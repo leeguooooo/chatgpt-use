@@ -143,6 +143,8 @@ Live testing + studying three mature projects (see below) converged on one desig
 **don't make web ChatGPT role-play tools — route by what each model tier can actually do.**
 Full write-up: [`docs/architecture.html`](docs/architecture.html).
 
+![plan, then hand off](assets/planner-executor.png)
+
 ```
                          chatgpt-use (local daemon)
                                     │
@@ -158,6 +160,8 @@ Full write-up: [`docs/architecture.html`](docs/architecture.html).
    browser is the only       role-play wall)
    way to reach Pro)
 ```
+
+![two lanes by model](assets/two-lanes.png)
 
 - **Pro can't use Apps/MCP** (confirmed: OpenAI Help Center — *"Apps … are not available with Pro"*).
   So Pro is reachable **only** through the browser channel, and is best used as a **planner/reviewer**
