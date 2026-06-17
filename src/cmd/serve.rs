@@ -661,6 +661,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         session: args.channel.session.clone(),
         project: args.channel.project.clone(),
         timeout_secs: args.channel.timeout,
+        model: args.channel.model.clone(),
     };
     let mut channel = Channel::connect(&opts)?;
 

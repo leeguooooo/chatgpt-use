@@ -119,6 +119,9 @@ pub struct ChannelOptions {
     pub project: String,
     /// Per-turn wall-clock budget in seconds.
     pub timeout_secs: u64,
+    /// Browser-channel model to select: pro | thinking | instant | <raw label>.
+    /// None → use the account default. (Pro is reachable only via the browser.)
+    pub model: Option<String>,
 }
 
 /// A live conversation. `send` keeps appending turns to the SAME chat, so

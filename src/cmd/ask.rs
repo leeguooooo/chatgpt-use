@@ -42,5 +42,6 @@ fn channel_opts_from_args(args: &AskArgs) -> ChannelOptions {
         session: args.channel.session.clone(),
         project: args.channel.project.clone(),
         timeout_secs: args.channel.timeout,
+        model: args.channel.model.clone(),
     }
 }

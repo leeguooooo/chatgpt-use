@@ -1,7 +1,7 @@
 //! CLI argument definitions (clap). Owned by the orchestrator; the cmd modules
 //! consume these structs but do not modify this file.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -22,6 +22,18 @@ pub enum Command {
     Run(RunArgs),
     /// Mode 3 · drop-in — Anthropic-compatible /v1/messages shim for Claude Code.
     Serve(ServeArgs),
+    /// MCP channel — local MCP server exposing project tools to a regular GPT-5.5
+    /// (native tool-calling; reach it from ChatGPT via a public tunnel).
+    Mcp(McpArgs),
+    /// Executor handoff — feed a delegation packet to Codex / Claude Code to run.
+    Handoff(HandoffArgs),
+}
+
+/// Which local coding agent executes a handed-off plan.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Executor {
+    Codex,
+    ClaudeCode,
 }
 
 /// Flags shared by every mode that opens a ChatGPT web channel.
@@ -39,6 +51,10 @@ pub struct ChannelArgs {
     /// Total wall-clock budget per model turn, in seconds.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
+    /// Select the browser-channel model: pro | thinking | instant | <raw label>.
+    /// GPT-5.5 Pro can only be reached here (it has no Apps/MCP). Default: account default.
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -48,6 +64,13 @@ pub struct AskArgs {
     /// Files whose contents are prepended as context (repeatable).
     #[arg(long = "file")]
     pub files: Vec<String>,
+    /// Delegation mode: ask (plain text) | plan | review | debug | research.
+    /// Non-ask modes send a typed delegation packet and parse a structured reply.
+    #[arg(long, value_enum, default_value_t = crate::delegation::Mode::Ask)]
+    pub mode: crate::delegation::Mode,
+    /// For non-ask modes, emit the parsed delegation packet as JSON on stdout.
+    #[arg(long)]
+    pub json: bool,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
@@ -79,4 +102,35 @@ pub struct ServeArgs {
     pub host: String,
     #[command(flatten)]
     pub channel: ChannelArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct McpArgs {
+    /// Port for the local MCP server (expose via a public tunnel for ChatGPT).
+    #[arg(long, default_value_t = 8788)]
+    pub port: u16,
+    /// Bind host.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Root directory the exposed tools operate in (default: current dir).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Shared secret required to call the server (recommended when tunneled).
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct HandoffArgs {
+    /// Path to a delegation-packet JSON file, or "-" to read it from stdin.
+    pub packet: String,
+    /// Which local agent runs the plan.
+    #[arg(long, value_enum, default_value_t = Executor::Codex)]
+    pub to: Executor,
+    /// Working directory the executor runs in (default: current dir).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Actually launch the executor. Without it, print the assembled command (dry-run).
+    #[arg(long)]
+    pub execute: bool,
 }
