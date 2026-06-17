@@ -1,0 +1,24 @@
+[package]
+name = "chatgpt-use"
+version = "0.0.1"
+edition = "2021"
+description = "Turn your ChatGPT web subscription into a coding-agent backend — no API key, no Codex billing. Built on chrome-use."
+license = "MIT"
+repository = "https://github.com/leeguooooo/chatgpt-use"
+
+[[bin]]
+name = "chatgpt-use"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+walkdir = "2"
+regex = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
