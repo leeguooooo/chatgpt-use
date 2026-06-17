@@ -241,23 +241,46 @@ Then make sure you have a Chrome profile logged in to chatgpt.com (or connect yo
 ## Usage cheatsheet
 
 ```bash
-# Mode 1 — sidekick (harness is the brain)
+# Sidekick — plain question (harness is the brain)
 chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
 
-# Mode 2 — brain (ChatGPT drives local tools in a loop)
+# Structured delegation — ChatGPT plans/reviews, returns a verdict packet
+chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]
+
+# Hand the packet to a local executor (dry-run unless --execute)
+chatgpt-use ask "<task>" --mode plan --json > plan.json
+chatgpt-use handoff plan.json --to codex|claude-code [--cwd <dir>] [--execute]
+
+# MCP channel — native tools for a regular GPT-5.5 (see MCP setup below)
+chatgpt-use mcp --port 8788 --token <secret> --cwd <project>
+
+# Mode 2 — brain (experimental browser tool loop)
 chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
-
 # Mode 3 — drop-in model (Claude Code keeps its loop; ChatGPT is the model)
-chatgpt-use serve --port 8787
-#   then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=x claude
+chatgpt-use serve --port 8787   # then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 
-# shared flags (mirroring chatgpt-imagegen)
+# shared channel flags
+#   --model     pro | thinking | instant   (browser channel; Pro is browser-only)
 #   --profile   auto (default) | relay | "Profile 3"
-#   --session   reuse a chrome-use tab group across runs
-#   --project   file the conversation under a ChatGPT Project
+#   --session   reuse a chrome-use tab group   --project  file under a ChatGPT Project
 ```
 
-*(Flags are the design target; check `chatgpt-use --help` once built for the authoritative set.)*
+### MCP channel setup (regular GPT-5.5)
+
+`chatgpt-use mcp` exposes the project tools (`read_file`/`write_file`/`list_dir`/`grep`/`bash`) as a
+JSON-RPC MCP server so a **regular** GPT-5.5 can call them natively (Pro can't use MCP). Since ChatGPT
+is in the cloud, expose the local server through a public HTTPS tunnel, then register it in
+**ChatGPT → Settings → Apps → Add custom connector**:
+
+```bash
+chatgpt-use mcp --port 8788 --token "$(openssl rand -hex 16)" --cwd /path/to/project
+cloudflared tunnel --url http://127.0.0.1:8788     # → paste the https URL into ChatGPT
+#   connector auth header:  Authorization: Bearer <your token>
+```
+
+⚠️ The MCP server runs `bash`/`write_file` **without human approval** — a leaked tunnel URL + token is
+shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral tunnels.
+**Full step-by-step + security notes: [`docs/mcp-setup.html`](docs/mcp-setup.html).**
 
 ---
 

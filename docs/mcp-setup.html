@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chatgpt-use · MCP 通道接入说明</title>
+<style>
+  :root{
+    --fg:#1a1a1a; --muted:#666; --bg:#fff; --soft:#f6f6f4;
+    --border:#e2e2dd; --accent:#157a52; --warn:#b25000; --danger:#a11; --code:#f0f0ec;
+  }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--fg); background:var(--bg); line-height:1.65; margin:0; -webkit-font-smoothing:antialiased}
+  main{max-width:920px; margin:0 auto; padding:48px 24px 96px}
+  header.doc{border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:28px}
+  h1{font-size:28px; margin:0 0 6px}
+  h2{font-size:21px; margin:40px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--border)}
+  h3{font-size:16px; margin:22px 0 8px}
+  .sub{color:var(--muted); font-size:15px}
+  p,li{font-size:15.5px}
+  code{background:var(--code); padding:1px 5px; border-radius:4px; font-size:90%;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  pre{background:var(--code); padding:13px 15px; border-radius:8px; overflow:auto;
+    border:1px solid var(--border); font-size:12.5px; line-height:1.5}
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:14.5px}
+  th,td{border:1px solid var(--border); padding:9px 12px; text-align:left; vertical-align:top}
+  th{background:var(--soft); font-weight:600}
+  aside{background:var(--soft); border-left:4px solid var(--accent); padding:12px 18px;
+    border-radius:0 8px 8px 0; margin:18px 0}
+  aside.warn{border-left-color:var(--warn)}
+  aside.danger{border-left-color:var(--danger)}
+  ol.steps{padding-left:0; counter-reset:step; list-style:none}
+  ol.steps>li{position:relative; padding:4px 0 18px 44px; margin:0}
+  ol.steps>li::before{counter-increment:step; content:counter(step);
+    position:absolute; left:0; top:2px; width:28px; height:28px; border-radius:50%;
+    background:var(--accent); color:#fff; font-weight:700; text-align:center; line-height:28px}
+  .ok{color:var(--accent); font-weight:600} .no{color:var(--danger); font-weight:600}
+  footer{margin-top:54px; padding-top:16px; border-top:1px solid var(--border); color:var(--muted); font-size:13px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+<header class="doc">
+  <h1>MCP 通道接入说明</h1>
+  <p class="sub">把本地项目工具暴露给 ChatGPT(普通 GPT-5.5)做原生工具调用 · chatgpt-use <code>mcp</code> 子命令</p>
+</header>
+
+<p><code>chatgpt-use mcp</code> 起一个本地 <strong>JSON-RPC 2.0 MCP server</strong>,把项目工具
+(<code>read_file</code> / <code>write_file</code> / <code>list_dir</code> / <code>grep</code> / <code>bash</code>)
+暴露成 ChatGPT 的自定义 connector。普通 GPT-5.5 能<strong>原生调用</strong>这些工具——绕开"浏览器里拒绝扮演工具"那道墙。</p>
+
+<aside class="danger"><strong>两条硬前提,先看:</strong>
+<ul style="margin:6px 0 0">
+  <li><strong>Pro 用不了。</strong>GPT-5.5 <strong>Pro 不支持 Apps/MCP connector</strong>。本通道只对
+    <strong>普通 GPT-5.5(Instant / Thinking)</strong>生效;Pro 的规划能力请走浏览器通道(<code>ask --model pro</code>)。</li>
+  <li><strong>需要 ChatGPT 套餐支持自定义 connector</strong>(通常 Plus/Pro/Business 的 Developer mode / Apps 高级设置;按账户、地区、工作区而定)。</li>
+</ul></aside>
+
+<h2>为什么需要隧道</h2>
+<p>ChatGPT 跑在云端,<strong>够不到你的 <code>localhost</code></strong>。所以本地 server 必须经一条公网 HTTPS 隧道
+(Cloudflare Tunnel / ngrok / Tailscale Funnel)暴露出去,再把公网 URL 填进 ChatGPT。</p>
+
+<h2>接入四步</h2>
+<ol class="steps">
+  <li>
+    <h3>起本地 MCP server</h3>
+    <p><code>--cwd</code> 限定工具能触及的根目录,<code>--token</code> 是访问口令(强烈建议,见安全警告)。</p>
+<pre>chatgpt-use mcp --port 8788 --token "$(openssl rand -hex 16)" --cwd /path/to/your/project</pre>
+    <p>启动日志(真实输出):</p>
+<pre>[mcp] listening on http://127.0.0.1:8788
+[mcp] cwd: /path/to/your/project
+[mcp] auth: Bearer token required
+[mcp] tunnel hint: expose with  cloudflared tunnel --url http://127.0.0.1:8788
+[mcp]   then register the public URL in ChatGPT &gt; Settings &gt; Apps &gt; Add custom connector</pre>
+  </li>
+  <li>
+    <h3>开一条公网 HTTPS 隧道</h3>
+    <p>任选其一,把 <code>127.0.0.1:8788</code> 暴露成 <code>https://…</code>:</p>
+<pre># Cloudflare(零账号快速隧道,给一个临时 trycloudflare.com 域名)
+cloudflared tunnel --url http://127.0.0.1:8788
+
+# 或 ngrok
+ngrok http 8788
+
+# 或 Tailscale Funnel
+tailscale funnel 8788</pre>
+    <p>记下它给出的 <code>https://&lt;random&gt;.trycloudflare.com</code> 之类的公网地址。</p>
+  </li>
+  <li>
+    <h3>在 ChatGPT 里注册 connector</h3>
+    <p>ChatGPT → <strong>Settings → Apps</strong>(或 Connectors / Developer mode 的 Advanced)→
+      <strong>Add custom connector / Create app</strong>:</p>
+    <table>
+      <tr><th>字段</th><th>填什么</th></tr>
+      <tr><td>MCP Server URL</td><td>第 2 步的公网地址,末尾可带 <code>/</code> 或 <code>/mcp</code>(两者都接受)</td></tr>
+      <tr><td>Authentication / Header</td><td><code>Authorization: Bearer &lt;你的 token&gt;</code>(即第 1 步 <code>--token</code> 的值)</td></tr>
+    </table>
+    <p>保存后 ChatGPT 会握手(<code>initialize</code> + <code>tools/list</code>),把 5 个工具拉到工具列表。</p>
+  </li>
+  <li>
+    <h3>在<strong>普通 GPT-5.5</strong> 对话里用</h3>
+    <p>新开一个 GPT-5.5(Instant / Thinking,<strong>不是 Pro</strong>)对话,经 Tools 菜单或
+      <code>@&lt;connector 名&gt;</code> 启用本 connector。之后让它读/改文件、跑命令,它会<strong>真的</strong>发
+      <code>tools/call</code> 给你的本地 server 执行并拿回结果。</p>
+  </li>
+</ol>
+
+<h2>本地自检(无需 ChatGPT)</h2>
+<p>起 server 后,用 curl 验证(以下为真实返回):</p>
+<pre># 无 token → 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8788/ \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+# → 401
+
+# initialize(带 token)
+curl -s -X POST "http://127.0.0.1:8788/?token=YOUR_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+# → {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},
+#     "protocolVersion":"2024-11-05","serverInfo":{"name":"chatgpt-use","version":"0.0.1"}}}
+
+# tools/call(Bearer header)
+curl -s -X POST http://127.0.0.1:8788/ -H 'Authorization: Bearer YOUR_TOKEN' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call",
+       "params":{"name":"read_file","arguments":{"path":"Cargo.toml"}}}'
+# → {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"[package]\n…"}],"isError":false}}</pre>
+
+<h2>协议细节</h2>
+<table>
+  <tr><th>项</th><th>值</th></tr>
+  <tr><td>传输</td><td>HTTP <code>POST /</code> 或 <code>POST /mcp</code>,JSON-RPC 2.0(无需 SSE)</td></tr>
+  <tr><td>protocolVersion</td><td><code>2024-11-05</code></td></tr>
+  <tr><td>方法</td><td><code>initialize</code> · <code>notifications/initialized</code>(通知,无响应体)· <code>tools/list</code> · <code>tools/call</code></td></tr>
+  <tr><td><code>tools/call</code> 返回</td><td><code>{content:[{type:"text",text:…}], isError:bool}</code>(工具失败时 <code>isError:true</code>)</td></tr>
+  <tr><td>鉴权</td><td><code>Authorization: Bearer &lt;token&gt;</code> 头 或 <code>?token=&lt;token&gt;</code> 查询;不符 → HTTP 401 + JSON-RPC <code>-32000</code></td></tr>
+  <tr><td>未知方法</td><td>JSON-RPC <code>-32601</code></td></tr>
+</table>
+
+<h2 style="color:var(--danger)">⚠️ 安全警告(务必读)</h2>
+<aside class="danger">
+本 server 里没有人类审批环节:<code>tools/call</code> 一律以 <strong>auto-approve</strong> 执行,
+其中 <code>bash</code> 与 <code>write_file</code> 会<strong>真的在 <code>--cwd</code> 里跑命令、写文件</strong>。
+因此:
+<ul style="margin:6px 0 0">
+  <li><strong>公网 URL + token = 你机器上 <code>--cwd</code> 范围内的 shell 权限。</strong>谁拿到它谁就能执行命令。</li>
+  <li>务必设 <code>--token</code>(用随机长串),把 URL 和 token 当机密;别贴进聊天/截图/仓库。</li>
+  <li><code>--cwd</code> 收窄到具体项目目录,别用 <code>$HOME</code> 或 <code>/</code>。</li>
+  <li>用<strong>临时隧道</strong>,用完即停;长期暴露请加更强鉴权/网络隔离。</li>
+  <li>合规:见 <a href="architecture.html">architecture.html</a> 的 ToS 边界——这是个人生产力桥,非规模化自动化。</li>
+</ul>
+</aside>
+
+<h2>排错</h2>
+<table>
+  <tr><th>现象</th><th>原因 / 处理</th></tr>
+  <tr><td>ChatGPT 里看不到工具</td><td>多半在用 <span class="no">Pro</span>;换<strong>普通 GPT-5.5</strong>。Pro 不支持 MCP connector。</td></tr>
+  <tr><td>握手失败 / 401</td><td>connector 没带 <code>Authorization: Bearer &lt;token&gt;</code>,或 token 与 <code>--token</code> 不一致。</td></tr>
+  <tr><td>连不上 / 超时</td><td>必须是公网 <strong>HTTPS</strong>(ChatGPT 够不到 localhost);确认隧道在跑、URL 没过期。</td></tr>
+  <tr><td>工具报错 <code>isError:true</code></td><td>路径不在 <code>--cwd</code> 内 / 文件不存在 / 命令失败——看返回的 <code>text</code>。</td></tr>
+</table>
+
+<footer>
+  配套:<a href="architecture.html">architecture.html</a>(双通道架构与研究纪要)。
+  实现见 <code>src/cmd/mcp.rs</code>。本说明中的返回样例为本地实测输出。
+</footer>
+</main>
+</body>
+</html>
