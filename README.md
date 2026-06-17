@@ -143,7 +143,11 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
 
 - **No native function-calling.** The web chat has no tool-call API (that's API-only). Tool calls are a
   **text protocol** we define in the system prompt and parse out of the reply. This is the make-or-break
-  bet: it needs careful prompt design, robust parsing, and retries. Expect occasional malformed calls.
+  bet — and live testing **confirmed it's the real wall**: current web models are strongly grounded and
+  often refuse to role-play tool execution from an instruction message alone ("I can't run those tools —
+  please paste the file"). Overcoming this needs **conversation priming** (seeding a real-looking prior
+  tool round-trip as actual turns, not just described), which is the active hardening work for Modes 2/3.
+  Mode 1 (no tools) is unaffected and works today.
 - **Rate limits are real.** Driving the one shared logged-in tab, the page rate-limits aggressively, so
   the channel runs at **concurrency 1** and queues across processes (flock), same as `chatgpt-imagegen`.
 - **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
@@ -200,14 +204,20 @@ chatgpt-use serve --port 8787
 
 ## Roadmap
 
-- [x] Design: two modes on one `chrome-use`-driven channel
-- [ ] Channel core (send / poll / parse) — port the `chatgpt-imagegen` web practices to Rust
-- [ ] Tool protocol + parser (`read_file`, `write_file`, `bash`, `grep`, `list_dir`)
-- [ ] Mode 1 `ask` (one-shot, no tools)
-- [ ] Mode 2 `run` agent loop + approval gate
-- [ ] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in
-- [ ] `install.sh` + GitHub-Release binaries
+- [x] Design: three modes on one `chrome-use`-driven channel
+- [x] Channel core (send / poll / parse) — ported from `chatgpt-imagegen`, **live-verified**
+- [x] Tool protocol + parser + executor (`read_file`, `write_file`, `bash`, `grep`, `list_dir`) — unit-tested
+- [x] Mode 1 `ask` (one-shot, no tools) — **live-verified end-to-end**
+- [x] Mode 2 `run` agent loop + approval gate — implemented (see fidelity note ⬇)
+- [x] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in — implemented PoC
+- [x] `install.sh` + GitHub-Release workflow
+- [ ] **Tool-fidelity hardening (the open problem):** conversation priming so web models reliably
+  emit tool calls instead of refusing — gates Modes 2 & 3 from "implemented" to "reliable"
 - [ ] Optional: a UI shell over the loop (TUI / menubar) for live progress & tool approval
+
+> **Status (honest):** Mode 1 works live. Modes 2 & 3 are fully built, compile clean, and pass unit
+> tests, but live runs hit the documented wall — ChatGPT web refuses to role-play tools from a single
+> prompt. The engine is done; the remaining work is prompt/priming, not plumbing.
 
 ---
 
