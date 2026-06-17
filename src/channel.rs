@@ -262,13 +262,23 @@ impl Channel {
         // button stays bound to the live content. Mirrors chatgpt-imagegen.
         ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, remaining_secs())
             .context("clicking #prompt-textarea")?;
-        ab_cmd(
-            &self.ab,
-            &["keyboard", "type", message],
-            &self.session,
-            remaining_secs(),
-        )
-        .context("typing message into composer")?;
+        // Type the message in CHARACTER chunks. A single `keyboard type` call with
+        // a multi-KB argument overruns chrome-use's IPC and fails with EAGAIN
+        // ("Resource temporarily unavailable"); chunking keeps each call small
+        // while still firing the real input events React/ProseMirror needs.
+        // Split on char boundaries (the prompt contains multibyte chars).
+        const TYPE_CHUNK_CHARS: usize = 400;
+        let chars: Vec<char> = message.chars().collect();
+        if chars.len() <= TYPE_CHUNK_CHARS {
+            ab_cmd(&self.ab, &["keyboard", "type", message], &self.session, remaining_secs())
+                .context("typing message into composer")?;
+        } else {
+            for chunk in chars.chunks(TYPE_CHUNK_CHARS) {
+                let piece: String = chunk.iter().collect();
+                ab_cmd(&self.ab, &["keyboard", "type", &piece], &self.session, remaining_secs())
+                    .context("typing message chunk into composer")?;
+            }
+        }
         ab_cmd(&self.ab, &["press", "Enter"], &self.session, remaining_secs())
             .context("pressing Enter to submit")?;
 
@@ -473,31 +483,36 @@ impl Channel {
         // button by several selectors that have been stable across recent ChatGPT
         // layouts, trying them in order.
         let js_click_picker = r#"(() => {
-  // Try common picker button selectors in order of specificity.
+  // Skip the account/profile button — its aria-label contains the plan name
+  // ("… Pro, open profile menu"), which used to get mis-clicked.
+  const isProfile = el => {
+    const al = (el.getAttribute('aria-label') || '').toLowerCase();
+    return al.includes('profile') || al.includes('account') || al.includes('open profile');
+  };
+  // Specific, safe selectors for the composer model/mode picker.
   const selectors = [
-    'button[aria-label*="model" i]',
-    'button[aria-label*="GPT" i]',
     'button[data-testid*="model" i]',
     'button[data-testid*="mode" i]',
-    // Fallback: a composer button whose label contains a known model keyword.
-    'button[aria-label*="Instant" i]',
-    'button[aria-label*="Thinking" i]',
-    'button[aria-label*="Pro" i]',
+    'button[aria-label="Instant"]',
+    'button[aria-label="Thinking"]',
+    'button[aria-label*="model selector" i]',
   ];
   for (const sel of selectors) {
     const btn = document.querySelector(sel);
-    if (btn) { btn.click(); return JSON.stringify({ok: true, sel}); }
+    if (btn && !isProfile(btn)) { btn.click(); return JSON.stringify({ok: true, sel}); }
   }
-  // Last resort: look for any visible button near the composer that contains
-  // a known model name in its text content.
-  const keywords = ['Instant', 'Thinking', 'Pro', 'GPT'];
-  const area = document.querySelector('form, [role="dialog"], #composer-background, main');
-  const buttons = (area || document).querySelectorAll('button');
-  for (const b of buttons) {
-    const txt = b.textContent || '';
-    if (keywords.some(k => txt.includes(k))) {
+  // Fallback: a SHORT composer button whose text is a whole-word model/mode label
+  // (e.g. exactly "Instant"/"Thinking"/"Auto"/"GPT-5.5"). Never the profile button.
+  const KW = ['instant', 'thinking', 'auto', 'pro', 'gpt-5.5', 'gpt'];
+  const area = document.querySelector('form, #composer-background, main') || document;
+  for (const b of area.querySelectorAll('button')) {
+    if (isProfile(b)) continue;
+    const txt = (b.textContent || '').trim();
+    if (txt.length === 0 || txt.length > 18) continue;
+    const words = txt.toLowerCase().split(/[^a-z0-9.]+/).filter(Boolean);
+    if (KW.some(k => words.includes(k))) {
       b.click();
-      return JSON.stringify({ok: true, sel: 'text:' + txt.trim().slice(0, 40)});
+      return JSON.stringify({ok: true, sel: 'text:' + txt.slice(0, 24)});
     }
   }
   return JSON.stringify({ok: false, error: 'picker button not found'});
@@ -525,29 +540,33 @@ impl Channel {
         let js_select_item = format!(
             r#"(() => {{
   const target = {target_json};
-  // Menu items appear in several possible roles.
-  const candidates = [
-    ...document.querySelectorAll('[role="menuitem"]'),
-    ...document.querySelectorAll('[role="option"]'),
-    ...document.querySelectorAll('[role="listitem"]'),
+  // WHOLE-WORD, case-insensitive match — NOT substring. This is the fix for the
+  // bug where target "Pro" matched "Share project" (contains the substring "pro").
+  const norm = s => (s || '').toLowerCase();
+  const wordEq = (txt, t) => {{
+    const tt = norm(t);
+    if (norm(txt) === tt) return true;
+    const words = norm(txt).split(/[^a-z0-9.]+/).filter(Boolean);
+    return words.includes(tt);
+  }};
+  // Prefer items inside an OPENED floating menu/listbox (the picker we just
+  // opened), so we don't pick a stray menuitem elsewhere on the page.
+  const layers = [
+    ...document.querySelectorAll('[data-radix-popper-content-wrapper]'),
+    ...document.querySelectorAll('[data-floating-ui-portal]'),
+    ...document.querySelectorAll('[role="menu"]'),
+    ...document.querySelectorAll('[role="listbox"]'),
   ];
-  for (const el of candidates) {{
-    const txt = (el.textContent || '').trim();
-    if (txt.toLowerCase().includes(target.toLowerCase())) {{
-      el.click();
-      return JSON.stringify({{ok: true, matched: txt}});
+  for (const layer of layers) {{
+    for (const el of layer.querySelectorAll('[role="menuitem"], [role="option"], button, [tabindex]')) {{
+      const txt = (el.textContent || '').trim();
+      if (wordEq(txt, target)) {{ el.click(); return JSON.stringify({{ok: true, matched: txt}}); }}
     }}
   }}
-  // Fallback: any button inside a floating layer whose text matches.
-  const floaters = document.querySelectorAll('[data-radix-popper-content-wrapper], [data-floating-ui-portal], [role="menu"], [role="listbox"]');
-  for (const layer of floaters) {{
-    for (const b of layer.querySelectorAll('button, [tabindex]')) {{
-      const txt = (b.textContent || '').trim();
-      if (txt.toLowerCase().includes(target.toLowerCase())) {{
-        b.click();
-        return JSON.stringify({{ok: true, matched: txt}});
-      }}
-    }}
+  // Fallback: document-wide menu roles, still whole-word matched.
+  for (const el of document.querySelectorAll('[role="menuitem"], [role="option"], [role="listitem"]')) {{
+    const txt = (el.textContent || '').trim();
+    if (wordEq(txt, target)) {{ el.click(); return JSON.stringify({{ok: true, matched: txt}}); }}
   }}
   return JSON.stringify({{ok: false, error: 'menu item not found for: ' + target}});
 }})()"#,

@@ -197,39 +197,74 @@ Output the ```json block now."#,
 /// Parse + validate ChatGPT's reply into a DelegationPacket. Fail fast (Err) on a
 /// missing/empty verdict or unparseable block — never return an ambiguous packet.
 pub fn parse_packet(reply: &str) -> Result<DelegationPacket> {
-    // Extract the fenced ```json ... ``` block, tolerating surrounding prose.
-    let re = Regex::new(r"(?s)```[jJ][sS][oO][nN]\s*\n(.*?)\n?```").expect("valid regex");
-
-    let captures = re.captures(reply);
-    let block_content = captures
-        .as_ref()
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim());
-
-    let raw = match block_content {
-        Some(s) if !s.is_empty() => s,
-        Some(_) => bail!("delegation packet: fenced json block is empty"),
-        None => bail!(
-            "delegation packet: no fenced ```json block found in reply \
+    let raw = extract_json_object(reply).ok_or_else(|| {
+        anyhow::anyhow!(
+            "delegation packet: no JSON object / json block found in reply \
              (ChatGPT did not return a structured packet; raw reply: {:?})",
             &reply[..reply.len().min(300)]
-        ),
-    };
+        )
+    })?;
 
-    let packet: DelegationPacket = serde_json::from_str(raw).map_err(|e| {
+    let packet: DelegationPacket = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
-            "delegation packet: failed to parse json block: {e}\n\
-             raw block was: {:?}",
+            "delegation packet: failed to parse json: {e}\nraw was: {:?}",
             &raw[..raw.len().min(500)]
         )
     })?;
 
-    // goal must be non-empty (the serde parse already enforced verdict presence)
+    // goal must be non-empty (serde already enforced verdict presence).
     if packet.goal.trim().is_empty() {
         bail!("delegation packet: `goal` field is empty");
     }
 
     Ok(packet)
+}
+
+/// Pull a JSON object out of a model reply. Prefers a fenced ```json block, but
+/// falls back to the first balanced `{...}`. The fallback matters because the
+/// browser channel scrapes the RENDERED message: a fenced code block shows up as
+/// `JSON\n{ … }` (a language label + the code), with NO literal backticks — so a
+/// fence-only parser would reject a perfectly good packet.
+fn extract_json_object(reply: &str) -> Option<String> {
+    // 1. Literal ```json ... ``` fence (raw markdown source case).
+    if let Ok(re) = Regex::new(r"(?s)```[jJ][sS][oO][nN]\s*\n(.*?)\n?```") {
+        if let Some(m) = re.captures(reply).and_then(|c| c.get(1)) {
+            let s = m.as_str().trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // 2. First balanced {...}, tracking string literals so braces inside strings
+    //    don't throw off the depth count. ASCII braces/quotes only; UTF-8
+    //    continuation bytes (>=0x80) never collide with these markers.
+    let start = reply.find('{')?;
+    let bytes = reply.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(reply[start..start + i + 1].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 // ---- tests ------------------------------------------------------------------
