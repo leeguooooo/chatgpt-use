@@ -31,10 +31,10 @@ from your coding agent, this closes the gap: route the cheap-and-already-paid wo
 
 ---
 
-## Two modes
+## Three modes
 
 `chatgpt-use` is one engine — a `chrome-use`-driven **channel** to the ChatGPT web conversation (send a
-message, wait for the reply, parse it) — exposed two ways depending on **who's the brain**.
+message, wait for the reply, parse it) — exposed three ways depending on **who's the brain**.
 
 ### Mode 1 · 副手 / Sidekick — `chatgpt-use ask`
 
@@ -80,7 +80,34 @@ chatgpt-use run "Add a --json flag to the status command and update the tests"
 access *is* the `read_file` / `grep` tools: the local harness reads the bytes and hands them into the
 conversation. ChatGPT never reaches back to your machine — it just asks, and the hands obey.
 
-Mode 1 is a strict subset of Mode 2 (one turn, tools disabled), so they share the entire engine.
+### Mode 3 · 替身 / Drop-in model — `chatgpt-use serve`
+
+![drop-in](assets/mode3-dropin.png)
+
+**Claude Code stays exactly as it is — its agent loop, its tools, its UX — but the model behind it is
+secretly ChatGPT.** `chatgpt-use serve` exposes a local **Anthropic-compatible endpoint**
+(`/v1/messages`, streaming). Point Claude Code at it:
+
+```bash
+chatgpt-use serve --port 8787 &
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=whatever claude
+```
+
+Now every model call Claude Code makes — the thing that *spends Anthropic model tokens* — is
+intercepted, translated into a prompt, driven through your ChatGPT web subscription, and translated
+back into Anthropic's response shape (**including `tool_use` blocks**, so Claude Code's own tools keep
+working). Claude Code never knows its brain was swapped.
+
+- **No model tokens.** Claude Code's loop runs locally and free; the tokens it would have billed are
+  served by your flat subscription instead.
+- Reuses Mode 2's **text tool-call protocol + parser** — but instead of running our own loop, it
+  re-encodes ChatGPT's tool calls as Anthropic `tool_use` blocks and hands them back to Claude Code,
+  which runs its own tools.
+- The most ambitious and most fragile mode (see caveats): Claude Code's prompts are large, tool-call
+  fidelity over a text protocol is imperfect, and the web surface rate-limits. **Experimental².**
+
+All three modes share one engine: **Mode 1** is Mode 2 with tools off; **Mode 3** is Mode 2's tool
+protocol re-dressed as an Anthropic API so an *existing* harness can wear ChatGPT as its model.
 
 ---
 
@@ -121,6 +148,9 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   the channel runs at **concurrency 1** and queues across processes (flock), same as `chatgpt-imagegen`.
 - **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
   not for tight latency loops.
+- **Mode 3 is the deep end.** A full chat harness's traffic squeezed through a browser chat box: slow,
+  occasionally wrong, and only as good as the tool-call translation. It's a proof-of-concept of "free
+  Claude Code", not a daily driver — yet.
 - **ToS:** you are driving *your own* logged-in browser session. Use it within your plan's terms.
 - **macOS first** (matches `chrome-use` / `cookie-use`); other platforms follow `chrome-use`.
 
@@ -154,6 +184,10 @@ chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile 
 # Mode 2 — brain (ChatGPT drives local tools in a loop)
 chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
 
+# Mode 3 — drop-in model (Claude Code keeps its loop; ChatGPT is the model)
+chatgpt-use serve --port 8787
+#   then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=x claude
+
 # shared flags (mirroring chatgpt-imagegen)
 #   --profile   auto (default) | relay | "Profile 3"
 #   --session   reuse a chrome-use tab group across runs
@@ -171,6 +205,7 @@ chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
 - [ ] Tool protocol + parser (`read_file`, `write_file`, `bash`, `grep`, `list_dir`)
 - [ ] Mode 1 `ask` (one-shot, no tools)
 - [ ] Mode 2 `run` agent loop + approval gate
+- [ ] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in
 - [ ] `install.sh` + GitHub-Release binaries
 - [ ] Optional: a UI shell over the loop (TUI / menubar) for live progress & tool approval
 
