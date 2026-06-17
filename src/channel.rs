@@ -208,6 +208,14 @@ impl Channel {
 
         let chan = Channel { ab, session, timeout_secs };
 
+        // Optionally select a specific model in the composer before sending.
+        if let Some(ref model) = opts.model {
+            let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
+            if let Err(e) = chan.select_model(model, model_deadline) {
+                eprintln!("warning: could not select model {model:?}: {e}; using account default");
+            }
+        }
+
         // Optionally navigate into a ChatGPT Project.
         let project = opts.project.trim().to_string();
         if !project.is_empty() {
@@ -423,6 +431,151 @@ impl Channel {
         if !wait_composer(&self.ab, &self.session, deadline, 15)? {
             bail!("project page composer never appeared");
         }
+
+        Ok(())
+    }
+
+    /// Select a model in the ChatGPT composer. Best-effort: logs a warning and
+    /// continues with the account default if the picker cannot be found or the
+    /// label does not match. Model names are normalised case-insensitively:
+    ///   "pro"      → looks for a menu item containing "Pro"
+    ///   "thinking" → looks for a menu item containing "Thinking"
+    ///   "instant"  → looks for a menu item containing "Instant" (default for free/Plus)
+    ///   anything else is matched verbatim (substring, case-insensitive).
+    ///
+    /// Driven via JS element.click() — more reliable than coordinate clicks on
+    /// an element whose position shifts with layout reflows.
+    fn select_model(&self, model: &str, deadline: Instant) -> Result<()> {
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::from_secs(2))
+                .as_secs_f64()
+                .max(2.0)
+        };
+
+        // Normalise the caller's label into a substring we search for in the
+        // picker menu items (case-insensitive).
+        let model_lower = model.trim().to_lowercase();
+        let target_label: &str = match model_lower.as_str() {
+            "pro"      => "Pro",
+            "thinking" => "Thinking",
+            "instant"  => "Instant",
+            _          => model.trim(),  // raw label passed through unchanged
+        };
+        // Escape for embedding in a JS string literal.
+        let target_json = serde_json::to_string(target_label)
+            .unwrap_or_else(|_| format!("\"{}\"", target_label));
+
+        // Step 1: click the model/mode picker button in the composer.
+        // The button is typically labelled "Instant", "Thinking", or "GPT-5.5 Pro"
+        // and lives next to the file-upload / tools buttons.  We look for the
+        // button by several selectors that have been stable across recent ChatGPT
+        // layouts, trying them in order.
+        let js_click_picker = r#"(() => {
+  // Try common picker button selectors in order of specificity.
+  const selectors = [
+    'button[aria-label*="model" i]',
+    'button[aria-label*="GPT" i]',
+    'button[data-testid*="model" i]',
+    'button[data-testid*="mode" i]',
+    // Fallback: a composer button whose label contains a known model keyword.
+    'button[aria-label*="Instant" i]',
+    'button[aria-label*="Thinking" i]',
+    'button[aria-label*="Pro" i]',
+  ];
+  for (const sel of selectors) {
+    const btn = document.querySelector(sel);
+    if (btn) { btn.click(); return JSON.stringify({ok: true, sel}); }
+  }
+  // Last resort: look for any visible button near the composer that contains
+  // a known model name in its text content.
+  const keywords = ['Instant', 'Thinking', 'Pro', 'GPT'];
+  const area = document.querySelector('form, [role="dialog"], #composer-background, main');
+  const buttons = (area || document).querySelectorAll('button');
+  for (const b of buttons) {
+    const txt = b.textContent || '';
+    if (keywords.some(k => txt.includes(k))) {
+      b.click();
+      return JSON.stringify({ok: true, sel: 'text:' + txt.trim().slice(0, 40)});
+    }
+  }
+  return JSON.stringify({ok: false, error: 'picker button not found'});
+})()"#;
+
+        let open_result = ab_eval(&self.ab, js_click_picker, &self.session, remaining())?;
+        let picker_opened = open_result
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !picker_opened {
+            let detail = open_result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("model picker button not found: {detail}");
+        }
+
+        // Brief pause for the menu to animate open.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Step 2: find the menu item whose text contains the target label and
+        // click it via JS (element.click() is reliable for menu items).
+        let js_select_item = format!(
+            r#"(() => {{
+  const target = {target_json};
+  // Menu items appear in several possible roles.
+  const candidates = [
+    ...document.querySelectorAll('[role="menuitem"]'),
+    ...document.querySelectorAll('[role="option"]'),
+    ...document.querySelectorAll('[role="listitem"]'),
+  ];
+  for (const el of candidates) {{
+    const txt = (el.textContent || '').trim();
+    if (txt.toLowerCase().includes(target.toLowerCase())) {{
+      el.click();
+      return JSON.stringify({{ok: true, matched: txt}});
+    }}
+  }}
+  // Fallback: any button inside a floating layer whose text matches.
+  const floaters = document.querySelectorAll('[data-radix-popper-content-wrapper], [data-floating-ui-portal], [role="menu"], [role="listbox"]');
+  for (const layer of floaters) {{
+    for (const b of layer.querySelectorAll('button, [tabindex]')) {{
+      const txt = (b.textContent || '').trim();
+      if (txt.toLowerCase().includes(target.toLowerCase())) {{
+        b.click();
+        return JSON.stringify({{ok: true, matched: txt}});
+      }}
+    }}
+  }}
+  return JSON.stringify({{ok: false, error: 'menu item not found for: ' + target}});
+}})()"#,
+            target_json = target_json
+        );
+
+        let select_result = ab_eval(&self.ab, &js_select_item, &self.session, remaining())?;
+        let selected = select_result
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !selected {
+            let detail = select_result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("model menu item not found: {detail}");
+        }
+
+        let matched = select_result
+            .get("matched")
+            .and_then(|v| v.as_str())
+            .unwrap_or(target_label);
+        eprintln!("model selected: {matched:?}");
+
+        // Brief pause for the menu to close and the composer to settle.
+        std::thread::sleep(Duration::from_millis(300));
 
         Ok(())
     }
