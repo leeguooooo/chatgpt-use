@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chatgpt-use · 架构与研究纪要</title>
+<style>
+  :root{
+    --fg:#1a1a1a; --muted:#666; --bg:#fff; --soft:#f6f6f4;
+    --border:#e2e2dd; --accent:#157a52; --warn:#b25000; --danger:#a11;
+    --code:#f0f0ec;
+  }
+  *{box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--fg); background:var(--bg); line-height:1.65; margin:0;
+    -webkit-font-smoothing:antialiased;
+  }
+  main{max-width:980px; margin:0 auto; padding:48px 24px 96px}
+  header.doc{border-bottom:3px solid var(--accent); padding-bottom:18px; margin-bottom:32px}
+  h1{font-size:30px; margin:0 0 6px}
+  h2{font-size:22px; margin:44px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--border)}
+  h3{font-size:17px; margin:26px 0 8px}
+  .sub{color:var(--muted); font-size:15px}
+  p,li{font-size:15.5px}
+  code{background:var(--code); padding:1px 5px; border-radius:4px; font-size:90%;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  pre{background:var(--code); padding:14px 16px; border-radius:8px; overflow:auto;
+    border:1px solid var(--border); font-size:13px; line-height:1.5}
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:14.5px}
+  th,td{border:1px solid var(--border); padding:9px 12px; text-align:left; vertical-align:top}
+  th{background:var(--soft); font-weight:600}
+  aside{background:var(--soft); border-left:4px solid var(--accent); padding:12px 18px;
+    border-radius:0 8px 8px 0; margin:18px 0}
+  aside.warn{border-left-color:var(--warn)}
+  aside.danger{border-left-color:var(--danger)}
+  .tag{display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px;
+    background:var(--soft); border:1px solid var(--border); color:var(--muted)}
+  .ok{color:var(--accent); font-weight:600}
+  .no{color:var(--danger); font-weight:600}
+  footer{margin-top:60px; padding-top:18px; border-top:1px solid var(--border);
+    color:var(--muted); font-size:13px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+<header class="doc">
+  <h1>chatgpt-use · 架构与研究纪要</h1>
+  <p class="sub">把 ChatGPT 网页订阅接入本地 coding-agent 工作流 · 2026-06-17 · <span class="tag">实验性</span></p>
+</header>
+
+<p>本文记录:我们撞到的墙(实证)、社区三个成熟项目的做法、由此收敛出的<strong>目标架构(双通道)</strong>,
+以及决定保留的自有模式。一句话定位:<em>把 ChatGPT(尤其 GPT-5.5 Pro)当高质量 planner/reviewer 接入本地
+coding-agent 流程,执行始终留给 Codex / Claude Code / 本地工具。</em></p>
+
+<h2>1. 实证结论:浏览器里"让 ChatGPT 演工具"这堵墙</h2>
+<p>我们先按"网页版无原生 function-calling → 用文本协议伪造工具调用"的思路做了 Mode 2/3,并在真实登录态网页上实测。
+跨 <strong>3 种提示词框架</strong> 全部被模型拒绝:</p>
+<table>
+  <tr><th>框架</th><th>结果</th></tr>
+  <tr><td>"你拥有这些工具,按需调用"</td><td class="no">模型用自然语言要求"上传/粘贴文件"</td></tr>
+  <tr><td>"你没有任何文件访问权限,工具是唯一途径"</td><td class="no">"那我无法完成,请提供文件"</td></tr>
+  <tr><td>"你不是在执行工具,只是输出 JSON 请求,外部控制器会执行并贴回结果" + few-shot</td>
+      <td class="no">"贴更多 schema 文本并不能让工具变真,请提供文件"</td></tr>
+</table>
+<aside class="warn"><strong>结论:</strong>强 grounding 的网页模型不会仅凭单条消息文本去"扮演工具执行"。
+这不是提示词没调好,而是<strong>方向本身要换</strong> —— 三个成熟项目无一硬破此墙。</aside>
+
+<h2>2. 社区三个项目(源码级)</h2>
+
+<h3>ChesterRa/cccc <span class="tag">930★ · 活跃</span></h3>
+<p>单写者 daemon + append-only <code>ledger.jsonl</code> 为唯一事实源;Web/CLI/MCP/IM 都是无状态前端。
+对接 ChatGPT 用<strong>双通道</strong>:</p>
+<ul>
+  <li><strong>浏览器投递(push)</strong>:daemon 持有持久化 Playwright/CDP profile,把消息批量注入绑定的
+    <code>chatgpt.com/c/…</code> 会话;提交后若无法确认接收则标 <code>delivery-unverified</code>。</li>
+  <li><strong>Remote MCP(pull)</strong>:暴露公网 HTTPS MCP 端点(需 Cloudflare Tunnel / ngrok / Tailscale,
+    因为 ChatGPT 在云端、够不到 <code>localhost</code>);ChatGPT 注册为自定义 app connector,GPT-5.x 调
+    <code>cccc_runtime_wait_next_turn</code> 拉取轮次、用 <code>cccc_repo_edit</code>/<code>cccc_shell</code>/<code>cccc_git</code> 等工具。
+    URL 带 actor-bound token,服务端只存哈希。</li>
+</ul>
+<aside class="danger"><strong>Pro 硬约束(cccc 文档原文):</strong>"GPT-5.x Pro sessions currently cannot be
+used this way — they do not expose third-party MCP connectors." Pro 只能当"需手动给上下文的外部顾问"。</aside>
+
+<h3>tt-a1i/hive <span class="tag">369★</span></h3>
+<p>纯本地 CLI PTY 工作台,<strong>不</strong>接 ChatGPT 网页。值得借鉴:把
+<code>&lt;xml-system-reminder&gt;</code> 锚点放在每条消息<strong>尾部</strong>(抗 <code>/compact</code> 与自动摘要)、
+<code>PROTOCOL.md</code> 兜底锚点、<code>tasks.md</code> 任务图、通过读 <code>rollout-*.jsonl</code> 首行恢复会话。</p>
+
+<h3>RPG-478/codex-chatgpt-bridge <span class="tag">alpha · 最对口</span></h3>
+<p>本地 <code>cgpt</code> CLI + stdio MCP server,让 Codex 把<strong>小型结构化"委派包"</strong>丢给 ChatGPT 网页(纯 Playwright)。
+ChatGPT 只规划/评审,执行留在 Codex。其浏览器收发逻辑与我们 <code>channel.rs</code> 几乎一致(填编辑器→点
+<code>[data-testid=send-button]</code>→轮询 <code>[data-message-author-role=assistant]</code>→连续 2 次稳定且无 stop-button)。</p>
+<p>委派包要点:① <strong>委派声明</strong>(发件人是机器,不是人类)防止模型当聊天;② <strong>模式分型</strong>
+plan/review/debug/research;③ 严格输出 schema 含 <code>verdict: proceed|revise|blocked</code>,
+解析失败<strong>直接失败</strong>不存歧义结果。</p>
+
+<h2>3. 目标架构:按模型分流的双通道</h2>
+<pre>                       chatgpt-use (本地 daemon)
+                                │
+     ┌──────────────────────────┼───────────────────────────┐
+ 浏览器通道(chrome-use)     MCP 通道(本地 server+公网隧道)   执行 handoff
+     ▼                          ▼                             ▼
+ GPT-5.5 <strong>Pro</strong>              GPT-5.5 Instant/Thinking       Codex / Claude Code
+ 规划 / 评审               原生工具调用(无拒演墙)         本地落地执行
+ (Pro 无 Apps/MCP,
+  只能走浏览器)</pre>
+<table>
+  <tr><th>模型</th><th>第三方 App / MCP</th><th>在本架构里的角色</th></tr>
+  <tr><td>GPT-5.5 Instant</td><td class="ok">可用</td><td>MCP 通道,原生工具</td></tr>
+  <tr><td>GPT-5.5 Thinking</td><td class="ok">可用</td><td>MCP 通道,原生工具</td></tr>
+  <tr><td>GPT-5.5 Pro</td><td class="no">不可用</td><td>浏览器通道,planner/reviewer 出委派包</td></tr>
+</table>
+
+<h3>planner → executor 委派包(契约)</h3>
+<pre>{
+  "goal": "implement X",
+  "plan": [ {"step":1,"action":"inspect","target":"src/foo.ts","success_criteria":"…"} ],
+  "risks": ["migration may break auth"],
+  "tests": ["cargo test"],
+  "acceptance": ["feature works","no regression"],
+  "do_not_do": ["broad refactor","change public API"],
+  "verdict": "proceed | revise | blocked"
+}</pre>
+<p>executor 只吃这种包、不接受 Pro 的自由文本直接执行 —— 显著降低幻觉误操作。</p>
+
+<h2>4. 借鉴清单 → 主线工作</h2>
+<table>
+  <tr><th>借鉴自</th><th>我们要做</th></tr>
+  <tr><td>codex-chatgpt-bridge</td><td><strong>结构化委派</strong>:<code>ask</code> 升级为 <code>--mode plan|review|debug|research</code> + 本地上下文采集 + verdict schema + fail-fast</td></tr>
+  <tr><td>(Pro 约束)</td><td><code>--model</code> 开关:浏览器通道选 Pro/Thinking(新版 UI 选择器目前自动化点不动,待解)</td></tr>
+  <tr><td>cccc</td><td>MCP 通道(本地 server + 公网隧道,普通 5.5 原生工具);append-only ledger + actor-bound token</td></tr>
+  <tr><td>hive</td><td>尾部 <code>&lt;xml-system-reminder&gt;</code> 锚点 + <code>PROTOCOL.md</code> 兜底 + tasks.md</td></tr>
+  <tr><td>—</td><td>executor handoff:把委派包喂给 Codex / Claude Code 执行</td></tr>
+</table>
+
+<h2>5. 保留的自有模式(不放弃,慢慢研究)</h2>
+<ul>
+  <li><strong>Mode 1 · ask</strong> —— <span class="ok">已实测可用</span>,将升级为结构化委派,成为主线。</li>
+  <li><strong>Mode 2 · run</strong>(浏览器自主工具循环)—— 撞拒演墙,作为研究track,后续试<em>真·多轮对话预置</em>。</li>
+  <li><strong>Mode 3 · serve</strong>(Anthropic drop-in)—— 同墙,暂为 PoC。</li>
+</ul>
+
+<h2>6. 合规边界</h2>
+<aside class="danger">OpenAI Terms 禁止"程序化提取 Output"与绕过速率限制。本工具<strong>不</strong>定位为"网页 ChatGPT 当免费 API",
+而是个人生产力桥:用你自己登录的 ChatGPT(尤其 Pro)当 planner/reviewer,执行交给 Codex/Claude Code/本地工具。
+不做转售、不做规模化自动化。价值在于"订阅额度与 API/Codex 额度分桶"的合理利用。</aside>
+
+<footer>
+  来源:用 <code>chatgpt-use ask</code> 自身 dogfood 的 ChatGPT 联网调研(非 Pro 模型)+ 子 agent 源码级研报。
+  种子想法:<a href="https://x.com/VincentLogic/status/2066800292604026943">@VincentLogic</a>。
+</footer>
+</main>
+</body>
+</html>
