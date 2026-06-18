@@ -141,6 +141,20 @@ pub struct McpArgs {
     /// Command-gating level for `bash` under --profile full (safe|trusted|dangerous).
     #[arg(long, value_enum, default_value_t = PermissionMode::Safe)]
     pub permission_mode: PermissionMode,
+    /// Authentication mode: token (default shared-secret Bearer) or oauth
+    /// (OAuth 2.1 Authorization-Code + PKCE for ChatGPT "OAuth" connector mode).
+    #[arg(long, value_enum, default_value_t = AuthMode::Token)]
+    pub auth_mode: AuthMode,
+}
+
+/// Authentication mode for the MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthMode {
+    /// Shared-secret Bearer token (default). Pass `--token` or use `chatgpt-use init`.
+    Token,
+    /// OAuth 2.1 Authorization-Code + PKCE (S256). ChatGPT "OAuth" connector mode.
+    #[value(name = "oauth", alias = "o-auth")]
+    OAuth,
 }
 
 /// Tool-exposure profile for the MCP channel.

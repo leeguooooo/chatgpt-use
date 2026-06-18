@@ -22,10 +22,11 @@
 //!
 //! Owned by the MCP agent.
 
-use crate::cli::{McpArgs, PermissionMode};
+use crate::cli::{AuthMode, McpArgs, PermissionMode};
 use crate::protocol::ToolCall;
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -257,6 +258,94 @@ fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool, perm: 
 
 // ---- Public entry point -----------------------------------------------------
 
+// ---- HTTP response helpers --------------------------------------------------
+
+/// Send a plain JSON response.
+fn respond_json(request: tiny_http::Request, status: u16, body: String) {
+    let resp = tiny_http::Response::from_string(body)
+        .with_status_code(status)
+        .with_header(
+            "Content-Type: application/json"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        );
+    let _ = request.respond(resp);
+}
+
+/// Send an HTML response.
+fn respond_html(request: tiny_http::Request, status: u16, body: String) {
+    let resp = tiny_http::Response::from_string(body)
+        .with_status_code(status)
+        .with_header(
+            "Content-Type: text/html; charset=utf-8"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        );
+    let _ = request.respond(resp);
+}
+
+/// Send a 302 redirect.
+fn respond_redirect(request: tiny_http::Request, location: &str) {
+    let resp = tiny_http::Response::empty(302).with_header(
+        format!("Location: {location}")
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(resp);
+}
+
+/// Send a 404 JSON response.
+fn respond_not_found(request: tiny_http::Request) {
+    respond_json(request, 404, r#"{"error":"not found"}"#.to_string());
+}
+
+// ---- Issuer derivation ------------------------------------------------------
+
+/// Derive the OAuth issuer URL from the request's `Host` header.
+/// ChatGPT reaches the server through the public tunnel, so we use
+/// `https://{Host}` (no port re-emission — the tunnel host has no port).
+fn issuer_from_request(request: &tiny_http::Request) -> String {
+    for header in request.headers() {
+        if header.field.equiv("Host") {
+            let host = header.value.as_str();
+            return format!("https://{host}");
+        }
+    }
+    // Fallback: derive from the bind address (local dev).
+    "http://localhost".to_string()
+}
+
+// ---- Content-type sniffing --------------------------------------------------
+
+/// Return true if the request carries an `application/json` body (or no
+/// Content-Type, where we also try JSON).
+fn is_json_content_type(request: &tiny_http::Request) -> bool {
+    for header in request.headers() {
+        if header.field.equiv("Content-Type") {
+            return header.value.as_str().contains("application/json");
+        }
+    }
+    false
+}
+
+// ---- Token-body parser for /token endpoint ----------------------------------
+
+/// Parse the `POST /token` body — accepts either JSON or urlencoded form.
+fn parse_token_body(body: &str, is_json: bool) -> HashMap<String, String> {
+    if is_json {
+        // Flatten a JSON object into a string map.
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(body) {
+            return map
+                .into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect();
+        }
+    }
+    crate::oauth::parse_urlencoded(body)
+}
+
+// ---- Public entry point -----------------------------------------------------
+
 /// Start the MCP JSON-RPC server and block serving requests.
 pub fn run(args: &McpArgs) -> Result<()> {
     let cwd: PathBuf = match &args.cwd {
@@ -275,11 +364,10 @@ pub fn run(args: &McpArgs) -> Result<()> {
     let server = tiny_http::Server::http(&bind_addr)
         .map_err(|e| anyhow::anyhow!("failed to bind MCP server on {bind_addr}: {e}"))?;
 
+    let oauth_mode = args.auth_mode == AuthMode::OAuth;
+
     eprintln!("[mcp] listening on http://{bind_addr}");
-    eprintln!(
-        "[mcp] cwd: {}",
-        cwd.display()
-    );
+    eprintln!("[mcp] cwd: {}", cwd.display());
     eprintln!(
         "[mcp] profile: {} ({})",
         if read_only { "read-only" } else { "full" },
@@ -289,7 +377,13 @@ pub fn run(args: &McpArgs) -> Result<()> {
             "ALL tools incl. write_file + bash — trusted/local only"
         }
     );
-    if token.is_some() {
+    if oauth_mode {
+        // In OAuth mode, the server password = the resolved token.
+        match &token {
+            Some(pw) => eprintln!("[mcp] auth: OAuth 2.1 + PKCE — password: {pw}"),
+            None => eprintln!("[mcp] auth: OAuth 2.1 + PKCE — WARNING: no password set (run `chatgpt-use init` or pass --token)"),
+        }
+    } else if token.is_some() {
         eprintln!("[mcp] auth: Bearer token required");
     } else {
         eprintln!("[mcp] auth: NONE — consider --token when tunneling");
@@ -304,55 +398,139 @@ pub fn run(args: &McpArgs) -> Result<()> {
         // Read the body before anything else (tiny_http::Request needs &mut for body).
         let mut body_buf = Vec::new();
         std::io::copy(request.as_reader(), &mut body_buf)?;
-        let body_str = String::from_utf8_lossy(&body_buf);
+        let body_str = String::from_utf8_lossy(&body_buf).into_owned();
 
-        // Method + path check.
-        let url_path: &str = {
-            let url = request.url();
-            // strip query string for comparison
+        // Parse the URL into path and raw query string.
+        let (url_path, url_query) = {
+            let url = request.url().to_string();
             if let Some(idx) = url.find('?') {
-                &url[..idx]
+                (url[..idx].to_string(), url[idx + 1..].to_string())
             } else {
-                url
+                (url, String::new())
             }
         };
 
-        // We need 'url_path' as an owned value since request.url() borrows request.
-        let url_path = url_path.to_string();
+        let method = request.method().clone();
 
-        if request.method() != &tiny_http::Method::Post
+        // -----------------------------------------------------------------
+        // OAuth routes — handled BEFORE the JSON-RPC path.
+        // -----------------------------------------------------------------
+        if oauth_mode {
+            let issuer = issuer_from_request(&request);
+
+            match (method.as_str(), url_path.as_str()) {
+                // RFC 8414 discovery
+                ("GET", "/.well-known/oauth-authorization-server") => {
+                    let doc = crate::oauth::discovery_document(&issuer);
+                    respond_json(request, 200, doc.to_string());
+                    continue;
+                }
+                // RFC 9728 protected resource metadata
+                ("GET", "/.well-known/oauth-protected-resource") => {
+                    let doc = crate::oauth::protected_resource_document(&issuer);
+                    respond_json(request, 200, doc.to_string());
+                    continue;
+                }
+                // Dynamic client registration
+                ("POST", "/register") => {
+                    let doc = crate::oauth::register();
+                    respond_json(request, 200, doc.to_string());
+                    continue;
+                }
+                // Authorization form (GET shows the password form)
+                ("GET", "/authorize") => {
+                    let html = crate::oauth::authorize_form_html(&url_query);
+                    respond_html(request, 200, html);
+                    continue;
+                }
+                // Authorization form submission (POST from the browser form)
+                ("POST", "/authorize") => {
+                    // Merge query params + form body so hidden fields survive.
+                    let mut params = crate::oauth::parse_urlencoded(&url_query);
+                    let form_params = crate::oauth::parse_urlencoded(&body_str);
+                    params.extend(form_params);
+
+                    let server_password = token.as_deref().unwrap_or("");
+                    match crate::oauth::authorize_submit(&params, server_password) {
+                        Ok(location) => {
+                            respond_redirect(request, &location);
+                        }
+                        Err(e) => {
+                            respond_json(
+                                request,
+                                400,
+                                json!({"error": "access_denied", "error_description": e}).to_string(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // Token endpoint
+                ("POST", "/token") => {
+                    let is_json = is_json_content_type(&request);
+                    let params = parse_token_body(&body_str, is_json);
+                    match crate::oauth::exchange_token(&params) {
+                        Ok(token_resp) => {
+                            respond_json(request, 200, token_resp.to_string());
+                        }
+                        Err(e) => {
+                            respond_json(
+                                request,
+                                400,
+                                json!({"error": "invalid_grant", "error_description": e}).to_string(),
+                            );
+                        }
+                    }
+                    continue;
+                }
+                _ => {
+                    // Falls through to MCP JSON-RPC handling below (or 404).
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // MCP JSON-RPC path — POST / or POST /mcp only.
+        // -----------------------------------------------------------------
+        if method != tiny_http::Method::Post
             || (url_path != "/" && url_path != "/mcp")
         {
-            let resp = tiny_http::Response::from_string(r#"{"error":"not found"}"#)
-                .with_status_code(404)
-                .with_header(
-                    "Content-Type: application/json"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                );
-            let _ = request.respond(resp);
+            respond_not_found(request);
             continue;
         }
 
-        // Auth gate.
-        if let Some(ref expected) = token {
-            if !auth_ok(&request, expected) {
-                let body = json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": { "code": -32000, "message": "unauthorized: invalid or missing token" }
-                })
-                .to_string();
-                let resp = tiny_http::Response::from_string(body)
-                    .with_status_code(401)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    );
-                let _ = request.respond(resp);
-                continue;
+        // Auth gate — Token mode: check Bearer header or ?token= query param.
+        // Auth gate — OAuth mode: require a valid Bearer issued by our token endpoint.
+        let authed = if oauth_mode {
+            // Extract Bearer from Authorization header.
+            let bearer = request.headers().iter().find_map(|h| {
+                if h.field.equiv("Authorization") {
+                    h.value.as_str().strip_prefix("Bearer ").map(|t| t.to_string())
+                } else {
+                    None
+                }
+            });
+            match bearer {
+                Some(ref t) => crate::oauth::validate_bearer(t),
+                None => false,
             }
+        } else {
+            // Token mode: existing behaviour — no token = open, token = must match.
+            match &token {
+                Some(expected) => auth_ok(&request, expected),
+                None => true,
+            }
+        };
+
+        if !authed {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32000, "message": "unauthorized: invalid or missing token" }
+            })
+            .to_string();
+            respond_json(request, 401, body);
+            continue;
         }
 
         // Parse JSON-RPC.
@@ -371,14 +549,7 @@ pub fn run(args: &McpArgs) -> Result<()> {
             }
         };
 
-        let resp = tiny_http::Response::from_string(response_body)
-            .with_status_code(status)
-            .with_header(
-                "Content-Type: application/json"
-                    .parse::<tiny_http::Header>()
-                    .unwrap(),
-            );
-        let _ = request.respond(resp);
+        respond_json(request, status, response_body);
     }
 }
 
