@@ -26,6 +26,7 @@ fn main() {
         Command::Serve(args) => cmd::serve::run(args),
         Command::Mcp(args) => cmd::mcp::run(args),
         Command::Handoff(args) => cmd::handoff::run(args),
+        Command::Init(args) => cmd::init::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");

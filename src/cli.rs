@@ -27,6 +27,16 @@ pub enum Command {
     Mcp(McpArgs),
     /// Executor handoff — feed a delegation packet to Codex / Claude Code to run.
     Handoff(HandoffArgs),
+    /// One-time setup — generate an auth token at ~/.chatgpt-use/auth.json and
+    /// print the next steps (the `mcp` command auto-loads it when --token is omitted).
+    Init(InitArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    /// Overwrite an existing token.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Which local coding agent executes a handed-off plan.

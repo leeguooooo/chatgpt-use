@@ -265,6 +265,11 @@ pub fn run(args: &McpArgs) -> Result<()> {
     };
 
     let read_only = matches!(args.profile, crate::cli::ToolProfile::ReadOnly);
+    // Effective token: --token wins, else the one saved by `chatgpt-use init`.
+    let token: Option<String> = args
+        .token
+        .clone()
+        .or_else(crate::cmd::init::load_token);
 
     let bind_addr = format!("{}:{}", args.host, args.port);
     let server = tiny_http::Server::http(&bind_addr)
@@ -284,7 +289,7 @@ pub fn run(args: &McpArgs) -> Result<()> {
             "ALL tools incl. write_file + bash — trusted/local only"
         }
     );
-    if args.token.is_some() {
+    if token.is_some() {
         eprintln!("[mcp] auth: Bearer token required");
     } else {
         eprintln!("[mcp] auth: NONE — consider --token when tunneling");
@@ -330,7 +335,7 @@ pub fn run(args: &McpArgs) -> Result<()> {
         }
 
         // Auth gate.
-        if let Some(ref expected) = args.token {
+        if let Some(ref expected) = token {
             if !auth_ok(&request, expected) {
                 let body = json!({
                     "jsonrpc": "2.0",
