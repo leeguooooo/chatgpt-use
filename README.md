@@ -301,10 +301,13 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
   on the browser channel. **Live-verified** (DOM-reverse-engineered: CDP-click the picker, JS-click the item).
 - [x] **Executor handoff** — pipe a delegation packet into a local agent. `--to` is **required** (never a
   silent codex default); dry-run by default. **Live-verified** (dry-run + a real run). Optional side-bridge.
-- [~] **MCP channel** — local MCP JSON-RPC server exposing the tools to a *regular* GPT-5.5. **Server
-  built + verified locally** (initialize/tools.list/tools.call over curl). ChatGPT-side test is pending a
-  **stable public tunnel** — cloudflared quick tunnels 404'd at the edge here; needs ngrok / a named
-  tunnel. Also gated: ChatGPT custom connectors need Developer mode and don't work on Pro.
+- [x] **MCP channel** — local MCP JSON-RPC server exposing the tools to a *regular* GPT-5.5.
+  **Live-verified end-to-end**: registered as a custom connector (Settings → Apps, Developer mode,
+  No-Auth + token-in-URL) over a **named cloudflared tunnel**, then in an Instant chat ChatGPT called
+  `read_file` and returned a random probe string only our server could produce. Named-tunnel recipe (the
+  part that's fiddly): `--protocol http2` to dodge a local WARP+QUIC clash, and
+  `--config /dev/null --credentials-file <this-tunnel.json>` so the default tunnel's secret isn't reused.
+  Pro still can't use connectors — use Instant/Thinking.
 - [x] **Append-only ledger** at `~/.chatgpt-use/ledger.jsonl` (ask/delegate/handoff events). [ ] `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback still pending (for the Mode-2 loop).
 - [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
 
@@ -313,13 +316,13 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
 - [ ] Mode 3 `serve` (Anthropic drop-in) — same wall; PoC only for now.
 - [ ] Optional UI shell (TUI / menubar) for live progress & approval.
 
-> **Status (honest):** The browser main line is live-verified end-to-end: `ask`, structured delegation
-> (`ask --mode plan` → a valid `DelegationPacket`), `--model pro` (switches the level on the page), and
-> `handoff` (renders + runs the executor) all work against real ChatGPT, filing under the project. The
-> **MCP channel** server works locally but its ChatGPT-side test is blocked on a stable tunnel + connector
-> gating. **Modes 2 & 3** (web ChatGPT autonomously calling tools) still hit the role-play wall — open
-> research. Net: ChatGPT is a reliable **planner/reviewer/generator** here; autonomous tool-execution by
-> web ChatGPT is the unsolved part.
+> **Status (honest):** Two channels are now live-verified end-to-end against real ChatGPT.
+> **Browser channel:** `ask`, structured delegation (`ask --mode plan` → a valid `DelegationPacket`),
+> `--model pro` (switches the level on the page), and `handoff` all work, filing under the project.
+> **MCP channel:** a regular GPT-5.5 (Instant) called our local `read_file` over a named cloudflared
+> tunnel and returned a random probe string — so **ChatGPT genuinely runs our tools**, no role-play.
+> The only thing still unsolved is **Modes 2 & 3** (making *web* ChatGPT autonomously call tools via a
+> text protocol) — that hits the role-play wall; the MCP channel is the right way to get native tools.
 
 ---
 
