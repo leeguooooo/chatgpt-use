@@ -30,6 +30,18 @@ pub enum Command {
     /// One-time setup — generate an auth token at ~/.chatgpt-use/auth.json and
     /// print the next steps (the `mcp` command auto-loads it when --token is omitted).
     Init(InitArgs),
+    /// Closed loop — dispatch a task to ChatGPT which DOES it on the local project
+    /// via its chatgpt-use MCP connector (read/build/test/logs), then reports back.
+    /// Requires the connector connected + an `mcp --profile full` server running.
+    Work(WorkArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct WorkArgs {
+    /// The task for ChatGPT to carry out on the local project via its connector tools.
+    pub task: String,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
 }
 
 #[derive(Args, Debug)]
