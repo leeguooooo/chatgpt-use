@@ -155,10 +155,11 @@ fn handle_initialize(id: &Option<Value>) -> Value {
 ///
 /// Our `ToolSpec` uses `input_schema`; the MCP spec calls the same field
 /// `inputSchema` (camelCase). We rename it here.
-fn handle_tools_list(id: &Option<Value>) -> Value {
+fn handle_tools_list(id: &Option<Value>, read_only: bool) -> Value {
     let specs = crate::tools::builtin_specs();
     let tools: Vec<Value> = specs
         .into_iter()
+        .filter(|s| !read_only || crate::tools::is_read_only(&s.name))
         .map(|s| {
             json!({
                 "name": s.name,
@@ -180,13 +181,25 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
 ///   "isError": false
 /// }
 /// ```
-fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path) -> Value {
+fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, read_only: bool) -> Value {
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
             return err_response(id, -32602, "tools/call: missing required param 'name'");
         }
     };
+
+    // Workspace-exposed safety: under the read-only profile, refuse write/exec tools.
+    if read_only && !crate::tools::is_read_only(&name) {
+        return ok_response(
+            id,
+            json!({
+                "content": [{ "type": "text", "text":
+                    format!("tool '{name}' is disabled: this MCP server runs in the read-only profile (read_file/list_dir/grep only). Restart with --profile full on a trusted, non-exposed setup to enable write_file/bash.") }],
+                "isError": true
+            }),
+        );
+    }
 
     let arguments = params
         .get("arguments")
@@ -214,7 +227,7 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path) 
 
 /// Dispatch a single JSON-RPC request and return the response body, or `None`
 /// for notifications (requests without an `id`).
-fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path) -> Option<Value> {
+fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool) -> Option<Value> {
     let id = &req.id;
 
     // Notifications (no `id`) → process but return no response.
@@ -228,9 +241,9 @@ fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path) -> Option<Value> {
             return None;
         }
 
-        "tools/list" => handle_tools_list(id),
+        "tools/list" => handle_tools_list(id, read_only),
 
-        "tools/call" => handle_tools_call(id, &req.params, cwd),
+        "tools/call" => handle_tools_call(id, &req.params, cwd, read_only),
 
         other => err_response(id, -32601, &format!("method not found: {other}")),
     };
@@ -251,6 +264,8 @@ pub fn run(args: &McpArgs) -> Result<()> {
         None => std::env::current_dir()?,
     };
 
+    let read_only = matches!(args.profile, crate::cli::ToolProfile::ReadOnly);
+
     let bind_addr = format!("{}:{}", args.host, args.port);
     let server = tiny_http::Server::http(&bind_addr)
         .map_err(|e| anyhow::anyhow!("failed to bind MCP server on {bind_addr}: {e}"))?;
@@ -259,6 +274,15 @@ pub fn run(args: &McpArgs) -> Result<()> {
     eprintln!(
         "[mcp] cwd: {}",
         cwd.display()
+    );
+    eprintln!(
+        "[mcp] profile: {} ({})",
+        if read_only { "read-only" } else { "full" },
+        if read_only {
+            "read_file/list_dir/grep"
+        } else {
+            "ALL tools incl. write_file + bash — trusted/local only"
+        }
     );
     if args.token.is_some() {
         eprintln!("[mcp] auth: Bearer token required");
@@ -330,7 +354,7 @@ pub fn run(args: &McpArgs) -> Result<()> {
         let (status, response_body) = match parse_jsonrpc(&body_str) {
             Err(err_body) => (200u16, err_body.to_string()),
             Ok(rpc_req) => {
-                match dispatch(&rpc_req, &cwd) {
+                match dispatch(&rpc_req, &cwd, read_only) {
                     None => {
                         // Notification — send empty 204.
                         let resp = tiny_http::Response::empty(204);
@@ -410,7 +434,7 @@ mod tests {
     #[test]
     fn tools_list_contains_all_builtins() {
         let id = Some(json!("req-1"));
-        let resp = handle_tools_list(&id);
+        let resp = handle_tools_list(&id, false);
         let tools = resp["result"]["tools"].as_array().expect("tools should be array");
         let names: Vec<&str> = tools
             .iter()
@@ -424,9 +448,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_profile_hides_and_blocks_write_tools() {
+        // tools/list under read-only shows only read_file/list_dir/grep.
+        let id = Some(json!(1));
+        let resp = handle_tools_list(&id, true);
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read_file") && names.contains(&"list_dir") && names.contains(&"grep"));
+        assert!(!names.contains(&"write_file"), "write_file must be hidden in read-only");
+        assert!(!names.contains(&"bash"), "bash must be hidden in read-only");
+
+        // tools/call to a write tool under read-only is refused with isError.
+        let params = json!({ "name": "bash", "arguments": { "command": "echo hi" } });
+        let resp = handle_tools_call(&id, &params, &std::env::temp_dir(), true);
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("read-only"), "should explain the read-only profile: {text}");
+    }
+
+    #[test]
     fn tools_list_uses_input_schema_camel_case() {
         let id = Some(json!(1));
-        let resp = handle_tools_list(&id);
+        let resp = handle_tools_list(&id, false);
         let tools = resp["result"]["tools"].as_array().unwrap();
         for tool in tools {
             assert!(
@@ -449,7 +496,7 @@ mod tests {
         let id = Some(json!(3));
         let params = json!({ "arguments": {} });
         let cwd = std::env::temp_dir();
-        let resp = handle_tools_call(&id, &params, &cwd);
+        let resp = handle_tools_call(&id, &params, &cwd, false);
         assert_eq!(resp["error"]["code"], -32602);
     }
 
@@ -458,7 +505,7 @@ mod tests {
         let id = Some(json!(4));
         let params = json!({ "name": "no_such_tool", "arguments": {} });
         let cwd = std::env::temp_dir();
-        let resp = handle_tools_call(&id, &params, &cwd);
+        let resp = handle_tools_call(&id, &params, &cwd, false);
         // Unknown tool: tools::execute returns ok=false, which maps to isError=true.
         assert_eq!(resp["result"]["isError"], true);
         let content = &resp["result"]["content"][0];
@@ -475,7 +522,7 @@ mod tests {
 
         let id = Some(json!(5));
         let params = json!({ "name": "read_file", "arguments": { "path": "hello.txt" } });
-        let resp = handle_tools_call(&id, &params, &dir);
+        let resp = handle_tools_call(&id, &params, &dir, false);
 
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -491,7 +538,7 @@ mod tests {
             method: "notifications/initialized".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir());
+        let result = dispatch(&rpc, &std::env::temp_dir(), false);
         assert!(result.is_none(), "notifications should produce no response");
     }
 
@@ -502,7 +549,7 @@ mod tests {
             method: "bogus/method".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir()).unwrap();
+        let result = dispatch(&rpc, &std::env::temp_dir(), false).unwrap();
         assert_eq!(result["error"]["code"], -32601);
     }
 

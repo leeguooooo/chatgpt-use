@@ -253,6 +253,9 @@ chatgpt-use handoff plan.json --to codex|claude-code [--cwd <dir>] [--execute]
 
 # MCP channel — native tools for a regular GPT-5.5 (see MCP setup below)
 chatgpt-use mcp --port 8788 --token <secret> --cwd <project>
+#   --profile read-only (DEFAULT — read_file/list_dir/grep, safe to tunnel)
+#   --profile full      (also write_file/bash — trusted/local only, never expose)
+#   paths are workspace-sandboxed: absolute / ".." / symlink-escapes are rejected
 
 # Mode 2 — brain (experimental browser tool loop)
 chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
@@ -278,8 +281,10 @@ cloudflared tunnel --url http://127.0.0.1:8788     # → paste the https URL int
 #   connector auth header:  Authorization: Bearer <your token>
 ```
 
-⚠️ The MCP server runs `bash`/`write_file` **without human approval** — a leaked tunnel URL + token is
-shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral tunnels.
+⚠️ **Default is `--profile read-only`** (read_file/list_dir/grep, paths sandboxed to `--cwd`), so a
+tunneled server can't write files or run shell. Only pass `--profile full` on a **trusted, non-exposed**
+setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL + token = shell access to
+`--cwd`. Always use a random `--token`, scope `--cwd`, and prefer ephemeral tunnels.
 **Full step-by-step + security notes: [`docs/mcp-setup.html`](docs/mcp-setup.html).**
 
 ---

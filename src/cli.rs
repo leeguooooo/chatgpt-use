@@ -119,6 +119,20 @@ pub struct McpArgs {
     /// Shared secret required to call the server (recommended when tunneled).
     #[arg(long)]
     pub token: Option<String>,
+    /// Which tools to expose: read-only (read_file/list_dir/grep — DEFAULT, safe
+    /// for a public tunnel) or full (also write_file/bash — only on a trusted,
+    /// non-exposed setup).
+    #[arg(long, value_enum, default_value_t = ToolProfile::ReadOnly)]
+    pub profile: ToolProfile,
+}
+
+/// Tool-exposure profile for the MCP channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ToolProfile {
+    /// read_file / list_dir / grep only — safe to expose over a tunnel.
+    ReadOnly,
+    /// All tools incl. write_file + bash — trusted/local use only.
+    Full,
 }
 
 #[derive(Args, Debug)]

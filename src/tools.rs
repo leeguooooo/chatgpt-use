@@ -336,13 +336,48 @@ fn require_string(input: &Value, key: &str) -> Result<String, String> {
 
 /// Resolve a path string against `cwd`, returning an absolute PathBuf.
 /// Relative paths are joined to `cwd`.
+/// Read-only tools — the set exposed under the `read-only` MCP profile.
+pub fn is_read_only(tool_name: &str) -> bool {
+    matches!(tool_name, "read_file" | "list_dir" | "grep")
+}
+
+/// Resolve a tool path inside the workspace, REJECTING anything that escapes it:
+/// absolute paths, `..` traversal, and symlink escapes (the deepest existing
+/// ancestor, canonicalized, must stay under the canonical workspace root). This
+/// is the workspace sandbox for the publicly-exposed MCP channel.
 fn resolve_path(cwd: &Path, path_str: &str) -> Result<PathBuf, String> {
-    let p = if path_str.starts_with('/') {
-        PathBuf::from(path_str)
-    } else {
-        cwd.join(path_str)
+    let req = Path::new(path_str);
+    if req.is_absolute() {
+        return Err(format!(
+            "absolute paths are not allowed: {path_str:?} — use a workspace-relative path"
+        ));
+    }
+    if req
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("path traversal with '..' is not allowed: {path_str:?}"));
+    }
+    let joined = cwd.join(req);
+    let root = cwd
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve workspace root: {e}"))?;
+    // Canonicalize the deepest existing ancestor (the target itself may not exist
+    // yet, e.g. write_file) and confirm it lives under the workspace root.
+    let mut probe = joined.clone();
+    let real = loop {
+        match probe.canonicalize() {
+            Ok(rp) => break rp,
+            Err(_) => match probe.parent() {
+                Some(par) if !par.as_os_str().is_empty() => probe = par.to_path_buf(),
+                _ => return Err(format!("path escapes the workspace: {path_str:?}")),
+            },
+        }
     };
-    Ok(p)
+    if !real.starts_with(&root) {
+        return Err(format!("path escapes the workspace root: {path_str:?}"));
+    }
+    Ok(joined)
 }
 
 /// Prompt on stderr + read from stdin; returns true if the user types y/Y.
