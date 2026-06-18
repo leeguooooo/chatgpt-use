@@ -306,7 +306,7 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
   **stable public tunnel** — cloudflared quick tunnels 404'd at the edge here; needs ngrok / a named
   tunnel. Also gated: ChatGPT custom connectors need Developer mode and don't work on Pro.
 - [ ] **Append-only ledger** + `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback (from `cccc`/`hive`).
-- [ ] **Release** — cut a GitHub-Release binary so `install.sh` works (today: build from source).
+- [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
 
 **Kept as open research tracks (not abandoned):**
 - [ ] Mode 2 `run` (autonomous browser tool loop) — hits the role-play wall; revisit via real multi-turn
