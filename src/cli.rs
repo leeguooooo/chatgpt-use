@@ -89,6 +89,10 @@ pub struct RunArgs {
     /// Hard cap on agent-loop iterations.
     #[arg(long, default_value_t = 40)]
     pub max_steps: u32,
+    /// Command-gating level for `bash` (safe|trusted|dangerous). Local Mode-2
+    /// defaults to trusted.
+    #[arg(long, value_enum, default_value_t = PermissionMode::Trusted)]
+    pub permission_mode: PermissionMode,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
@@ -124,15 +128,31 @@ pub struct McpArgs {
     /// non-exposed setup).
     #[arg(long, value_enum, default_value_t = ToolProfile::ReadOnly)]
     pub profile: ToolProfile,
+    /// Command-gating level for `bash` under --profile full (safe|trusted|dangerous).
+    #[arg(long, value_enum, default_value_t = PermissionMode::Safe)]
+    pub permission_mode: PermissionMode,
 }
 
 /// Tool-exposure profile for the MCP channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ToolProfile {
-    /// read_file / list_dir / grep only — safe to expose over a tunnel.
+    /// read_file / list_dir / grep + git_* only — safe to expose over a tunnel.
     ReadOnly,
-    /// All tools incl. write_file + bash — trusted/local use only.
+    /// All tools incl. write_file / edit_file / bash — trusted/local use only.
     Full,
+}
+
+/// How aggressively to gate side-effecting commands (`bash`). Borrowed from
+/// coding-tools-mcp's permission modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PermissionMode {
+    /// Block destructive, network, and shell-substitution commands; filter
+    /// secret-looking env vars. The default.
+    Safe,
+    /// Allow local-dev commands (incl. network); still filters secret env vars.
+    Trusted,
+    /// No gates at all. Only on a fully trusted machine.
+    Dangerous,
 }
 
 #[derive(Args, Debug)]

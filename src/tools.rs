@@ -5,6 +5,7 @@
 //!
 //! Owned by the CORE agent.
 
+use crate::cli::PermissionMode;
 use crate::protocol::{ToolCall, ToolResult, ToolSpec};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -175,14 +176,14 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
 /// prompt on stderr/stdin for y/N before running; read-only tools never prompt.
 /// Paths are resolved under `cwd`; errors are returned as `ok: false` results
 /// rather than panicking.
-pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool) -> ToolResult {
+pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: PermissionMode) -> ToolResult {
     let result = match call.name.as_str() {
         "read_file" => tool_read_file(&call.input, cwd),
         "write_file" => tool_write_file(&call.input, cwd, auto_approve),
         "edit_file" => tool_edit_file(&call.input, cwd, auto_approve),
         "list_dir" => tool_list_dir(&call.input, cwd),
         "grep" => tool_grep(&call.input, cwd),
-        "bash" => tool_bash(&call.input, cwd, auto_approve),
+        "bash" => tool_bash(&call.input, cwd, auto_approve, perm),
         "git_status" => tool_git(&["status", "--short", "--branch"], cwd),
         "git_diff" => tool_git_diff(&call.input, cwd),
         "git_log" => tool_git(&["log", "--oneline", "-n", "30"], cwd),
@@ -338,8 +339,66 @@ fn tool_grep(input: &Value, cwd: &Path) -> Result<String, String> {
     Ok(matches.join("\n"))
 }
 
-fn tool_bash(input: &Value, cwd: &Path, auto_approve: bool) -> Result<String, String> {
+/// Catastrophic, irreversible patterns blocked even in `trusted` mode.
+fn destructive_reason(cmd: &str) -> Option<String> {
+    let c = cmd.to_lowercase();
+    let pats = [
+        "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -fr /", "rm -rf --no-preserve-root",
+        "mkfs", "dd if=", ":(){", "> /dev/sd", "of=/dev/", "chmod -r 777 /", "chown -r",
+    ];
+    pats.iter()
+        .find(|p| c.contains(**p))
+        .map(|p| format!("destructive pattern {p:?}"))
+}
+
+/// Network-reaching commands, blocked in `safe` mode.
+fn network_reason(cmd: &str) -> Option<String> {
+    let tools = ["curl", "wget", "nc ", "ncat", "netcat", "ssh ", "scp ", "sftp", "telnet", "ftp "];
+    // crude word-ish check on the command head + after pipes/&&/;
+    let segments: Vec<&str> = cmd.split(|ch| ch == '|' || ch == ';' || ch == '&').collect();
+    for seg in segments {
+        let head = seg.trim_start();
+        if let Some(t) = tools.iter().find(|t| head.starts_with(t.trim()) && (head.len() == t.trim().len() || head[t.trim().len()..].starts_with(' '))) {
+            return Some(format!("network command {:?}", t.trim()));
+        }
+    }
+    None
+}
+
+/// Gate a bash command per the permission mode. Returns Some(reason) if blocked.
+fn gate_command(command: &str, perm: PermissionMode) -> Option<String> {
+    match perm {
+        PermissionMode::Dangerous => None,
+        PermissionMode::Trusted => destructive_reason(command),
+        PermissionMode::Safe => destructive_reason(command)
+            .or_else(|| network_reason(command))
+            .or_else(|| {
+                if command.contains("$(") || command.contains('`') {
+                    Some("command substitution ($(…) / backticks)".to_string())
+                } else {
+                    None
+                }
+            }),
+    }
+}
+
+/// Env var names that look secret — filtered out (except in `dangerous` mode).
+fn is_secret_env(name: &str) -> bool {
+    let n = name.to_uppercase();
+    ["SECRET", "TOKEN", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "CREDENTIAL",
+     "PRIVATE_KEY", "ACCESS_KEY", "SESSION", "OPENAI", "ANTHROPIC", "AWS_"]
+        .iter()
+        .any(|p| n.contains(p))
+}
+
+fn tool_bash(input: &Value, cwd: &Path, auto_approve: bool, perm: PermissionMode) -> Result<String, String> {
     let command = require_string(input, "command")?;
+
+    if let Some(reason) = gate_command(&command, perm) {
+        return Err(format!(
+            "bash: blocked by permission policy: {reason}. Re-run with --permission-mode trusted or dangerous to allow."
+        ));
+    }
 
     if !auto_approve {
         let approved = prompt_approval(&format!("bash: run command: {command}"));
@@ -348,10 +407,18 @@ fn tool_bash(input: &Value, cwd: &Path, auto_approve: bool) -> Result<String, St
         }
     }
 
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(cwd)
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&command).current_dir(cwd);
+    // Filter secret-looking env vars unless explicitly in dangerous mode.
+    if !matches!(perm, PermissionMode::Dangerous) {
+        cmd.env_clear();
+        for (k, v) in std::env::vars() {
+            if !is_secret_env(&k) {
+                cmd.env(k, v);
+            }
+        }
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("bash: failed to spawn shell: {e}"))?;
 
@@ -576,7 +643,7 @@ mod tests {
         fs::write(&file, "hello, world\n").unwrap();
 
         let call = make_call("c1", "read_file", json!({"path": "hello.txt"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
 
         assert!(result.ok, "read_file should succeed: {:?}", result.content);
         assert!(result.content.contains("hello, world"));
@@ -586,7 +653,7 @@ mod tests {
     fn read_file_missing() {
         let dir = tmpdir();
         let call = make_call("c1", "read_file", json!({"path": "no_such_file.txt"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(!result.ok, "read_file on missing file should fail");
     }
 
@@ -600,11 +667,11 @@ mod tests {
             "write_file",
             json!({"path": "output.txt", "content": "written content"}),
         );
-        let result = execute(&write_call, &dir, true);
+        let result = execute(&write_call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok, "write_file should succeed: {:?}", result.content);
 
         let read_call = make_call("c2", "read_file", json!({"path": "output.txt"}));
-        let read_result = execute(&read_call, &dir, true);
+        let read_result = execute(&read_call, &dir, true, PermissionMode::Dangerous);
         assert!(read_result.ok);
         assert!(read_result.content.contains("written content"));
     }
@@ -618,7 +685,7 @@ mod tests {
         fs::write(dir.join("b.txt"), "b").unwrap();
 
         let call = make_call("c1", "list_dir", json!({"path": "."}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok, "list_dir should succeed: {:?}", result.content);
         assert!(result.content.contains("a.txt"));
         assert!(result.content.contains("b.txt"));
@@ -632,7 +699,7 @@ mod tests {
         fs::write(dir.join("src.rs"), "fn hello() {}\nfn world() {}\n").unwrap();
 
         let call = make_call("c1", "grep", json!({"pattern": "hello", "path": "src.rs"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok, "grep should succeed: {:?}", result.content);
         assert!(result.content.contains("hello"));
         assert!(!result.content.contains("world"), "should not match 'world'");
@@ -644,7 +711,7 @@ mod tests {
         fs::write(dir.join("empty.rs"), "fn foo() {}").unwrap();
 
         let call = make_call("c1", "grep", json!({"pattern": "XYZZY_NOT_FOUND", "path": "."}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok);
         assert!(result.content.contains("no matches"));
     }
@@ -653,7 +720,7 @@ mod tests {
     fn grep_invalid_regex_returns_error() {
         let dir = tmpdir();
         let call = make_call("c1", "grep", json!({"pattern": "[invalid"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(!result.ok);
         assert!(result.content.contains("invalid regex"));
     }
@@ -664,7 +731,7 @@ mod tests {
     fn bash_runs_command_auto_approved() {
         let dir = tmpdir();
         let call = make_call("c1", "bash", json!({"command": "echo 'hello from bash'"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok, "bash should succeed: {:?}", result.content);
         assert!(result.content.contains("hello from bash"));
     }
@@ -673,7 +740,7 @@ mod tests {
     fn bash_captures_exit_code_on_failure() {
         let dir = tmpdir();
         let call = make_call("c1", "bash", json!({"command": "exit 42"}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         // ok can be true (we ran it) but the content should mention the exit code.
         assert!(result.content.contains("42"), "should report non-zero exit code");
     }
@@ -684,9 +751,31 @@ mod tests {
     fn unknown_tool_returns_error() {
         let dir = tmpdir();
         let call = make_call("c1", "no_such_tool", json!({}));
-        let result = execute(&call, &dir, true);
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(!result.ok);
         assert!(result.content.contains("unknown tool"));
+    }
+
+    // --- permission gating + sandbox ---
+
+    #[test]
+    fn permission_modes_gate_bash() {
+        assert!(gate_command("curl http://x", PermissionMode::Safe).is_some());
+        assert!(gate_command("echo hi", PermissionMode::Safe).is_none());
+        assert!(gate_command("rm -rf /", PermissionMode::Trusted).is_some());
+        assert!(gate_command("curl http://x", PermissionMode::Trusted).is_none());
+        assert!(gate_command("rm -rf /", PermissionMode::Dangerous).is_none());
+        assert!(is_secret_env("OPENAI_API_KEY"));
+        assert!(is_secret_env("MY_SECRET"));
+        assert!(!is_secret_env("PATH"));
+    }
+
+    #[test]
+    fn resolve_path_rejects_escapes() {
+        let dir = tmpdir();
+        assert!(resolve_path(&dir, "../etc/passwd").is_err());
+        assert!(resolve_path(&dir, "/etc/passwd").is_err());
+        assert!(resolve_path(&dir, "sub/ok.txt").is_ok());
     }
 
     // --- builtin_specs ---

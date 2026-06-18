@@ -97,7 +97,7 @@ fn agent_loop(
                 let auto_approve = !args.approve;
                 let results: Vec<_> = calls
                     .iter()
-                    .map(|call| tools::execute(call, cwd, auto_approve))
+                    .map(|call| tools::execute(call, cwd, auto_approve, args.permission_mode))
                     .collect();
 
                 // Feed observations back to ChatGPT and get the next reply.

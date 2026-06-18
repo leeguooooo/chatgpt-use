@@ -22,7 +22,7 @@
 //!
 //! Owned by the MCP agent.
 
-use crate::cli::McpArgs;
+use crate::cli::{McpArgs, PermissionMode};
 use crate::protocol::ToolCall;
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -181,7 +181,7 @@ fn handle_tools_list(id: &Option<Value>, read_only: bool) -> Value {
 ///   "isError": false
 /// }
 /// ```
-fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, read_only: bool) -> Value {
+fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, read_only: bool, perm: PermissionMode) -> Value {
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -212,7 +212,7 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, 
         input: arguments,
     };
 
-    let result = crate::tools::execute(&call, cwd, true /* auto_approve — no human in this loop */);
+    let result = crate::tools::execute(&call, cwd, true /* auto_approve — no human in this loop */, perm);
 
     ok_response(
         id,
@@ -227,7 +227,7 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, 
 
 /// Dispatch a single JSON-RPC request and return the response body, or `None`
 /// for notifications (requests without an `id`).
-fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool) -> Option<Value> {
+fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool, perm: PermissionMode) -> Option<Value> {
     let id = &req.id;
 
     // Notifications (no `id`) → process but return no response.
@@ -243,7 +243,7 @@ fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool) -> Opt
 
         "tools/list" => handle_tools_list(id, read_only),
 
-        "tools/call" => handle_tools_call(id, &req.params, cwd, read_only),
+        "tools/call" => handle_tools_call(id, &req.params, cwd, read_only, perm),
 
         other => err_response(id, -32601, &format!("method not found: {other}")),
     };
@@ -354,7 +354,7 @@ pub fn run(args: &McpArgs) -> Result<()> {
         let (status, response_body) = match parse_jsonrpc(&body_str) {
             Err(err_body) => (200u16, err_body.to_string()),
             Ok(rpc_req) => {
-                match dispatch(&rpc_req, &cwd, read_only) {
+                match dispatch(&rpc_req, &cwd, read_only, args.permission_mode) {
                     None => {
                         // Notification — send empty 204.
                         let resp = tiny_http::Response::empty(204);
@@ -464,7 +464,7 @@ mod tests {
 
         // tools/call to a write tool under read-only is refused with isError.
         let params = json!({ "name": "bash", "arguments": { "command": "echo hi" } });
-        let resp = handle_tools_call(&id, &params, &std::env::temp_dir(), true);
+        let resp = handle_tools_call(&id, &params, &std::env::temp_dir(), true, PermissionMode::Dangerous);
         assert_eq!(resp["result"]["isError"], json!(true));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("read-only"), "should explain the read-only profile: {text}");
@@ -496,7 +496,7 @@ mod tests {
         let id = Some(json!(3));
         let params = json!({ "arguments": {} });
         let cwd = std::env::temp_dir();
-        let resp = handle_tools_call(&id, &params, &cwd, false);
+        let resp = handle_tools_call(&id, &params, &cwd, false, PermissionMode::Dangerous);
         assert_eq!(resp["error"]["code"], -32602);
     }
 
@@ -505,7 +505,7 @@ mod tests {
         let id = Some(json!(4));
         let params = json!({ "name": "no_such_tool", "arguments": {} });
         let cwd = std::env::temp_dir();
-        let resp = handle_tools_call(&id, &params, &cwd, false);
+        let resp = handle_tools_call(&id, &params, &cwd, false, PermissionMode::Dangerous);
         // Unknown tool: tools::execute returns ok=false, which maps to isError=true.
         assert_eq!(resp["result"]["isError"], true);
         let content = &resp["result"]["content"][0];
@@ -522,7 +522,7 @@ mod tests {
 
         let id = Some(json!(5));
         let params = json!({ "name": "read_file", "arguments": { "path": "hello.txt" } });
-        let resp = handle_tools_call(&id, &params, &dir, false);
+        let resp = handle_tools_call(&id, &params, &dir, false, PermissionMode::Dangerous);
 
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -538,7 +538,7 @@ mod tests {
             method: "notifications/initialized".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir(), false);
+        let result = dispatch(&rpc, &std::env::temp_dir(), false, PermissionMode::Dangerous);
         assert!(result.is_none(), "notifications should produce no response");
     }
 
@@ -549,7 +549,7 @@ mod tests {
             method: "bogus/method".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir(), false).unwrap();
+        let result = dispatch(&rpc, &std::env::temp_dir(), false, PermissionMode::Dangerous).unwrap();
         assert_eq!(result["error"]["code"], -32601);
     }
 
