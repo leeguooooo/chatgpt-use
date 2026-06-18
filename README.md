@@ -305,7 +305,7 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
   built + verified locally** (initialize/tools.list/tools.call over curl). ChatGPT-side test is pending a
   **stable public tunnel** — cloudflared quick tunnels 404'd at the edge here; needs ngrok / a named
   tunnel. Also gated: ChatGPT custom connectors need Developer mode and don't work on Pro.
-- [ ] **Append-only ledger** + `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback (from `cccc`/`hive`).
+- [x] **Append-only ledger** at `~/.chatgpt-use/ledger.jsonl` (ask/delegate/handoff events). [ ] `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback still pending (for the Mode-2 loop).
 - [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
 
 **Kept as open research tracks (not abandoned):**

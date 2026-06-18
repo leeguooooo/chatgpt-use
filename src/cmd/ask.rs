@@ -50,6 +50,15 @@ fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     channel.close();
 
     let text = reply?;
+    crate::ledger::record(
+        "ask",
+        serde_json::json!({
+            "prompt_chars": args.prompt.len(),
+            "files": args.files.len(),
+            "model": args.channel.model,
+            "reply_chars": text.len(),
+        }),
+    );
     println!("{text}");
 
     Ok(())
@@ -81,6 +90,16 @@ fn run_delegation_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     // Parse the structured reply into a DelegationPacket.
     let packet = delegation::parse_packet(&reply)
         .with_context(|| "ChatGPT reply did not contain a valid delegation packet")?;
+
+    crate::ledger::record(
+        "delegate",
+        serde_json::json!({
+            "mode": format!("{:?}", args.mode),
+            "goal": packet.goal,
+            "verdict": format!("{:?}", packet.verdict),
+            "model": args.channel.model,
+        }),
+    );
 
     if args.json {
         // Machine-readable: emit the packet as pretty JSON.

@@ -11,6 +11,7 @@ mod channel; // chrome-use-driven transport to the ChatGPT web conversation
 mod cli; // clap argument definitions
 mod cmd; // subcommand entry points (ask / run / serve / mcp / handoff)
 mod delegation; // structured delegation packets (the planner/reviewer main line)
+mod ledger; // append-only audit trail at ~/.chatgpt-use/ledger.jsonl
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
 

@@ -201,6 +201,16 @@ pub fn run(args: &HandoffArgs) -> Result<()> {
         Executor::ClaudeCode => "Claude Code",
     };
 
+    crate::ledger::record(
+        "handoff",
+        serde_json::json!({
+            "to": executor_label,
+            "verdict": format!("{:?}", packet.verdict),
+            "executed": args.execute,
+            "goal": packet.goal,
+        }),
+    );
+
     // 5. Execute or dry-run.
     if args.execute {
         println!("=== HANDOFF: executing via {executor_label} ===");
