@@ -251,10 +251,16 @@ chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json]
 chatgpt-use ask "<task>" --mode plan --json > plan.json
 chatgpt-use handoff plan.json --to codex|claude-code [--cwd <dir>] [--execute]
 
+# One-time setup — generate ~/.chatgpt-use/auth.json (mcp auto-loads it)
+chatgpt-use init
+
 # MCP channel — native tools for a regular GPT-5.5 (see MCP setup below)
-chatgpt-use mcp --port 8788 --token <secret> --cwd <project>
-#   --profile read-only (DEFAULT — read_file/list_dir/grep, safe to tunnel)
-#   --profile full      (also write_file/bash — trusted/local only, never expose)
+chatgpt-use mcp --port 8788 [--token <secret>] --cwd <project>
+#   tools (read-only): read_file/list_dir/grep + git_status/diff/log/show/blame
+#   tools (full only):  write_file/edit_file/bash
+#   --profile read-only (DEFAULT, safe to tunnel) | full (trusted/local only)
+#   --permission-mode safe (DEFAULT) | trusted | dangerous   (gates bash + secret-env filter)
+#   --auth-mode token (DEFAULT) | oauth                      (OAuth 2.1 + PKCE)
 #   paths are workspace-sandboxed: absolute / ".." / symlink-escapes are rejected
 
 # Mode 2 — brain (experimental browser tool loop)
@@ -298,10 +304,18 @@ setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL
 - [x] Mode 2 `run` agent loop + approval gate — implemented (see fidelity note ⬇)
 - [x] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in — implemented PoC
 - [x] `install.sh` + GitHub-Release workflow
-**Borrowed strengths → the new main line (we keep all modes; this is where effort goes):**
-- [ ] **Structured delegation** — upgrade `ask` into mode-typed packets (`--mode plan|review|debug|research`),
-  compact local-context gathering, and a strict `verdict: proceed|revise|blocked` schema with fail-fast
-  parsing (from `codex-chatgpt-bridge`). This is the proven, Pro-compatible core.
+**Borrowed strengths → the main line (all live-verified unless noted):**
+- [x] **Structured delegation** — `ask --mode plan|review|debug|research` gathers `--file` context, sends a
+  typed machine-delegation packet, parses a strict `verdict: proceed|revise|blocked` packet (fail-fast).
+  **Live-verified** (from `codex-chatgpt-bridge`).
+- [x] **Read-only profile (default) + workspace sandbox** — `mcp --profile read-only|full`; paths reject
+  absolute/`..`/symlink-escape. Safe to tunnel by default. (from `coding-tools-mcp`)
+- [x] **More tools** — `git_status/diff/log/show/blame` (read-only) + `edit_file` (exact unique replace).
+- [x] **Permission modes + secret-env filtering** — `--permission-mode safe|trusted|dangerous` gates
+  destructive/network/substitution `bash`; secret-looking env vars stripped. (from `coding-tools-mcp`)
+- [x] **OAuth 2.1 + PKCE** — `mcp --auth-mode oauth` (discovery/register/authorize/token); full flow
+  verified locally. Token-in-URL stays the ChatGPT-verified default. (from `coding-tools-mcp`)
+- [x] **`init`** — `chatgpt-use init` writes `~/.chatgpt-use/auth.json`; `mcp` auto-loads it. (from `devspace`)
 - [x] **`--model` flag** — select the composer Intelligence level (instant/medium/high/extra high/**pro**)
   on the browser channel. **Live-verified** (DOM-reverse-engineered: CDP-click the picker, JS-click the item).
 - [x] **Executor handoff** — pipe a delegation packet into a local agent. `--to` is **required** (never a
