@@ -297,12 +297,16 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
 - [ ] **Structured delegation** — upgrade `ask` into mode-typed packets (`--mode plan|review|debug|research`),
   compact local-context gathering, and a strict `verdict: proceed|revise|blocked` schema with fail-fast
   parsing (from `codex-chatgpt-bridge`). This is the proven, Pro-compatible core.
-- [ ] **`--model` flag** — select GPT-5.5 Pro / Thinking on the browser channel (Pro can't be reached any
-  other way; today we use the account default).
-- [ ] **Executor handoff** — pipe a delegation packet into Codex / Claude Code to run the plan.
-- [ ] **MCP channel** — local MCP server + public tunnel for native tool-calling on *regular* GPT-5.5
-  (the no-role-play path; from `cccc`).
+- [x] **`--model` flag** — select the composer Intelligence level (instant/medium/high/extra high/**pro**)
+  on the browser channel. **Live-verified** (DOM-reverse-engineered: CDP-click the picker, JS-click the item).
+- [x] **Executor handoff** — pipe a delegation packet into a local agent. `--to` is **required** (never a
+  silent codex default); dry-run by default. **Live-verified** (dry-run + a real run). Optional side-bridge.
+- [~] **MCP channel** — local MCP JSON-RPC server exposing the tools to a *regular* GPT-5.5. **Server
+  built + verified locally** (initialize/tools.list/tools.call over curl). ChatGPT-side test is pending a
+  **stable public tunnel** — cloudflared quick tunnels 404'd at the edge here; needs ngrok / a named
+  tunnel. Also gated: ChatGPT custom connectors need Developer mode and don't work on Pro.
 - [ ] **Append-only ledger** + `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback (from `cccc`/`hive`).
+- [ ] **Release** — cut a GitHub-Release binary so `install.sh` works (today: build from source).
 
 **Kept as open research tracks (not abandoned):**
 - [ ] Mode 2 `run` (autonomous browser tool loop) — hits the role-play wall; revisit via real multi-turn
@@ -310,12 +314,13 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
 - [ ] Mode 3 `serve` (Anthropic drop-in) — same wall; PoC only for now.
 - [ ] Optional UI shell (TUI / menubar) for live progress & approval.
 
-> **Status (honest):** Mode 1 works live (a real, cited research report came back through it). Modes 2 & 3
-> are fully built + unit-tested but hit the wall: across 3 prompt framings, web ChatGPT refused to
-> role-play tools. So the **main line pivots** to "ChatGPT-as-planner + structured handoff + dual-channel"
-> (all good ideas borrowed from cccc / hive / codex-chatgpt-bridge), while Modes 2/3 stay as slow research.
-> Caveat: the research above ran on the **account default model, not Pro** — Pro (browser-only) should be
-> stronger still, pending the `--model` flag.
+> **Status (honest):** The browser main line is live-verified end-to-end: `ask`, structured delegation
+> (`ask --mode plan` → a valid `DelegationPacket`), `--model pro` (switches the level on the page), and
+> `handoff` (renders + runs the executor) all work against real ChatGPT, filing under the project. The
+> **MCP channel** server works locally but its ChatGPT-side test is blocked on a stable tunnel + connector
+> gating. **Modes 2 & 3** (web ChatGPT autonomously calling tools) still hit the role-play wall — open
+> research. Net: ChatGPT is a reliable **planner/reviewer/generator** here; autonomous tool-execution by
+> web ChatGPT is the unsolved part.
 
 ---
 
