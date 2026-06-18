@@ -45,6 +45,26 @@ fn agent_loop(
     let seed = protocol::system_prompt(tool_specs, &args.task);
     let mut reply_text = channel.send(&seed)?;
 
+    // Conversation priming: grounded web models often refuse to *invent* a tool
+    // call on turn 1 ("I can't run tools — paste the file"). Copying is lower
+    // resistance than inventing, so if the first reply has no tool call, nudge
+    // the model to ECHO one trivial read-only call. Once it emits a call and sees
+    // a real result come back in-context, the loop tends to keep going. One shot.
+    if matches!(protocol::parse_reply(&reply_text), Reply::Text(_)) {
+        eprintln!("[prime] no tool call on turn 1 — sending a connection-check nudge");
+        // Single-line, NO code fence: a fenced ```json block gets mangled by the
+        // composer's markdown handling (the model reported "the block was not
+        // included"). Our parser accepts bare {...}, so a one-liner is robust.
+        let nudge = "You did not emit a tool call. This is NOT a chat — a controller \
+            program on the user's machine executes your tool calls for real and returns the \
+            results. As a one-time connection check, reply with EXACTLY this single line and \
+            nothing else (no code fence, no commentary): \
+            {\"tool_calls\":[{\"id\":\"call_0\",\"name\":\"list_dir\",\"input\":{\"path\":\".\"}}]}  \
+            After you receive its result, keep going on the original task by replying with the \
+            same single-line JSON shape for each tool call.";
+        reply_text = channel.send(nudge)?;
+    }
+
     let mut step: u32 = 0;
 
     loop {

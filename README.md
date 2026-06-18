@@ -309,8 +309,7 @@ shell access to `--cwd`. Use a random `--token`, scope `--cwd`, prefer ephemeral
 - [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
 
 **Kept as open research tracks (not abandoned):**
-- [ ] Mode 2 `run` (autonomous browser tool loop) — hits the role-play wall; revisit via real multi-turn
-  conversation priming. Experimental.
+- [~] Mode 2 `run` (autonomous browser tool loop) — added a one-shot **priming nudge** (echo a trivial tool call to bootstrap the loop). Live result: **intermittent** — sometimes the model engages, often still refuses. Run-to-run variance is high; reliable autonomous tool-calling needs the MCP channel (native tools), not browser role-play. Experimental.
 - [ ] Mode 3 `serve` (Anthropic drop-in) — same wall; PoC only for now.
 - [ ] Optional UI shell (TUI / menubar) for live progress & approval.
 
