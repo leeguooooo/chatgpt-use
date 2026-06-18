@@ -3,7 +3,7 @@
 > Turn your **ChatGPT web subscription** into a coding-agent backend — **no API key, no Codex billing.**
 > Built on [`chrome-use`](https://github.com/leeguooooo/chrome-use), same lineage as [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) and [`cookie-use`](https://github.com/leeguooooo/cookie-use).
 
-<p align="center"><em>🚧 Experimental · design phase. The architecture below is the contract; the binary is being built against it.</em></p>
+<p align="center"><em>🧪 Experimental · <strong>v0.0.1 released</strong>. Browser main line (ask · structured delegation · <code>--model pro</code> · handoff) is live-verified; install with the one-liner below.</em></p>
 
 ![chatgpt-use](assets/hero.png)
 
