@@ -51,8 +51,9 @@ pub struct ChannelArgs {
     /// Total wall-clock budget per model turn, in seconds.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
-    /// Select the browser-channel model: pro | thinking | instant | <raw label>.
-    /// GPT-5.5 Pro can only be reached here (it has no Apps/MCP). Default: account default.
+    /// Select the composer "Intelligence" level: instant | medium | high |
+    /// "extra high" | pro (or a raw menu label). GPT-5.5 Pro can only be reached
+    /// here (it has no Apps/MCP). Default: the account's current level.
     #[arg(long)]
     pub model: Option<String>,
 }

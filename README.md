@@ -260,7 +260,7 @@ chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
 chatgpt-use serve --port 8787   # then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 
 # shared channel flags
-#   --model     pro | thinking | instant   (browser channel; Pro is browser-only)
+#   --model     instant | medium | high | "extra high" | pro   (Pro is browser-only)
 #   --profile   auto (default) | relay | "Profile 3"
 #   --session   reuse a chrome-use tab group   --project  file under a ChatGPT Project
 ```

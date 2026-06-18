@@ -208,15 +208,8 @@ impl Channel {
 
         let chan = Channel { ab, session, timeout_secs };
 
-        // Optionally select a specific model in the composer before sending.
-        if let Some(ref model) = opts.model {
-            let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
-            if let Err(e) = chan.select_model(model, model_deadline) {
-                eprintln!("warning: could not select model {model:?}: {e}; using account default");
-            }
-        }
-
-        // Optionally navigate into a ChatGPT Project.
+        // Navigate into a ChatGPT Project FIRST — it loads a new page and would
+        // reset any model selection, so model selection must come afterwards.
         let project = opts.project.trim().to_string();
         if !project.is_empty() {
             let proj_deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -226,6 +219,15 @@ impl Channel {
                 let restore_deadline = Instant::now() + Duration::from_secs(30);
                 let _ = ab_open(&chan.ab, &chan.session, WEB_NEW_CHAT_URL, None, restore_deadline);
                 let _ = wait_composer(&chan.ab, &chan.session, restore_deadline, 15);
+            }
+        }
+
+        // Select the Intelligence level on the now-settled composer (after any
+        // project navigation), best-effort.
+        if let Some(ref model) = opts.model {
+            let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
+            if let Err(e) = chan.select_model(model, model_deadline) {
+                eprintln!("warning: could not select model {model:?}: {e}; using account default");
             }
         }
 
@@ -445,16 +447,21 @@ impl Channel {
         Ok(())
     }
 
-    /// Select a model in the ChatGPT composer. Best-effort: logs a warning and
-    /// continues with the account default if the picker cannot be found or the
-    /// label does not match. Model names are normalised case-insensitively:
-    ///   "pro"      → looks for a menu item containing "Pro"
-    ///   "thinking" → looks for a menu item containing "Thinking"
-    ///   "instant"  → looks for a menu item containing "Instant" (default for free/Plus)
-    ///   anything else is matched verbatim (substring, case-insensitive).
+    /// Select an "Intelligence" level in the ChatGPT composer (verified against
+    /// the live UI 2026-06: the composer has one picker button whose text is the
+    /// current level — Instant / Medium / High / Extra High / Pro — and opens a
+    /// menu of those items). GPT-5.5 *Pro* is the "Pro" level here.
     ///
-    /// Driven via JS element.click() — more reliable than coordinate clicks on
-    /// an element whose position shifts with layout reflows.
+    /// Two non-obvious facts the live DOM forced:
+    ///   1. The picker opens ONLY on a real input click — a JS `element.click()`
+    ///      does nothing — so we fetch its coords and click via `chrome-use click
+    ///      x y` (a CDP input event).
+    ///   2. The menu ITEMS, by contrast, respond fine to JS `element.click()`.
+    ///
+    /// Best-effort: warns and continues with the account default if anything
+    /// can't be found. Labels are normalised case-insensitively:
+    ///   pro → "Pro", instant → "Instant", medium → "Medium", high → "High",
+    ///   "extra high" → "Extra High"; anything else passes through verbatim.
     fn select_model(&self, model: &str, deadline: Instant) -> Result<()> {
         let remaining = || {
             deadline
@@ -464,107 +471,83 @@ impl Channel {
                 .max(2.0)
         };
 
-        // Normalise the caller's label into a substring we search for in the
-        // picker menu items (case-insensitive).
         let model_lower = model.trim().to_lowercase();
         let target_label: &str = match model_lower.as_str() {
-            "pro"      => "Pro",
-            "thinking" => "Thinking",
-            "instant"  => "Instant",
-            _          => model.trim(),  // raw label passed through unchanged
+            "pro" => "Pro",
+            "instant" => "Instant",
+            "medium" => "Medium",
+            "high" => "High",
+            "extra high" | "extrahigh" | "extra-high" => "Extra High",
+            _ => model.trim(), // raw label passed through unchanged
         };
-        // Escape for embedding in a JS string literal.
         let target_json = serde_json::to_string(target_label)
             .unwrap_or_else(|_| format!("\"{}\"", target_label));
 
-        // Step 1: click the model/mode picker button in the composer.
-        // The button is typically labelled "Instant", "Thinking", or "GPT-5.5 Pro"
-        // and lives next to the file-upload / tools buttons.  We look for the
-        // button by several selectors that have been stable across recent ChatGPT
-        // layouts, trying them in order.
-        let js_click_picker = r#"(() => {
-  // Skip the account/profile button — its aria-label contains the plan name
-  // ("… Pro, open profile menu"), which used to get mis-clicked.
+        // Step 1: locate the composer picker button and return its CENTER coords.
+        // The picker is a button whose ENTIRE text is the current level label
+        // (Instant / Medium / High / Extra High / Pro). Search document-wide (the
+        // project page nests the composer deeper than a fixed parent-walk reaches)
+        // and exclude the account/profile button ("ChatGPT Pro …"). The picker can
+        // render a beat after #prompt-textarea, so the caller retries.
+        let js_find_picker = r#"(() => {
+  const LEVELS = ['instant','medium','high','extra high','pro'];
   const isProfile = el => {
     const al = (el.getAttribute('aria-label') || '').toLowerCase();
-    return al.includes('profile') || al.includes('account') || al.includes('open profile');
+    return al.includes('profile') || al.includes('account');
   };
-  // Specific, safe selectors for the composer model/mode picker.
-  const selectors = [
-    'button[data-testid*="model" i]',
-    'button[data-testid*="mode" i]',
-    'button[aria-label="Instant"]',
-    'button[aria-label="Thinking"]',
-    'button[aria-label*="model selector" i]',
-  ];
-  for (const sel of selectors) {
-    const btn = document.querySelector(sel);
-    if (btn && !isProfile(btn)) { btn.click(); return JSON.stringify({ok: true, sel}); }
-  }
-  // Fallback: a SHORT composer button whose text is a whole-word model/mode label
-  // (e.g. exactly "Instant"/"Thinking"/"Auto"/"GPT-5.5"). Never the profile button.
-  const KW = ['instant', 'thinking', 'auto', 'pro', 'gpt-5.5', 'gpt'];
-  const area = document.querySelector('form, #composer-background, main') || document;
-  for (const b of area.querySelectorAll('button')) {
+  for (const b of document.querySelectorAll('button')) {
     if (isProfile(b)) continue;
     const txt = (b.textContent || '').trim();
-    if (txt.length === 0 || txt.length > 18) continue;
-    const words = txt.toLowerCase().split(/[^a-z0-9.]+/).filter(Boolean);
-    if (KW.some(k => words.includes(k))) {
-      b.click();
-      return JSON.stringify({ok: true, sel: 'text:' + txt.slice(0, 24)});
-    }
+    if (txt.length === 0 || txt.length > 16) continue;
+    if (!LEVELS.includes(txt.toLowerCase())) continue;
+    const r = b.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;        // not visible
+    if (r.top < 0 || r.left < 0) continue;
+    return JSON.stringify({ok: true, x: Math.round(r.left + r.width/2),
+                           y: Math.round(r.top + r.height/2), label: txt});
   }
-  return JSON.stringify({ok: false, error: 'picker button not found'});
+  return JSON.stringify({ok: false, error: 'composer level picker not found'});
 })()"#;
 
-        let open_result = ab_eval(&self.ab, js_click_picker, &self.session, remaining())?;
-        let picker_opened = open_result
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !picker_opened {
-            let detail = open_result
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+        // Retry: the picker can appear shortly after the composer.
+        let mut pick = serde_json::Value::Null;
+        for attempt in 0..6 {
+            pick = ab_eval(&self.ab, js_find_picker, &self.session, remaining())?;
+            if pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                break;
+            }
+            if attempt < 5 {
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        }
+        if !pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
             bail!("model picker button not found: {detail}");
         }
+        let (x, y) = match (pick.get("x").and_then(|v| v.as_i64()), pick.get("y").and_then(|v| v.as_i64())) {
+            (Some(x), Some(y)) => (x, y),
+            _ => bail!("model picker coords missing"),
+        };
 
-        // Brief pause for the menu to animate open.
-        std::thread::sleep(Duration::from_millis(400));
+        // Real CDP click to open the menu (JS .click() does NOT open it).
+        let (xs, ys) = (x.to_string(), y.to_string());
+        ab_cmd(&self.ab, &["click", &xs, &ys], &self.session, remaining())
+            .context("clicking the composer level picker")?;
+        std::thread::sleep(Duration::from_millis(450));
 
-        // Step 2: find the menu item whose text contains the target label and
-        // click it via JS (element.click() is reliable for menu items).
+        // Step 2: click the menu item whose text whole-word matches the target.
+        // Menu items DO respond to JS element.click().
         let js_select_item = format!(
             r#"(() => {{
   const target = {target_json};
-  // WHOLE-WORD, case-insensitive match — NOT substring. This is the fix for the
-  // bug where target "Pro" matched "Share project" (contains the substring "pro").
   const norm = s => (s || '').toLowerCase();
   const wordEq = (txt, t) => {{
     const tt = norm(t);
     if (norm(txt) === tt) return true;
-    const words = norm(txt).split(/[^a-z0-9.]+/).filter(Boolean);
-    return words.includes(tt);
+    return norm(txt).split(/[^a-z0-9.]+/).filter(Boolean).includes(tt);
   }};
-  // Prefer items inside an OPENED floating menu/listbox (the picker we just
-  // opened), so we don't pick a stray menuitem elsewhere on the page.
-  const layers = [
-    ...document.querySelectorAll('[data-radix-popper-content-wrapper]'),
-    ...document.querySelectorAll('[data-floating-ui-portal]'),
-    ...document.querySelectorAll('[role="menu"]'),
-    ...document.querySelectorAll('[role="listbox"]'),
-  ];
-  for (const layer of layers) {{
-    for (const el of layer.querySelectorAll('[role="menuitem"], [role="option"], button, [tabindex]')) {{
-      const txt = (el.textContent || '').trim();
-      if (wordEq(txt, target)) {{ el.click(); return JSON.stringify({{ok: true, matched: txt}}); }}
-    }}
-  }}
-  // Fallback: document-wide menu roles, still whole-word matched.
-  for (const el of document.querySelectorAll('[role="menuitem"], [role="option"], [role="listitem"]')) {{
+  const items = document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
+  for (const el of items) {{
     const txt = (el.textContent || '').trim();
     if (wordEq(txt, target)) {{ el.click(); return JSON.stringify({{ok: true, matched: txt}}); }}
   }}
@@ -574,27 +557,41 @@ impl Channel {
         );
 
         let select_result = ab_eval(&self.ab, &js_select_item, &self.session, remaining())?;
-        let selected = select_result
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !selected {
-            let detail = select_result
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+        if !select_result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let detail = select_result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
             bail!("model menu item not found: {detail}");
         }
+        std::thread::sleep(Duration::from_millis(350));
 
-        let matched = select_result
-            .get("matched")
-            .and_then(|v| v.as_str())
-            .unwrap_or(target_label);
-        eprintln!("model selected: {matched:?}");
-
-        // Brief pause for the menu to close and the composer to settle.
-        std::thread::sleep(Duration::from_millis(300));
+        // Step 3: verify the picker label now reflects the target (whole-word).
+        let verify_json = target_json.clone();
+        let js_verify = format!(
+            r#"(() => {{
+  const target = {verify_json};
+  const ta = document.querySelector('#prompt-textarea');
+  let area = ta;
+  for (let i = 0; i < 6 && area && area.parentElement; i++) area = area.parentElement;
+  area = area || document;
+  const norm = s => (s || '').toLowerCase();
+  for (const b of area.querySelectorAll('button')) {{
+    const txt = (b.textContent || '').trim();
+    if (txt.length > 0 && txt.length <= 16 && norm(txt) === norm(target)) {{
+      return JSON.stringify({{ok: true, label: txt}});
+    }}
+  }}
+  return JSON.stringify({{ok: false}});
+}})()"#,
+            verify_json = verify_json
+        );
+        let verified = ab_eval(&self.ab, &js_verify, &self.session, remaining())
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        if verified {
+            eprintln!("model selected: {target_label:?}");
+        } else {
+            eprintln!("warning: clicked {target_label:?} but could not confirm the picker switched");
+        }
 
         Ok(())
     }
