@@ -316,6 +316,12 @@ impl Channel {
         // hanging until the total timeout.
         const IDLE_LIMIT: u32 = 30;
 
+        // Heartbeat: the page can think silently for minutes, so emit an
+        // elapsed-time progress line to stderr (~every 5s) so the wait is visible.
+        let started = Instant::now();
+        let mut last_beat: u64 = 0;
+        eprintln!("[   0.0s] submitted; waiting for reply");
+
         loop {
             if Instant::now() >= deadline {
                 bail!(
@@ -343,6 +349,14 @@ impl Channel {
                 .get("assistant_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+
+            // Throttled heartbeat (~every 5s).
+            let elapsed = started.elapsed().as_secs();
+            if elapsed >= last_beat + 5 {
+                last_beat = elapsed;
+                let phase = if stop { "generating" } else { "waiting for reply" };
+                eprintln!("[{elapsed:5}.0s] {phase}");
+            }
             let atext = st
                 .get("atext")
                 .and_then(|v| v.as_str())
