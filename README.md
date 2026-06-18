@@ -241,6 +241,11 @@ Then make sure you have a Chrome profile logged in to chatgpt.com (or connect yo
 ## Usage cheatsheet
 
 ```bash
+# Closed loop — dispatch a task; ChatGPT DOES it on the project via its MCP
+# connector (read/build/test/logs) and reports back. Needs the connector
+# connected + an `mcp --profile full` server running; uses a non-Pro model.
+chatgpt-use work "<task>"
+
 # Sidekick — plain question (harness is the brain)
 chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
 
