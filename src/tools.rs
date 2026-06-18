@@ -112,6 +112,58 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                 "required": ["command"]
             }),
         },
+        ToolSpec {
+            name: "edit_file".to_string(),
+            description: "Replace one exact occurrence of old_string with new_string in a file \
+                          (the old_string must be unique). Side-effecting; full profile only."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File to edit (workspace-relative)." },
+                    "old_string": { "type": "string", "description": "Exact text to replace (must occur exactly once)." },
+                    "new_string": { "type": "string", "description": "Replacement text." }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        },
+        ToolSpec {
+            name: "git_status".to_string(),
+            description: "Show `git status` (short, with branch) for the workspace.".to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolSpec {
+            name: "git_diff".to_string(),
+            description: "Show the unstaged `git diff`, optionally limited to one path.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Optional path to diff (workspace-relative)." } },
+                "required": []
+            }),
+        },
+        ToolSpec {
+            name: "git_log".to_string(),
+            description: "Show the last 30 commits (`git log --oneline`).".to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolSpec {
+            name: "git_show".to_string(),
+            description: "Show a commit/ref with `git show --stat` (default HEAD).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "rev": { "type": "string", "description": "Git revision/ref (default HEAD)." } },
+                "required": []
+            }),
+        },
+        ToolSpec {
+            name: "git_blame".to_string(),
+            description: "Show `git blame` for a file (workspace-relative).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "File to blame (workspace-relative)." } },
+                "required": ["path"]
+            }),
+        },
     ]
 }
 
@@ -127,9 +179,15 @@ pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool) -> ToolResult {
     let result = match call.name.as_str() {
         "read_file" => tool_read_file(&call.input, cwd),
         "write_file" => tool_write_file(&call.input, cwd, auto_approve),
+        "edit_file" => tool_edit_file(&call.input, cwd, auto_approve),
         "list_dir" => tool_list_dir(&call.input, cwd),
         "grep" => tool_grep(&call.input, cwd),
         "bash" => tool_bash(&call.input, cwd, auto_approve),
+        "git_status" => tool_git(&["status", "--short", "--branch"], cwd),
+        "git_diff" => tool_git_diff(&call.input, cwd),
+        "git_log" => tool_git(&["log", "--oneline", "-n", "30"], cwd),
+        "git_show" => tool_git_show(&call.input, cwd),
+        "git_blame" => tool_git_blame(&call.input, cwd),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -336,9 +394,104 @@ fn require_string(input: &Value, key: &str) -> Result<String, String> {
 
 /// Resolve a path string against `cwd`, returning an absolute PathBuf.
 /// Relative paths are joined to `cwd`.
+/// Targeted exact-string edit (apply_patch-style, but match-exact for safety).
+/// Side-effecting → full profile only.
+fn tool_edit_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<String, String> {
+    let path_str = require_string(input, "path")?;
+    let old = require_string(input, "old_string")?;
+    let new = require_string(input, "new_string")?;
+    let path = resolve_path(cwd, &path_str)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("edit_file: {}: {e}", path.display()))?;
+    let count = content.matches(&old).count();
+    if count == 0 {
+        return Err(format!("edit_file: old_string not found in {}", path.display()));
+    }
+    if count > 1 {
+        return Err(format!(
+            "edit_file: old_string matches {count} times in {} — include more context to make it unique",
+            path.display()
+        ));
+    }
+    if !auto_approve {
+        let approved = prompt_approval(&format!("edit_file: 1 replacement in {path:?}"));
+        if !approved {
+            return Err("edit_file: denied by user".to_string());
+        }
+    }
+    std::fs::write(&path, content.replacen(&old, &new, 1))
+        .map_err(|e| format!("edit_file: write {}: {e}", path.display()))?;
+    Ok(format!("edited {} (1 replacement)", path.display()))
+}
+
+/// Run `git -C <cwd> <args>` and return stdout (capped). Read-only git helpers.
+fn run_git(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e} (is git installed?)"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.trim().is_empty() {
+        s = "(no output)".to_string();
+    }
+    const CAP: usize = 20_000;
+    if s.len() > CAP {
+        s.truncate(CAP);
+        s.push_str("\n…(truncated)");
+    }
+    Ok(s)
+}
+
+fn tool_git(args: &[&str], cwd: &Path) -> Result<String, String> {
+    run_git(args, cwd)
+}
+
+fn tool_git_diff(input: &Value, cwd: &Path) -> Result<String, String> {
+    match input.get("path").and_then(|v| v.as_str()) {
+        Some(p) => {
+            resolve_path(cwd, p)?; // confine to workspace
+            run_git(&["diff", "--", p], cwd)
+        }
+        None => run_git(&["diff"], cwd),
+    }
+}
+
+fn tool_git_show(input: &Value, cwd: &Path) -> Result<String, String> {
+    let rev = input.get("rev").and_then(|v| v.as_str()).unwrap_or("HEAD");
+    if rev.is_empty() || !rev.chars().all(|c| c.is_ascii_alphanumeric() || "._-/~^".contains(c)) {
+        return Err("git_show: invalid rev (allowed: alphanumerics and . _ - / ~ ^)".to_string());
+    }
+    run_git(&["show", "--stat", rev], cwd)
+}
+
+fn tool_git_blame(input: &Value, cwd: &Path) -> Result<String, String> {
+    let path = require_string(input, "path")?;
+    resolve_path(cwd, &path)?; // confine to workspace
+    run_git(&["blame", "--", &path], cwd)
+}
+
 /// Read-only tools — the set exposed under the `read-only` MCP profile.
 pub fn is_read_only(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "list_dir" | "grep")
+    matches!(
+        tool_name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
+    )
 }
 
 /// Resolve a tool path inside the workspace, REJECTING anything that escapes it:
