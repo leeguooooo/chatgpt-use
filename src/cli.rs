@@ -126,7 +126,7 @@ pub struct HandoffArgs {
     /// Path to a delegation-packet JSON file, or "-" to read it from stdin.
     pub packet: String,
     /// Which local agent runs the plan.
-    #[arg(long, value_enum, default_value_t = Executor::Codex)]
+    #[arg(long, value_enum, required = true)]
     pub to: Executor,
     /// Working directory the executor runs in (default: current dir).
     #[arg(long)]
