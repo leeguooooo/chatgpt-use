@@ -42,13 +42,14 @@ pub fn run(args: &WorkArgs) -> Result<()> {
     // connect the tools…") instead of calling them. Tell it to act NOW and not
     // ask for clarification — verified to trigger real connector tool calls.
     let prompt = format!(
-        "Use your connected `chatgpt-use` tools to carry out the task below RIGHT NOW on the local \
-         project. Call the tools directly — read_file / list_dir / grep / git_status / git_diff / \
-         git_log / git_show / git_blame / write_file / edit_file / bash. Run builds and tests with \
-         the bash tool and read the real output. Do NOT ask me for clarification or for files, and \
-         do NOT just describe what you would do — actually call the tools and do it. When finished, \
-         reply with a concise report: the exact commands you ran, their key output, and the final \
-         result/status.\n\nTask: {}",
+        "TASK: {}\n\n\
+         Carry out the TASK above RIGHT NOW on the local project using your connected `chatgpt-use` \
+         tools — call them directly: read_file / list_dir / grep / git_status / git_diff / git_log / \
+         git_show / git_blame / write_file / edit_file / bash (run builds/tests and read the real \
+         output). Do NOT ask for clarification or for files, and do NOT just describe what you would \
+         do — actually call the tools and do it. The task is fully specified above; if any detail is \
+         ambiguous, make a reasonable choice and proceed. When finished, reply with a concise report: \
+         the exact commands you ran, their key output, and the final result/status.",
         args.task
     );
 

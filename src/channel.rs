@@ -51,8 +51,15 @@ const JS_STATE: &str = r#"(() => {
   const lastA = a[a.length - 1];
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
+  // A connector turn is multi-step: ChatGPT shows "Calling tool" / "Searching"
+  // indicators while a tool runs. Treat the turn as still in progress while any
+  // such active-tool marker is present, so we don't scrape an intermediate
+  // ("I'll check next…") message instead of the final report.
+  const tool_active = [...document.querySelectorAll('button, [role="button"]')]
+    .some(b => /^(calling|searching|running|using)\b/i.test((b.textContent || '').trim()));
   return JSON.stringify({
     stop,
+    tool_active,
     assistant_count: a.length,
     limited: /too many requests|requests too quickly/i.test(dlg),
     atext: lastA ? (lastA.innerText || lastA.textContent || '').trim() : ""
@@ -312,6 +319,14 @@ impl Channel {
         let poll_interval = Duration::from_millis(2000);
         let mut last_atext = String::new();
         let mut idle_count = 0u32;
+        // Stable-read: a reply (esp. one that calls connector tools) streams in
+        // phases — preamble, tool calls, final text — with brief moments where
+        // the stop button is absent mid-turn. Don't scrape until the assistant
+        // text has been UNCHANGED for a couple of polls AND the stop button is
+        // gone, so we capture the FINAL message, not a mid-turn partial.
+        let mut prev_stable = String::new();
+        let mut stable_polls = 0u32;
+        const STABLE_NEEDED: u32 = 2; // ~4s of unchanged text
         // After 30 idle polls (~60s) with no progress we give up rather than
         // hanging until the total timeout.
         const IDLE_LIMIT: u32 = 30;
@@ -345,6 +360,7 @@ impl Channel {
             }
 
             let stop = st.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
+            let tool_active = st.get("tool_active").and_then(|v| v.as_bool()).unwrap_or(false);
             let cur_count = st
                 .get("assistant_count")
                 .and_then(|v| v.as_u64())
@@ -354,7 +370,13 @@ impl Channel {
             let elapsed = started.elapsed().as_secs();
             if elapsed >= last_beat + 5 {
                 last_beat = elapsed;
-                let phase = if stop { "generating" } else { "waiting for reply" };
+                let phase = if tool_active {
+                    "running a tool"
+                } else if stop {
+                    "generating"
+                } else {
+                    "waiting for reply"
+                };
                 eprintln!("[{elapsed:5}.0s] {phase}");
             }
             let atext = st
@@ -364,27 +386,32 @@ impl Channel {
                 .to_string();
 
             if !atext.is_empty() {
-                last_atext = atext;
+                last_atext = atext.clone();
             }
 
-            if stop {
-                // still streaming — reset idle counter
+            if stop || tool_active {
+                // Streaming, or a connector tool call is mid-flight — not settled.
                 idle_count = 0;
+                stable_polls = 0;
                 continue;
             }
 
-            if cur_count > baseline_count {
-                // A new (non-streaming) assistant turn is present. Done.
-                break;
-            }
-
-            if cur_count > 0 {
-                // Count hasn't changed yet, but there is at least one assistant turn.
+            // Stop button gone. Only accept once the visible reply text has been
+            // stable for STABLE_NEEDED polls (guards against mid-turn partials
+            // between the preamble and connector tool calls).
+            if cur_count > 0 || cur_count > baseline_count {
+                if !atext.is_empty() && atext == prev_stable {
+                    stable_polls += 1;
+                    if stable_polls >= STABLE_NEEDED {
+                        break;
+                    }
+                } else {
+                    prev_stable = atext.clone();
+                    stable_polls = 0;
+                }
                 idle_count += 1;
                 if idle_count >= IDLE_LIMIT {
-                    // Tolerate the case where the count happened not to increment
-                    // (same-conversation fast reply); proceed to scrape.
-                    break;
+                    break; // safety net: give up waiting for further change
                 }
             }
         }
