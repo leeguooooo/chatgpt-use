@@ -51,12 +51,27 @@ const JS_STATE: &str = r#"(() => {
   const lastA = a[a.length - 1];
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
-  // A connector turn is multi-step: ChatGPT shows "Calling tool" / "Searching"
-  // indicators while a tool runs. Treat the turn as still in progress while any
-  // such active-tool marker is present, so we don't scrape an intermediate
-  // ("I'll check next…") message instead of the final report.
+  // A connector turn is multi-step: ChatGPT shows "Calling tool" / "Searching" /
+  // "Running…" indicators while a tool runs (a build/test can take MINUTES). Treat
+  // the turn as still in progress while any such active-tool marker is present, so
+  // we don't scrape an intermediate ("I'll check next…") message instead of the
+  // final report, and so we don't give up mid-build. Match PRESENT-tense action
+  // verbs only — never past-tense "Thought for Xs" / "Worked for Xs", which persist
+  // as static disclosures AFTER the turn ends and would wedge us as forever-active.
+  // IMPORTANT: only scan UI chips (buttons), NOT prose. The progress indicator
+  // ChatGPT shows while a connector tool runs is a button/disclosure whose text
+  // starts with a present-tense action verb ("Running…", "Searching…"). Scanning
+  // <div>/<span> too would also match the assistant's OWN words ("Running cargo
+  // test…", "Reading Cargo.toml…") in the finished answer — which kept the turn
+  // "active" forever and never settled. Verbs are present-progressive only; never
+  // past-tense ("Ran"/"Searched"/"Thought for Xs"), which persist after the turn.
+  const ACTIVE = /^(calling|searching|running|using|analyzing|analysing|executing|fetching|connecting|generating|working on)\b/i;
   const tool_active = [...document.querySelectorAll('button, [role="button"]')]
-    .some(b => /^(calling|searching|running|using)\b/i.test((b.textContent || '').trim()));
+    .filter(b => !b.closest('[data-message-author-role]')) // exclude in-message buttons
+    .some(b => {
+      const t = (b.textContent || '').trim();
+      return t.length > 0 && t.length <= 24 && ACTIVE.test(t);
+    });
   return JSON.stringify({
     stop,
     tool_active,
@@ -129,6 +144,38 @@ pub struct ChannelOptions {
     /// Browser-channel model to select: pro | thinking | instant | <raw label>.
     /// None → use the account default. (Pro is reachable only via the browser.)
     pub model: Option<String>,
+}
+
+/// Tuning for how `send` decides a reply is COMPLETE. Multi-step connector turns
+/// (read → bash build → report) stream in phases with quiet gaps; these knobs let
+/// long-running modes (`work`) wait through a several-minute build that a one-shot
+/// `ask` would never need.
+#[derive(Debug, Clone, Copy)]
+pub struct SendOptions {
+    /// Polls (each ~2s) the visible reply text must stay UNCHANGED, with no
+    /// stop-button and no active-tool marker, before we treat it as final.
+    pub stable_needed: u32,
+    /// Safety net: give up waiting after this many consecutive polls (~2s each)
+    /// of total silence — text static, not streaming, no tool running. Only the
+    /// per-turn `timeout_secs` deadline applies otherwise.
+    pub idle_limit: u32,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        // One-shot defaults: ~4s of unchanged text confirms; ~60s of silence aborts.
+        SendOptions { stable_needed: 2, idle_limit: 30 }
+    }
+}
+
+impl SendOptions {
+    /// Generous settings for closed-loop `work`: a build/test can sit quiet for
+    /// minutes, so confirm finality more slowly (~6s) and tolerate ~3min of
+    /// silence before the safety net fires (the wall-clock `timeout_secs` is the
+    /// real ceiling).
+    pub fn work() -> Self {
+        SendOptions { stable_needed: 3, idle_limit: 90 }
+    }
 }
 
 /// A live conversation. `send` keeps appending turns to the SAME chat, so
@@ -241,8 +288,14 @@ impl Channel {
         Ok(chan)
     }
 
-    /// Send one message and return ChatGPT's completed reply as text/markdown.
+    /// Send one message and return ChatGPT's completed reply as text/markdown,
+    /// using the default (one-shot) completion tuning.
     pub fn send(&mut self, message: &str) -> Result<String> {
+        self.send_with(message, &SendOptions::default())
+    }
+
+    /// Send one message with explicit completion tuning (see `SendOptions`).
+    pub fn send_with(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
 
         let remaining_secs = || {
@@ -326,10 +379,10 @@ impl Channel {
         // gone, so we capture the FINAL message, not a mid-turn partial.
         let mut prev_stable = String::new();
         let mut stable_polls = 0u32;
-        const STABLE_NEEDED: u32 = 2; // ~4s of unchanged text
-        // After 30 idle polls (~60s) with no progress we give up rather than
-        // hanging until the total timeout.
-        const IDLE_LIMIT: u32 = 30;
+        let stable_needed = sopts.stable_needed.max(1);
+        // After idle_limit polls (~2s each) with no progress at all we give up
+        // rather than hanging until the total timeout.
+        let idle_limit = sopts.idle_limit.max(1);
 
         // Heartbeat: the page can think silently for minutes, so emit an
         // elapsed-time progress line to stderr (~every 5s) so the wait is visible.
@@ -366,7 +419,15 @@ impl Channel {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
 
-            // Throttled heartbeat (~every 5s).
+            let atext = st
+                .get("atext")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Throttled heartbeat (~every 5s). Logs msg count + reply length so a
+            // hang is diagnosable from the log alone (e.g. msgs=0 → no assistant
+            // node yet; len frozen → settling; len climbing → still streaming).
             let elapsed = started.elapsed().as_secs();
             if elapsed >= last_beat + 5 {
                 last_beat = elapsed;
@@ -377,13 +438,8 @@ impl Channel {
                 } else {
                     "waiting for reply"
                 };
-                eprintln!("[{elapsed:5}.0s] {phase}");
+                eprintln!("[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})", atext.len());
             }
-            let atext = st
-                .get("atext")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
 
             if !atext.is_empty() {
                 last_atext = atext.clone();
@@ -396,13 +452,19 @@ impl Channel {
                 continue;
             }
 
-            // Stop button gone. Only accept once the visible reply text has been
-            // stable for STABLE_NEEDED polls (guards against mid-turn partials
-            // between the preamble and connector tool calls).
+            // We only reach here with the stop button GONE and no tool active —
+            // i.e. generation has actually ended (a genuine mid-stream gap keeps
+            // `stop` true, so we `continue` above and never land here). Fast path:
+            // settle once the visible text has been unchanged for `stable_needed`
+            // polls. Crucially `idle_count` ALWAYS increments in this branch and is
+            // never reset, so `idle_limit` is a HARD ceiling — without that, the
+            // DOM re-rendering a finished reply (collapsible tool-call disclosures
+            // mutating innerText) would reset the counter every poll and wedge us
+            // in "waiting for reply" forever.
             if cur_count > 0 || cur_count > baseline_count {
                 if !atext.is_empty() && atext == prev_stable {
                     stable_polls += 1;
-                    if stable_polls >= STABLE_NEEDED {
+                    if stable_polls >= stable_needed {
                         break;
                     }
                 } else {
@@ -410,8 +472,8 @@ impl Channel {
                     stable_polls = 0;
                 }
                 idle_count += 1;
-                if idle_count >= IDLE_LIMIT {
-                    break; // safety net: give up waiting for further change
+                if idle_count >= idle_limit {
+                    break; // safety net: generation ended but text never went stable
                 }
             }
         }
@@ -438,6 +500,21 @@ impl Channel {
     /// Close the tab (best-effort), matching chatgpt-imagegen's try/finally.
     pub fn close(self) {
         ab_close(&self.ab, &self.session);
+    }
+
+    /// Navigate the open session's tab to `url` and wait for it to settle.
+    /// Used by side flows (e.g. `refresh`) that drive ChatGPT pages other than
+    /// the chat composer.
+    pub fn open(&self, url: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(self.timeout_secs.min(30));
+        ab_open(&self.ab, &self.session, url, None, deadline)
+    }
+
+    /// Run JS in the page (the `JSON.stringify(value)` convention) and return the
+    /// decoded value. Exposed for side flows like `refresh`.
+    pub fn eval(&self, js: &str) -> Result<serde_json::Value> {
+        let t = (self.timeout_secs.min(30) as f64).max(5.0);
+        ab_eval(&self.ab, js, &self.session, t)
     }
 
     /// Navigate the open session into the named ChatGPT Project, creating it on

@@ -34,12 +34,39 @@ pub enum Command {
     /// via its chatgpt-use MCP connector (read/build/test/logs), then reports back.
     /// Requires the connector connected + an `mcp --profile full` server running.
     Work(WorkArgs),
+    /// Refresh the chatgpt-use connector in ChatGPT settings (re-runs tools/list).
+    /// Run this after restarting the `mcp` server so ChatGPT re-discovers the tools.
+    Refresh(RefreshArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct WorkArgs {
     /// The task for ChatGPT to carry out on the local project via its connector tools.
     pub task: String,
+    /// If ChatGPT replies without evidence it actually ran the tools (a thin or
+    /// hedging report), re-nudge it this many extra times in the same conversation.
+    #[arg(long, default_value_t = 1)]
+    pub retries: u32,
+    /// Keep the task going across turns: ChatGPT ends each report with
+    /// `STATUS: DONE` or `STATUS: CONTINUE`, and we auto-send "continue" until it
+    /// says DONE or `--max-turns` is hit. Lets one task span many tool steps.
+    #[arg(long)]
+    pub r#loop: bool,
+    /// Hard cap on turns when --loop is set (each turn is one model reply).
+    #[arg(long, default_value_t = 8)]
+    pub max_turns: u32,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct RefreshArgs {
+    /// Display name of the connector to refresh in ChatGPT settings.
+    #[arg(long, default_value = "chatgpt-use")]
+    pub connector: String,
+    /// Override the settings URL to open (default: the Connectors settings page).
+    #[arg(long)]
+    pub url: Option<String>,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }

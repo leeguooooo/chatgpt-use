@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example launchd LaunchAgent: run a recurring `chatgpt-use work` task on a schedule.
+
+  Edit before use:
+    * Label                  -> a unique reverse-DNS id
+    * the chatgpt-use path    -> `which chatgpt-use` (often ~/.local/bin/chatgpt-use)
+    * the task string         -> what you want ChatGPT to do
+    * --cwd via the task or run from the right directory (set WorkingDirectory)
+    * StartCalendarInterval   -> when to run (here: every day at 03:00)
+
+  Prereqs at run time:
+    * the user's Chrome is RUNNING and logged into chatgpt.com (chrome-use relays
+      through the live browser — a headless box with no Chrome will fail)
+    * the `chatgpt-use mcp --profile full` server + its tunnel are up, and the
+      `chatgpt-use` connector is connected in ChatGPT
+    * PATH includes cargo/homebrew bins (set below) so chrome-use is found
+
+  Install:
+    cp examples/work-nightly.plist ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
+    launchctl load ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
+  Each result is appended to ~/.chatgpt-use/ledger.jsonl (kind:"work") and the log below.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.you.chatgpt-use-nightly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/chatgpt-use</string>
+    <string>work</string>
+    <string>run the test suite and summarize any failures with file:line and a suggested fix</string>
+    <string>--retries</string>
+    <string>2</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/you/path/to/your/project</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/you/.cargo/bin:/Users/you/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/you/.chatgpt-use/nightly.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/.chatgpt-use/nightly.log</string>
+</dict>
+</plist>

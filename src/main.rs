@@ -29,6 +29,7 @@ fn main() {
         Command::Handoff(args) => cmd::handoff::run(args),
         Command::Init(args) => cmd::init::run(args),
         Command::Work(args) => cmd::work::run(args),
+        Command::Refresh(args) => cmd::refresh::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");

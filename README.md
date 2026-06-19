@@ -201,8 +201,15 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   not as an autonomous tool-runner. Mode 1 (no tools) works today; the autonomous browser loop (Mode 2)
   stays an open research track, not the main path.
 - **Pro is browser-only.** GPT-5.5 **Pro** — the strongest planner — cannot use Apps/MCP, so it's
-  reachable only through the browser channel. (Also: selecting Pro in the new ChatGPT UI isn't yet
-  automatable here — a `--model` flag is on the roadmap; today the channel uses the account default.)
+  reachable only through the browser channel. Selecting it *is* automated now (`--model pro`,
+  DOM-reverse-engineered), but the closed loop (`work`) must stay on a non-Pro level so the connector
+  tools are available.
+- **Connector goes stale on `mcp` restart.** ChatGPT caches `tools/list`, so after you restart the
+  server it may not see the tools until a manual Refresh. `chatgpt-use refresh` automates that click
+  (live-verified against the settings UI); the closed loop is otherwise hands-off.
+- **Instant tool-calling is run-to-run flaky.** On the connector, ChatGPT-Instant sometimes hedges
+  instead of calling a tool. `work --retries` re-nudges on a thin report, and `--loop` lets a task span
+  many tool steps — but expect the occasional turn that needs a nudge.
 - **Rate limits are real.** Driving the one shared logged-in tab, the page rate-limits aggressively, so
   the channel runs at **concurrency 1** and queues across processes (flock), same as `chatgpt-imagegen`.
 - **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
@@ -245,6 +252,14 @@ Then make sure you have a Chrome profile logged in to chatgpt.com (or connect yo
 # connector (read/build/test/logs) and reports back. Needs the connector
 # connected + an `mcp --profile full` server running; uses a non-Pro model.
 chatgpt-use work "<task>"
+#   --retries N    re-nudge if the report is thin / hedging (no real tool output). default 1
+#   --loop         multi-turn: ChatGPT ends each report STATUS: DONE|CONTINUE; we auto-
+#                  send "continue" until DONE — lets ONE task span many tool steps
+#   --max-turns N  cap on loop turns (default 8)
+#   --timeout S    per-turn wall-clock; work waits ≥1200s so a build/test can finish
+
+# Re-sync the connector after restarting the mcp server (re-runs tools/list).
+chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
 
 # Sidekick — plain question (harness is the brain)
 chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
@@ -298,6 +313,33 @@ setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL
 `--cwd`. Always use a random `--token`, scope `--cwd`, and prefer ephemeral tunnels.
 **Full step-by-step + security notes: [`docs/mcp-setup.html`](docs/mcp-setup.html).**
 
+### Working long enough · loops · scheduled runs
+
+ChatGPT can sit quiet for minutes while a connector `bash` build/test runs. `work` is tuned for that:
+it waits up to `--timeout` (≥1200s) per turn and only gives up after ~3 min of *total* silence (no
+streaming, no active-tool indicator). So a single `work` turn already covers a multi-minute build.
+
+For tasks too big for one reply, **`--loop`** spans turns: ChatGPT ends each report with
+`STATUS: DONE` or `STATUS: CONTINUE`, and `work` auto-sends "continue" until it's DONE (or `--max-turns`):
+
+```bash
+chatgpt-use work "port every callsite of send() to send_with(), run cargo test after each, until green" \
+  --loop --max-turns 12 --retries 2
+```
+
+**Scheduled / recurring work** — drive `work` from `launchd` (macOS) or `cron`. The job needs the
+user's Chrome running and logged into ChatGPT (chrome-use relays through the live browser), and the
+`mcp` server + tunnel up. A ready template lives at [`examples/work-nightly.plist`](examples/work-nightly.plist):
+
+```bash
+# nightly "smoke" report at 03:00 — edit the task + path, then:
+cp examples/work-nightly.plist ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
+launchctl load ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
+# every result is appended to ~/.chatgpt-use/ledger.jsonl (kind:"work")
+```
+
+cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the test suite and summarize failures" >> ~/.chatgpt-use/nightly.log 2>&1`
+
 ---
 
 ## Roadmap
@@ -334,6 +376,16 @@ setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL
   Pro still can't use connectors — use Instant/Thinking.
 - [x] **Append-only ledger** at `~/.chatgpt-use/ledger.jsonl` (ask/delegate/handoff events). [ ] `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback still pending (for the Mode-2 loop).
 - [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
+- [x] **Closed-loop robustness** — `work` waits through multi-minute connector turns (chip-only
+  active-tool detection that never matches the reply's own prose; a hard idle ceiling so a finished
+  reply's DOM re-render can't wedge the wait; ≥1200s per-turn budget; heartbeat logs `msgs`/`len`),
+  retries a thin/hedging report (`--retries`), and spans many tool steps via a `STATUS: DONE|CONTINUE`
+  sentinel (`--loop`/`--max-turns`). Scheduling recipe + `examples/work-nightly.plist` for cron/launchd.
+  **Live-verified**: a single `work` turn returned the 3 real latest commit subjects + `Cargo.toml`
+  version `0.0.1`; `--loop` advanced turn 1 → "continue" → turn 2 against live ChatGPT-Instant.
+- [x] **`refresh`** — `chatgpt-use refresh` re-syncs the connector after an `mcp` restart. **Live-verified**
+  (DOM-reverse-engineered: deep-link `#settings/Connectors` → click the `chatgpt-use` connector → click
+  its `Refresh` button, all via JS `.click()`); prints the controls it saw if it can't find one.
 
 **Kept as open research tracks (not abandoned):**
 - [~] Mode 2 `run` (autonomous browser tool loop) — added a one-shot **priming nudge** (echo a trivial tool call to bootstrap the loop). Live result: **intermittent** — sometimes the model engages, often still refuses. Run-to-run variance is high; reliable autonomous tool-calling needs the MCP channel (native tools), not browser role-play. Experimental.
