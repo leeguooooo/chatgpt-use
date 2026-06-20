@@ -178,17 +178,18 @@ fn is_thin_report(reply: &str) -> bool {
     }
     let lower = r.to_lowercase();
 
-    // Positive evidence the model actually used a tool / produced real output.
-    let has_evidence = r.contains("```")              // a code/output fence
+    // STRONG evidence the model actually ran a tool and pasted real output. (No
+    // line-count heuristic here — a verbose REFUSAL is also many lines, so length
+    // is not evidence; we check hedge markers next instead.)
+    let strong_evidence = r.contains("```")           // a code/output fence
         || lower.contains("$ ")                       // a shell prompt
         || r.contains("diff --git")
         || lower.contains("commit ")                  // git log/show output
         || regex_like_git_hash(r)
         || lower.contains("modified:")
         || lower.contains("error[")                   // compiler output
-        || lower.contains("warning:")
-        || r.lines().count() >= 8; // a long structured report is rarely pure hedging
-    if has_evidence {
+        || lower.contains("warning:");
+    if strong_evidence {
         return false;
     }
 
@@ -264,6 +265,10 @@ mod tests {
         assert!(is_thin_report(
             "第一条 uname -a 调用被工具层安全检查拦截了；我会继续尝试其余只读系统查询。"
         ));
+        // A LONG (>8 line) refusal must still count as thin — length is not evidence.
+        let long_refusal = "我无法执行你所描述的工具链。\n\n因此我不能真实运行:\n\nuname -a\nsw_vers\nwhoami\ndate\n\n也不能伪造原始输出。\n\n需要由控制器把工具结果返回。";
+        assert!(long_refusal.lines().count() >= 8);
+        assert!(is_thin_report(long_refusal), "long CJK refusal should be thin");
     }
 
     #[test]
