@@ -377,6 +377,27 @@ pub fn run(args: &McpArgs) -> Result<()> {
             "ALL tools incl. write_file + bash — trusted/local only"
         }
     );
+    // Under --profile full, `bash` becomes a PERSISTENT terminal: cwd + exported
+    // env carry over between calls, bounded by --bash-timeout. (Read-only profile
+    // never exposes bash, so there's nothing to configure.)
+    if !read_only {
+        let state_dir = crate::cmd::init::config_dir().join("shell");
+        crate::tools::configure_shell(state_dir, args.bash_timeout);
+        let limit = if args.bash_timeout == 0 {
+            "no timeout".to_string()
+        } else {
+            format!("{}s/command timeout", args.bash_timeout)
+        };
+        eprintln!("[mcp] bash: persistent terminal (cwd + env persist; {limit})");
+        if matches!(args.permission_mode, crate::cli::PermissionMode::Dangerous) {
+            eprintln!("[mcp] WARNING: --permission-mode dangerous → UNRESTRICTED shell. Anyone with the URL + token gets a terminal on this machine. Keep the token secret; prefer not tunneling.");
+        } else {
+            eprintln!(
+                "[mcp] bash gating: --permission-mode {:?} (use dangerous for an unrestricted terminal)",
+                args.permission_mode
+            );
+        }
+    }
     if oauth_mode {
         // In OAuth mode, the server password = the resolved token.
         match &token {

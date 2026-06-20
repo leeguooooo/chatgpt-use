@@ -280,8 +280,15 @@ chatgpt-use mcp --port 8788 [--token <secret>] --cwd <project>
 #   tools (full only):  write_file/edit_file/bash
 #   --profile read-only (DEFAULT, safe to tunnel) | full (trusted/local only)
 #   --permission-mode safe (DEFAULT) | trusted | dangerous   (gates bash + secret-env filter)
+#   --bash-timeout S   per-command limit for the bash terminal (full profile; 0=unlimited)
 #   --auth-mode token (DEFAULT) | oauth                      (OAuth 2.1 + PKCE)
 #   paths are workspace-sandboxed: absolute / ".." / symlink-escapes are rejected
+
+# Full terminal for ChatGPT — let it run ANY command, like a shell (cwd + env persist):
+chatgpt-use mcp --port 8788 --token "$(openssl rand -hex 16)" --cwd <project> \
+  --profile full --permission-mode dangerous
+#   ⚠️ 'dangerous' = NO command gating. Anyone with the URL + token gets a real
+#      terminal on this machine. Keep the token secret; prefer NOT tunneling it.
 
 # Mode 2 — brain (experimental browser tool loop)
 chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
@@ -312,6 +319,28 @@ tunneled server can't write files or run shell. Only pass `--profile full` on a 
 setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL + token = shell access to
 `--cwd`. Always use a random `--token`, scope `--cwd`, and prefer ephemeral tunnels.
 **Full step-by-step + security notes: [`docs/mcp-setup.html`](docs/mcp-setup.html).**
+
+### Give ChatGPT a real terminal
+
+Under `--profile full`, the `bash` tool is a **persistent shell session**, not one-off commands:
+the working directory and exported environment **carry over between calls**, so ChatGPT can
+`cd build/ && cmake .. && make`, then `./run_tests` in the next call, then `export RUST_LOG=debug`
+and have it stick — exactly like a terminal. Each command is bounded by `--bash-timeout` (default
+300s; `0` = unlimited) so a hung command can't freeze the server, and a fresh session starts on each
+server restart.
+
+Command gating depends on `--permission-mode`:
+
+| Mode | What `bash` may run |
+|---|---|
+| `safe` (default) | blocks destructive (`rm -rf`…), network (`curl`/`ssh`…), and `$(…)`/backticks; strips secret-looking env |
+| `trusted` | blocks only catastrophic commands; still strips secret env |
+| `dangerous` | **no gating at all — a full, unrestricted terminal**; full env passed through |
+
+So to let ChatGPT "run any command like a terminal", run the server with
+`--profile full --permission-mode dangerous`. That is a remote shell on your machine for anyone
+holding the URL + token — use a strong random `--token`, scope `--cwd`, and **strongly prefer keeping
+it local / off any public tunnel**. The server prints a loud warning when started this way.
 
 ### Working long enough · loops · scheduled runs
 
@@ -383,6 +412,10 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
   sentinel (`--loop`/`--max-turns`). Scheduling recipe + `examples/work-nightly.plist` for cron/launchd.
   **Live-verified**: a single `work` turn returned the 3 real latest commit subjects + `Cargo.toml`
   version `0.0.1`; `--loop` advanced turn 1 → "continue" → turn 2 against live ChatGPT-Instant.
+- [x] **Persistent terminal** — under `--profile full`, `bash` is a real shell session: cwd + exported
+  env carry over between calls, bounded by `--bash-timeout`. With `--permission-mode dangerous` it's an
+  unrestricted terminal for ChatGPT. **Live-verified** over MCP JSON-RPC: `cd /tmp`+`export` persisted to
+  the next call; `whoami`/`uname` ran; `sleep 10` was killed at the 1s timeout.
 - [x] **`refresh`** — `chatgpt-use refresh` re-syncs the connector after an `mcp` restart. **Live-verified**
   (DOM-reverse-engineered: deep-link `#settings/Connectors` → click the `chatgpt-use` connector → click
   its `Refresh` button, all via JS `.click()`); prints the controls it saw if it can't find one.

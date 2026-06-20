@@ -7,12 +7,17 @@ use crate::cli::InitArgs;
 use anyhow::{Context, Result};
 use std::io::Read;
 
-/// Path to the auth file: `~/.chatgpt-use/auth.json`.
-pub fn auth_path() -> std::path::PathBuf {
+/// The config directory: `~/.chatgpt-use`.
+pub fn config_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".chatgpt-use").join("auth.json")
+    home.join(".chatgpt-use")
+}
+
+/// Path to the auth file: `~/.chatgpt-use/auth.json`.
+pub fn auth_path() -> std::path::PathBuf {
+    config_dir().join("auth.json")
 }
 
 /// Load the saved token, if any (used by `mcp` when --token is omitted).

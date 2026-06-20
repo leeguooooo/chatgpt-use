@@ -184,6 +184,11 @@ pub struct McpArgs {
     /// (OAuth 2.1 Authorization-Code + PKCE for ChatGPT "OAuth" connector mode).
     #[arg(long, value_enum, default_value_t = AuthMode::Token)]
     pub auth_mode: AuthMode,
+    /// Per-command timeout (seconds) for the persistent `bash` terminal under
+    /// --profile full; 0 = unlimited. Bounds a hung command so it can't freeze
+    /// the single-threaded server. The shell keeps cwd + exported env across calls.
+    #[arg(long, default_value_t = 300)]
+    pub bash_timeout: u64,
 }
 
 /// Authentication mode for the MCP server.
