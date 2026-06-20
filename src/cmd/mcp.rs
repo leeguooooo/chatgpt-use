@@ -231,6 +231,24 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, 
 fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool, perm: PermissionMode) -> Option<Value> {
     let id = &req.id;
 
+    // Log every incoming request so connector activity is visible in mcp.log —
+    // for tools/call, include the tool name + a short arg preview. This is how
+    // you confirm ChatGPT's connector calls actually reach the server.
+    if req.method == "tools/call" {
+        let tool = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let preview: String = req
+            .params
+            .get("arguments")
+            .map(|a| a.to_string())
+            .unwrap_or_default()
+            .chars()
+            .take(160)
+            .collect();
+        eprintln!("[mcp] → tools/call {tool} {preview}");
+    } else {
+        eprintln!("[mcp] → {}", req.method);
+    }
+
     // Notifications (no `id`) → process but return no response.
     let is_notification = id.is_none();
 

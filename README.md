@@ -342,6 +342,20 @@ So to let ChatGPT "run any command like a terminal", run the server with
 holding the URL + token — use a strong random `--token`, scope `--cwd`, and **strongly prefer keeping
 it local / off any public tunnel**. The server prints a loud warning when started this way.
 
+> **Required one-time setup — turn off the per-call approval prompt.** ChatGPT pops an
+> *"Allow ChatGPT to use chatgpt-use? Deny / Allow once / Always allow"* dialog before **every**
+> connector tool call. An automated `work` run can't click it, so the call hangs and never reaches
+> the server (you'll see `work` stall with no output, and nothing in the server log). Fix it once:
+> in any chat, when the dialog appears click **Always allow → Always allow (without confirmation)**,
+> or set it under **Settings → Apps → chatgpt-use → permissions**. After that the closed loop is
+> truly hands-off. (This is *you* granting standing approval to an unrestricted terminal — deliberate
+> by design; the tool will not auto-click that safety prompt for you.)
+>
+> **Diagnosing:** the server logs every request — `[mcp] → tools/call bash {…}` in
+> `~/.chatgpt-use/mcp.log` means a call genuinely arrived. If a `work` run "reports success" but no
+> such line appears, ChatGPT regurgitated cached/project-memory output without actually running the
+> tool — check the log (and, for side-effecting commands, the real filesystem) to be sure.
+
 ### Working long enough · loops · scheduled runs
 
 ChatGPT can sit quiet for minutes while a connector `bash` build/test runs. `work` is tuned for that:
@@ -414,8 +428,14 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
   version `0.0.1`; `--loop` advanced turn 1 → "continue" → turn 2 against live ChatGPT-Instant.
 - [x] **Persistent terminal** — under `--profile full`, `bash` is a real shell session: cwd + exported
   env carry over between calls, bounded by `--bash-timeout`. With `--permission-mode dangerous` it's an
-  unrestricted terminal for ChatGPT. **Live-verified** over MCP JSON-RPC: `cd /tmp`+`export` persisted to
-  the next call; `whoami`/`uname` ran; `sleep 10` was killed at the 1s timeout.
+  unrestricted terminal for ChatGPT. **Live-verified end-to-end** (server log + on-disk side effect): a
+  hands-off `work` run made ChatGPT call `bash` to write a fresh random nonce to a file, confirmed by
+  `[mcp] → tools/call bash …` in the log AND the file appearing on disk with the exact nonce.
+- [x] **Request logging** — the MCP server logs every method to `mcp.log` (`→ tools/call <tool> <args>`),
+  so you can verify a connector call actually reached the server vs. ChatGPT regurgitating cached output.
+- [x] **Connector approval gotcha (documented)** — ChatGPT prompts *Allow once / Always allow* before each
+  connector tool call; the automated loop can't click it, so calls hang until you set the connector to
+  "always allow without confirmation" once. This was the real cause of the closed loop's earlier flakiness.
 - [x] **`refresh`** — `chatgpt-use refresh` re-syncs the connector after an `mcp` restart. **Live-verified**
   (DOM-reverse-engineered: deep-link `#settings/Connectors` → click the `chatgpt-use` connector → click
   its `Refresh` button, all via JS `.click()`); prints the controls it saw if it can't find one.
