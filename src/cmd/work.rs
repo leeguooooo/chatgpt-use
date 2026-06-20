@@ -216,7 +216,14 @@ fn is_thin_report(reply: &str) -> bool {
         "to proceed",
         "happy to help",
     ];
-    HEDGE.iter().any(|h| lower.contains(h))
+    // CJK hedge/refusal markers (the model sometimes replies in Chinese):
+    // 被拦截=blocked, 无法=cannot, 没有权限/受限=no permission/restricted,
+    // 需要你/请提供=need you to/please provide, 我会继续尝试=I'll keep trying.
+    const HEDGE_CJK: &[&str] = &[
+        "被拦截", "拦截了", "无法访问", "无法执行", "没有权限", "受限",
+        "需要你", "请提供", "请告诉我", "我会继续尝试", "未能执行", "无法完成",
+    ];
+    HEDGE.iter().any(|h| lower.contains(h)) || HEDGE_CJK.iter().any(|h| r.contains(h))
 }
 
 /// Cheap "looks like a 7–40 char hex git hash appears" check without pulling in
@@ -252,6 +259,10 @@ mod tests {
         assert!(is_thin_report("ok")); // too short
         assert!(is_thin_report(
             "I would start by reading the README, then I'd run the tests. Let me know if that works."
+        ));
+        // CJK confabulated-block / hedge with no real output → thin.
+        assert!(is_thin_report(
+            "第一条 uname -a 调用被工具层安全检查拦截了；我会继续尝试其余只读系统查询。"
         ));
     }
 
