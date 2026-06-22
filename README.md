@@ -369,8 +369,14 @@ two connector tools:
 | `read_skill {name}` | returns that skill's full `SKILL.md` + a listing of its files |
 
 The flow is `list_skills → read_skill → bash`: ChatGPT discovers a skill, reads how to use it, then
-runs its CLI with the persistent `bash` terminal. **Live-verified** (server log shows all three calls):
-ChatGPT listed 60 skills, read `chrome-use`'s SKILL.md, and ran `chrome-use --help` via bash.
+runs its CLI with the persistent `bash` terminal. **Live-verified across all three skill shapes** (the
+server log confirms the actual tool calls each time):
+
+| Skill shape | Example | What ChatGPT did (from the server log) |
+|---|---|---|
+| Prompt-only | `chinese-commit` | given a natural task with no tool names, it **auto-triggered** `list_skills → read_skill chinese-commit`, then produced a Conventional-Commits message following the skill |
+| CLI wrapper | `chrome-use` | `read_skill` then `bash chrome-use --help` |
+| Bundled script | `lark-slides` (its `xml_text_overlap_lint.py`) | `read_skill` → ran the script, hit a usage error, **ran `--help` to learn the flag, self-corrected**, then ran it with `--input`; output matched the locally-computed ground truth exactly |
 
 Two requirements:
 - **Profile / approval:** discovery tools are read-only (available in any profile); actually *running*
@@ -461,7 +467,9 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
   `[mcp] → tools/call bash …` in the log AND the file appearing on disk with the exact nonce.
 - [x] **Local skill discovery** — `list_skills` + `read_skill` MCP tools expose the machine's
   `~/.claude/skills` ecosystem; ChatGPT discovers a skill, reads its `SKILL.md`, then runs its CLI via
-  the `bash` terminal. **Live-verified** (server log): listed 60 skills, read `chrome-use`, ran it via bash.
+  the `bash` terminal. **Live-verified across all three skill shapes** (server log): prompt-only
+  (`chinese-commit`, auto-triggered from a natural task), CLI wrapper (`chrome-use`), and bundled script
+  (`lark-slides` lint — ChatGPT even ran `--help` to self-correct the flags, output matched ground truth).
   `--skills-dir` configures/disables the root. (Skill CLIs must be on the server's PATH.)
 - [x] **Request logging** — the MCP server logs every method to `mcp.log` (`→ tools/call <tool> <args>`),
   so you can verify a connector call actually reached the server vs. ChatGPT regurgitating cached output.
