@@ -276,11 +276,12 @@ chatgpt-use init
 
 # MCP channel — native tools for a regular GPT-5.5 (see MCP setup below)
 chatgpt-use mcp --port 8788 [--token <secret>] --cwd <project>
-#   tools (read-only): read_file/list_dir/grep + git_status/diff/log/show/blame
+#   tools (read-only): read_file/list_dir/grep + git_status/diff/log/show/blame + list_skills/read_skill
 #   tools (full only):  write_file/edit_file/bash
 #   --profile read-only (DEFAULT, safe to tunnel) | full (trusted/local only)
 #   --permission-mode safe (DEFAULT) | trusted | dangerous   (gates bash + secret-env filter)
 #   --bash-timeout S   per-command limit for the bash terminal (full profile; 0=unlimited)
+#   --skills-dir <dir> root for list_skills/read_skill (default ~/.claude/skills; "" disables)
 #   --auth-mode token (DEFAULT) | oauth                      (OAuth 2.1 + PKCE)
 #   paths are workspace-sandboxed: absolute / ".." / symlink-escapes are rejected
 
@@ -355,6 +356,33 @@ it local / off any public tunnel**. The server prints a loud warning when starte
 > `~/.chatgpt-use/mcp.log` means a call genuinely arrived. If a `work` run "reports success" but no
 > such line appears, ChatGPT regurgitated cached/project-memory output without actually running the
 > tool — check the log (and, for side-effecting commands, the real filesystem) to be sure.
+
+### Let ChatGPT use your local agent skills
+
+If this machine has agent **skills** (the `~/.claude/skills/<name>/SKILL.md` ecosystem — browser
+automation, email, image generation, Feishu/Lark ops, …), ChatGPT can discover and run them through
+two connector tools:
+
+| Tool | What it does |
+|---|---|
+| `list_skills` | lists every skill on the machine (name + one-line description) |
+| `read_skill {name}` | returns that skill's full `SKILL.md` + a listing of its files |
+
+The flow is `list_skills → read_skill → bash`: ChatGPT discovers a skill, reads how to use it, then
+runs its CLI with the persistent `bash` terminal. **Live-verified** (server log shows all three calls):
+ChatGPT listed 60 skills, read `chrome-use`'s SKILL.md, and ran `chrome-use --help` via bash.
+
+Two requirements:
+- **Profile / approval:** discovery tools are read-only (available in any profile); actually *running*
+  a skill needs `--profile full` (the `bash` tool) and the one-time "always allow" above.
+- **The skill's CLI must be on the server's `PATH`.** Skills are mostly thin wrappers over a CLI
+  (`chrome-use`, `mailbox`, `imagegen`, the `lark-*` tools). If the server can't find the binary you'll
+  see `command not found` — add its dir (e.g. `~/.local/bin`, `~/.bun/bin`) to the server's `PATH`
+  (in the launchd plist's `EnvironmentVariables`, or the shell that launches `mcp`).
+
+`--skills-dir <dir>` points discovery at a different root; `--skills-dir ""` disables it. Note: skills
+written purely for the Claude Code harness (those that say "use the Read/Edit tool") won't translate —
+but anything CLI-backed runs fine through `bash`.
 
 ### Working long enough · loops · scheduled runs
 
@@ -431,6 +459,10 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
   unrestricted terminal for ChatGPT. **Live-verified end-to-end** (server log + on-disk side effect): a
   hands-off `work` run made ChatGPT call `bash` to write a fresh random nonce to a file, confirmed by
   `[mcp] → tools/call bash …` in the log AND the file appearing on disk with the exact nonce.
+- [x] **Local skill discovery** — `list_skills` + `read_skill` MCP tools expose the machine's
+  `~/.claude/skills` ecosystem; ChatGPT discovers a skill, reads its `SKILL.md`, then runs its CLI via
+  the `bash` terminal. **Live-verified** (server log): listed 60 skills, read `chrome-use`, ran it via bash.
+  `--skills-dir` configures/disables the root. (Skill CLIs must be on the server's PATH.)
 - [x] **Request logging** — the MCP server logs every method to `mcp.log` (`→ tools/call <tool> <args>`),
   so you can verify a connector call actually reached the server vs. ChatGPT regurgitating cached output.
 - [x] **Connector approval gotcha (documented)** — ChatGPT prompts *Allow once / Always allow* before each

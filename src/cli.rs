@@ -189,6 +189,11 @@ pub struct McpArgs {
     /// the single-threaded server. The shell keeps cwd + exported env across calls.
     #[arg(long, default_value_t = 300)]
     pub bash_timeout: u64,
+    /// Directory to expose to the `list_skills`/`read_skill` tools (lets ChatGPT
+    /// discover + follow local agent skills, then run them via bash). Defaults to
+    /// `~/.claude/skills`. Pass an empty string to DISABLE skill discovery.
+    #[arg(long)]
+    pub skills_dir: Option<String>,
 }
 
 /// Authentication mode for the MCP server.

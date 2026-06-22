@@ -41,6 +41,28 @@ pub fn configure_shell(state_dir: PathBuf, timeout_secs: u64) {
     let _ = SHELL_CFG.set(ShellConfig { state_dir, timeout_secs });
 }
 
+/// Root directory for skill discovery (`list_skills`/`read_skill`). Each skill is
+/// `<dir>/<name>/SKILL.md` with YAML frontmatter (name + description). Configured
+/// by the MCP server at startup; an EMPTY path disables skill discovery.
+static SKILLS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the skills root. Pass an empty path to disable discovery.
+pub fn configure_skills(dir: PathBuf) {
+    let _ = SKILLS_DIR.set(dir);
+}
+
+/// The effective skills root: the configured one, else the conventional
+/// `~/.claude/skills`. Returns None when discovery is explicitly disabled
+/// (configured to an empty path).
+fn skills_dir() -> Option<PathBuf> {
+    match SKILLS_DIR.get() {
+        Some(p) if p.as_os_str().is_empty() => None, // explicitly disabled
+        Some(p) => Some(p.clone()),
+        None => std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".claude").join("skills")),
+    }
+}
+
 // ---- Tool catalog -----------------------------------------------------------
 
 /// The built-in tool catalog advertised to the model.
@@ -196,6 +218,28 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
                 "required": ["path"]
             }),
         },
+        ToolSpec {
+            name: "list_skills".to_string(),
+            description: "List the local agent SKILLS available on this machine (name + one-line \
+                          description each). A skill is a reusable capability — usually a CLI plus \
+                          instructions (e.g. browser automation, email, image generation, Feishu/Lark \
+                          ops). To USE one: call read_skill to learn how, then run its commands with \
+                          the bash tool."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolSpec {
+            name: "read_skill".to_string(),
+            description: "Read a skill's full instructions (its SKILL.md) plus a listing of the files \
+                          in the skill directory, so you can follow it and run the right commands via \
+                          the bash tool. Use the skill name from list_skills."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Skill name (as shown by list_skills)." } },
+                "required": ["name"]
+            }),
+        },
     ]
 }
 
@@ -220,6 +264,8 @@ pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: Permission
         "git_log" => tool_git(&["log", "--oneline", "-n", "30"], cwd),
         "git_show" => tool_git_show(&call.input, cwd),
         "git_blame" => tool_git_blame(&call.input, cwd),
+        "list_skills" => tool_list_skills(),
+        "read_skill" => tool_read_skill(&call.input),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -585,6 +631,120 @@ fn run_persistent(
     Ok(format_output(&stdout, &stderr, exit_code, note.as_deref()))
 }
 
+// ---- Skill discovery --------------------------------------------------------
+
+/// Pull `name` + `description` out of a SKILL.md YAML frontmatter block (the
+/// leading `--- … ---`). Returns (name, description) best-effort.
+fn parse_skill_frontmatter(md: &str, fallback_name: &str) -> (String, String) {
+    let mut name = fallback_name.to_string();
+    let mut desc = String::new();
+    let trimmed = md.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                if let Some(v) = line.strip_prefix("name:") {
+                    name = v.trim().trim_matches(['"', '\'']).to_string();
+                } else if let Some(v) = line.strip_prefix("description:") {
+                    desc = v.trim().trim_matches(['"', '\'']).to_string();
+                }
+            }
+        }
+    }
+    (name, desc)
+}
+
+/// `list_skills` — enumerate `<skills_dir>/<name>/SKILL.md`, returning each
+/// skill's name + one-line description.
+fn tool_list_skills() -> Result<String, String> {
+    let dir = match skills_dir() {
+        Some(d) => d,
+        None => return Err("skill discovery is disabled on this server (--skills-dir \"\").".to_string()),
+    };
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("list_skills: cannot read skills dir {}: {e}", dir.display()))?;
+
+    let mut skills: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let skill_md = entry.path().join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        let fallback = entry.file_name().to_string_lossy().to_string();
+        let head = read_head(&skill_md, 4096);
+        let (name, desc) = parse_skill_frontmatter(&head, &fallback);
+        skills.push((name, desc));
+    }
+    if skills.is_empty() {
+        return Ok(format!("(no skills found under {})", dir.display()));
+    }
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = format!("{} skills available (call read_skill <name> to learn how to use one):\n\n", skills.len());
+    for (name, desc) in skills {
+        out.push_str(&format!("- {name}: {desc}\n"));
+    }
+    Ok(out)
+}
+
+/// `read_skill {name}` — return the skill's full SKILL.md plus a listing of the
+/// files in its directory (so the model can see helper scripts to run via bash).
+fn tool_read_skill(input: &Value) -> Result<String, String> {
+    let dir = match skills_dir() {
+        Some(d) => d,
+        None => return Err("skill discovery is disabled on this server (--skills-dir \"\").".to_string()),
+    };
+    let name = require_string(input, "name")?;
+    // Guard against path escapes — skill names are single path segments.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("read_skill: invalid skill name {name:?}"));
+    }
+    let skill_root = dir.join(&name);
+    let skill_md = skill_root.join("SKILL.md");
+    if !skill_md.is_file() {
+        return Err(format!(
+            "read_skill: no skill named {name:?} (no {}). Use list_skills to see what's available.",
+            skill_md.display()
+        ));
+    }
+    let content = std::fs::read_to_string(&skill_md)
+        .map_err(|e| format!("read_skill: cannot read {}: {e}", skill_md.display()))?;
+
+    // List files in the skill dir (names + sizes) so the model knows what
+    // scripts/resources it can run/read via bash.
+    let mut files: Vec<String> = Vec::new();
+    for entry in WalkDir::new(&skill_root)
+        .max_depth(3)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            if let Ok(rel) = entry.path().strip_prefix(&skill_root) {
+                files.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    files.sort();
+
+    Ok(format!(
+        "# skill: {name}\n# location: {}\n\n## SKILL.md\n{content}\n\n## files in this skill ({} total)\n{}\n\n\
+         To use this skill, run the relevant commands with the bash tool (paths above are relative to {}).",
+        skill_root.display(),
+        files.len(),
+        files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+        skill_root.display(),
+    ))
+}
+
+/// Read up to `max` bytes from the start of a file (for frontmatter parsing).
+fn read_head(path: &Path, max: usize) -> String {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(max as u64).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 // ---- Helpers ----------------------------------------------------------------
 
 /// Extract a required string field from a JSON input object.
@@ -695,6 +855,8 @@ pub fn is_read_only(tool_name: &str) -> bool {
             | "git_log"
             | "git_show"
             | "git_blame"
+            | "list_skills"
+            | "read_skill"
     )
 }
 
@@ -922,6 +1084,45 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(6), "should be killed near the 1s timeout");
         assert!(r.contains("timed out"), "should report a timeout, got: {r}");
         assert!(!r.contains("done"), "the command should not have completed");
+    }
+
+    // --- skill discovery ---
+
+    #[test]
+    fn parse_skill_frontmatter_extracts_name_and_desc() {
+        let md = "---\nname: chrome-use\ndescription: Browser automation CLI.\n---\n\n# Goal\nbody";
+        let (n, d) = parse_skill_frontmatter(md, "fallback");
+        assert_eq!(n, "chrome-use");
+        assert_eq!(d, "Browser automation CLI.");
+        // No frontmatter → fallback name, empty desc.
+        let (n2, d2) = parse_skill_frontmatter("# just a heading", "myskill");
+        assert_eq!(n2, "myskill");
+        assert_eq!(d2, "");
+    }
+
+    #[test]
+    fn list_and_read_skill_roundtrip() {
+        // Build a fake skills dir and point the discovery at it.
+        let root = std::env::temp_dir().join(format!("cgu-skills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let s = root.join("demo-skill");
+        fs::create_dir_all(&s).unwrap();
+        fs::write(s.join("SKILL.md"), "---\nname: demo-skill\ndescription: A demo.\n---\n\nRun `demo --go`.").unwrap();
+        fs::write(s.join("run.sh"), "echo hi").unwrap();
+        let _ = SKILLS_DIR.set(root.clone());
+
+        let listed = tool_list_skills().unwrap();
+        assert!(listed.contains("demo-skill"), "list: {listed}");
+        assert!(listed.contains("A demo."), "list desc: {listed}");
+
+        let read = tool_read_skill(&json!({"name": "demo-skill"})).unwrap();
+        assert!(read.contains("Run `demo --go`."), "read body: {read}");
+        assert!(read.contains("run.sh"), "read should list files: {read}");
+
+        // Path-escape guard.
+        assert!(tool_read_skill(&json!({"name": "../etc"})).is_err());
+        // Missing skill.
+        assert!(tool_read_skill(&json!({"name": "nope"})).is_err());
     }
 
     // --- unknown tool ---

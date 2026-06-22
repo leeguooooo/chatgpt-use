@@ -416,6 +416,22 @@ pub fn run(args: &McpArgs) -> Result<()> {
             );
         }
     }
+    // Skill discovery (list_skills/read_skill): default ~/.claude/skills; empty disables.
+    if let Some(sd) = &args.skills_dir {
+        crate::tools::configure_skills(std::path::PathBuf::from(sd));
+        if sd.is_empty() {
+            eprintln!("[mcp] skills: discovery DISABLED (--skills-dir \"\")");
+        } else {
+            eprintln!("[mcp] skills: list_skills/read_skill → {sd}");
+        }
+    } else {
+        let default = crate::cmd::init::config_dir()
+            .parent()
+            .map(|p| p.join(".claude").join("skills"))
+            .unwrap_or_default();
+        // configure_skills not called → tools fall back to ~/.claude/skills.
+        eprintln!("[mcp] skills: list_skills/read_skill → {} (default)", default.display());
+    }
     if oauth_mode {
         // In OAuth mode, the server password = the resolved token.
         match &token {
