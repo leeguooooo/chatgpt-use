@@ -558,8 +558,41 @@ impl Channel {
         let project_url = WEB_PROJECT_URL_TPL.replace("{gizmo_id}", gizmo_id);
         ab_open(&self.ab, &self.session, &project_url, None, deadline)?;
 
-        if !wait_composer(&self.ab, &self.session, deadline, 15)? {
-            bail!("project page composer never appeared");
+        // Wait until the SPA has ACTUALLY settled into the project — not just that
+        // a `#prompt-textarea` exists. `chrome-use open` can return while the prior
+        // top-level page (https://chatgpt.com/) is still showing its composer; a
+        // bare composer check passes against THAT, and the next send() then submits
+        // on the top-level context, filing the conversation OUTSIDE the project.
+        // Gate on the URL containing the project gizmo id so we type into the real
+        // project composer. (The project URL is /g/<gizmo_id>/project and stays on
+        // that gizmo path until submit, so a substring check is reliable.)
+        let js_project_ready = format!(
+            r#"(() => {{
+  const gid = {gid};
+  return JSON.stringify({{
+    composer: !!document.querySelector('#prompt-textarea'),
+    in_project: (location.href || '').includes(gid),
+  }});
+}})()"#,
+            gid = serde_json::to_string(gizmo_id).unwrap_or_else(|_| "\"\"".to_string()),
+        );
+        let mut ready = false;
+        for _ in 0..30 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(st) = ab_eval(&self.ab, &js_project_ready, &self.session, remaining().min(20.0)) {
+                let composer = st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false);
+                let in_project = st.get("in_project").and_then(|v| v.as_bool()).unwrap_or(false);
+                if composer && in_project {
+                    ready = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if !ready {
+            bail!("project page never settled (composer + project URL) within the deadline");
         }
 
         Ok(())
