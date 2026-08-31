@@ -45,16 +45,23 @@ fn agent_loop(
     let seed = protocol::system_prompt(tool_specs, &args.task);
     let mut reply_text = channel.send(&seed)?;
 
-    // Conversation priming: grounded web models often refuse to *invent* a tool
-    // call on turn 1 ("I can't run tools — paste the file"). Copying is lower
-    // resistance than inventing, so if the first reply has no tool call, nudge
-    // the model to ECHO one trivial read-only call. Once it emits a call and sees
-    // a real result come back in-context, the loop tends to keep going. One shot.
+    // Fallback priming. This used to fire on essentially every run, and the
+    // diagnosis was "grounded web models refuse to *invent* a tool call on turn
+    // 1". That was a misread. The real cause was upstream: a typed newline is a
+    // SUBMIT in the composer, so this multi-line system prompt was shredded into
+    // one chat message per line and the model never saw the protocol intact —
+    // and separately, the reply parser only matched a literal ```json fence,
+    // which rendered innerText can never contain, so any tool call it *did*
+    // emit was misread as a final answer. Both are fixed (see channel.rs's
+    // js_insert_text and protocol::parse_reply), and turn 1 now normally calls a
+    // tool on its own. Keep the nudge as a genuine fallback for the occasional
+    // model that still opens with prose. One shot.
     if matches!(protocol::parse_reply(&reply_text), Reply::Text(_)) {
         eprintln!("[prime] no tool call on turn 1 — sending a connection-check nudge");
         // Single-line, NO code fence: a fenced ```json block gets mangled by the
         // composer's markdown handling (the model reported "the block was not
-        // included"). Our parser accepts bare {...}, so a one-liner is robust.
+        // included"). The parser scans for a bare balanced {...} anywhere in the
+        // reply, so a one-liner is the robust shape to ask for.
         let nudge = "You did not emit a tool call. This is NOT a chat — a controller \
             program on the user's machine executes your tool calls for real and returns the \
             results. As a one-time connection check, reply with EXACTLY this single line and \

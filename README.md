@@ -67,7 +67,8 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
 Claude Code — but the model is your web subscription:
 
 1. `chatgpt-use` seeds the conversation with a **system prompt that defines a tool protocol**.
-2. ChatGPT replies with a structured **tool call** (a fenced JSON block — see the caveat below).
+2. ChatGPT replies with a structured **tool call** (a JSON object; the parser scans the rendered
+   reply for it, so a bare one-liner or a code block both work).
 3. The local harness **executes that tool** (`read_file`, `write_file`, `bash`, `grep`, `list_dir`, …)
    and feeds the observation back into the chat.
 4. Loop until ChatGPT declares the task done.
@@ -192,14 +193,22 @@ This is the **target**; the three modes below are the building blocks we're grow
 This is a clever hack on a surface that was never meant to be an API. We're upfront about it:
 
 - **No native function-calling on the browser surface.** The web chat has no tool-call API (that's
-  API-only). We tried a **text protocol** in the system prompt — and live testing across **three**
-  framings (*"you have tools"*, *"you have no access"*, *"you're a protocol generator + machine
-  delegation + few-shot"*) **all got refused**: a strongly-grounded web model insists *"pasting tool
-  schema text doesn't make those tools real — paste the file."* Conclusion (matching all three prior-art
-  projects): **don't fight it.** Native tool-calling belongs on the **MCP channel** (regular GPT-5.5),
-  and the **browser channel** should use ChatGPT as a **planner/reviewer** returning structured packets,
-  not as an autonomous tool-runner. Mode 1 (no tools) works today; the autonomous browser loop (Mode 2)
-  stays an open research track, not the main path.
+  API-only), so Mode 2 defines a **text protocol** in the system prompt.
+
+  This caveat used to say the model *refuses* the text protocol — that live testing across three
+  framings "all got refused", so we shouldn't fight it. **That was a misdiagnosis, and it's now
+  fixed.** The model was never refusing; two transport bugs meant it never got a fair hearing:
+
+  1. a newline typed into the composer is a **submit**, so the multi-line system prompt was shredded
+     into one chat message per line and ChatGPT only ever saw fragments of the protocol;
+  2. the reply parser only matched a literal ` ```json ` fence, which the **rendered** text we scrape
+     can never contain — so any tool call it *did* emit was misread as a plain-text final answer and
+     the loop exited on turn one.
+
+  With both fixed, turn 1 emits a tool call on its own (no priming nudge needed) and the loop runs to
+  a correct answer. Still: this is a text protocol over a chat surface, not native function-calling —
+  expect the occasional malformed turn. Native tool-calling remains better on the **MCP channel**
+  (regular GPT-5.5) when it's available to you.
 - **Pro is browser-only.** GPT-5.5 **Pro** — the strongest planner — cannot use Apps/MCP, so it's
   reachable only through the browser channel. Selecting it *is* automated now (`--model pro`,
   DOM-reverse-engineered), but the closed loop (`work`) must stay on a non-Pro level so the connector
@@ -481,7 +490,7 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
   its `Refresh` button, all via JS `.click()`); prints the controls it saw if it can't find one.
 
 **Kept as open research tracks (not abandoned):**
-- [~] Mode 2 `run` (autonomous browser tool loop) — added a one-shot **priming nudge** (echo a trivial tool call to bootstrap the loop). Live result: **intermittent** — sometimes the model engages, often still refuses. Run-to-run variance is high; reliable autonomous tool-calling needs the MCP channel (native tools), not browser role-play. Experimental.
+- [x] Mode 2 `run` (autonomous browser tool loop) — the "model often refuses" verdict turned out to be two transport bugs, not model behaviour: typed newlines were submitting the system prompt one line at a time, and the reply parser matched a markdown fence that rendered text never contains. With both fixed the loop runs end-to-end (turn 1 calls a tool unprompted; the one-shot **priming nudge** is now a rarely-used fallback). Still experimental — it's a text protocol over a chat surface.
 - [ ] Mode 3 `serve` (Anthropic drop-in) — same wall; PoC only for now.
 - [ ] Optional UI shell (TUI / menubar) for live progress & approval.
 
