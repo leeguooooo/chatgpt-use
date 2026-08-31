@@ -17,6 +17,7 @@
 //! Owned by the CORE agent.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -262,6 +263,9 @@ pub struct Channel {
     session: String,
     /// Per-turn timeout in seconds.
     timeout_secs: u64,
+    /// Project to file the conversation under ("" → plain chat). Kept so a
+    /// reconnect can rebuild the same starting point.
+    project: String,
     /// The conversation this channel is pinned to, latched after the first
     /// successful turn (a fresh chat has no id until then). Every later turn
     /// verifies the tab still shows it, so a sidebar click, a stray navigation
@@ -341,7 +345,13 @@ impl Channel {
             );
         }
 
-        let chan = Channel { ab, session, timeout_secs, convo_id: None };
+        let chan = Channel {
+            ab,
+            session,
+            timeout_secs,
+            project: opts.project.trim().to_string(),
+            convo_id: None,
+        };
 
         // Navigate into a ChatGPT Project FIRST — it loads a new page and would
         // reset any model selection, so model selection must come afterwards.
@@ -371,7 +381,20 @@ impl Channel {
 
     /// Put `message` in the composer and submit it, returning only once a new
     /// user turn proves the submit landed.
-    fn fill_and_submit(&self, message: &str, baseline_users: u64, budget: f64) -> Result<()> {
+    fn fill_and_submit(
+        &self,
+        message: &str,
+        baseline_users: u64,
+        budget: f64,
+    ) -> std::result::Result<(), SubmitFailure> {
+        self.fill_composer(message, budget)
+            .map_err(SubmitFailure::BeforeSubmit)?;
+        self.submit(baseline_users, budget)
+    }
+
+    /// Put `message` in the composer and verify it landed intact. Nothing here
+    /// can have submitted anything, so any error is safe to retry.
+    fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
         // Focus and empty the composer, then insert the message as TEXT.
         ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
             .context("clicking #prompt-textarea")?;
@@ -435,8 +458,16 @@ impl Channel {
             }
         }
 
+        Ok(())
+    }
+
+    /// Press Enter and return only once a new user turn proves it landed.
+    fn submit(&self, baseline_users: u64, budget: f64) -> std::result::Result<(), SubmitFailure> {
+        // From here on a retry could DUPLICATE the message, so every failure is
+        // reported as ambiguous and the caller must not resend blindly.
         ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
-            .context("pressing Enter to submit")?;
+            .context("pressing Enter to submit")
+            .map_err(SubmitFailure::Ambiguous)?;
 
         // Confirm the submit actually landed, by EVIDENCE (a new user turn was
         // rendered) rather than by the old proxy "is the composer empty?". That
@@ -456,12 +487,12 @@ impl Channel {
                 budget,
             );
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
-                bail!(
+                return Err(SubmitFailure::Ambiguous(anyhow!(
                     "the message was never submitted — no new user turn appeared \
                      after pressing Enter and clicking the send button. The \
                      composer may be disabled (rate limit, expired session) or \
                      the page layout changed."
-                );
+                )));
             }
         }
 
@@ -495,6 +526,29 @@ impl Channel {
             None => Ok(()),
             Some(msg) => bail!("{msg}"),
         }
+    }
+
+    /// Re-establish a FRESH chat after losing the tab before anything was said.
+    ///
+    /// Safe only pre-pin and pre-submit: with no conversation id there is no
+    /// context to preserve, and with no submit receipt there is no risk of
+    /// duplicating a message that is already generating. This is the ordinary
+    /// case when another process sharing the session finishes and closes the
+    /// browser out from under us.
+    fn reopen_fresh(&self, budget: f64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(20.0, 90.0));
+        eprintln!("the ChatGPT tab went away before the first turn; opening a fresh chat");
+        ab_open(&self.ab, &self.session, WEB_NEW_CHAT_URL, None, deadline)
+            .context("reopening ChatGPT")?;
+        if !wait_composer(&self.ab, &self.session, deadline, 30)? {
+            bail!("reopened ChatGPT but the composer never appeared");
+        }
+        if !self.project.is_empty() {
+            if let Err(e) = self.enter_project(&self.project, deadline) {
+                eprintln!("warning: project {:?} unavailable ({e}); using a plain chat", self.project);
+            }
+        }
+        Ok(())
     }
 
     /// Navigate the session back to the pinned conversation.
@@ -563,12 +617,15 @@ impl Channel {
                 .max(2.0)
         };
 
+        // One turn at a time, across processes. Dropped at the end of the turn.
+        let _turn = TurnLock::acquire();
+
         // Refuse to type into a tab that has drifted off our pinned conversation.
         self.verify_convo(remaining_secs())?;
 
         // Snapshot rendered user turns: a rise in this count is our submit
         // receipt (see JS_USER_COUNT).
-        let baseline_users: u64 = self.user_turn_count(remaining_secs()).unwrap_or(0);
+        let mut baseline_users: u64 = self.user_turn_count(remaining_secs()).unwrap_or(0);
 
         // Snapshot the current number of assistant messages so we can detect
         // when a NEW one arrives.
@@ -581,20 +638,37 @@ impl Channel {
         // turns (closed, crashed, browser restarted) and the conversation itself
         // is still on the server, so losing the window shouldn't lose the turn.
         if let Err(first) = self.fill_and_submit(message, baseline_users, remaining_secs()) {
-            eprintln!("submit failed: {first:#}");
-            self.reopen_pinned(remaining_secs())
-                .context("could not reattach after a failed submit")?;
+            // Fail closed on anything that might already be in flight.
+            let SubmitFailure::BeforeSubmit(why) = first else {
+                return Err(first.into_error());
+            };
+            eprintln!("submit failed: {why:#}");
 
-            // Never blind-retry: the first attempt may have submitted before it
-            // errored. Re-check the receipt against the reattached page and, if
-            // the turn is already in flight, fall through to observing it rather
-            // than sending the message a second time.
+            // Reconnect: back to our conversation if we have one, otherwise to a
+            // fresh chat — nothing has been said yet, so nothing is lost.
+            if self.convo_id.is_some() {
+                self.reopen_pinned(remaining_secs())
+                    .context("could not reattach after a failed submit")?;
+            } else {
+                self.reopen_fresh(remaining_secs())
+                    .context("could not reopen ChatGPT after a failed submit")?;
+            }
+
+            // Re-baseline against the reattached page, and skip the resend
+            // entirely if the message turns out to be in flight already.
             let users_now = self.user_turn_count(remaining_secs()).unwrap_or(0);
-            if users_now > baseline_users {
+            if self.convo_id.is_some() && users_now > baseline_users {
                 eprintln!("the message had already been submitted; observing that turn");
             } else {
                 self.fill_and_submit(message, users_now, remaining_secs())
-                    .context("resubmitting after reattach")?;
+                    .map_err(SubmitFailure::into_error)
+                    .context("resubmitting after reconnect")?;
+                // The poll loop below uses this baseline to tell "our page" from
+                // "some other page". A reconnect can land on a chat with FEWER
+                // turns than the one we started on (a fresh chat has none), so
+                // the pre-reconnect figure would read as a page swap and abort
+                // the turn we just successfully submitted.
+                baseline_users = users_now;
             }
         }
 
@@ -1084,6 +1158,89 @@ impl Channel {
 // ---- chrome-use helpers (mirrors _ab / _ab_eval in chatgpt-imagegen) --------
 
 /// Locate the chrome-use binary: search PATH, then ~/.local/bin.
+/// Where a turn died, so the caller knows whether retrying could duplicate it.
+///
+/// This is the "ambiguous submit" distinction: recovering from a lost tab is
+/// only safe while nothing has been sent. Once Enter has been pressed we may be
+/// looking at a message that IS generating server-side but whose receipt we
+/// never saw — resending it would post the prompt twice.
+enum SubmitFailure {
+    /// Failed before anything was submitted — safe to reconnect and retry.
+    BeforeSubmit(anyhow::Error),
+    /// Enter was pressed but no receipt appeared — never auto-retry.
+    Ambiguous(anyhow::Error),
+}
+
+impl SubmitFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            SubmitFailure::BeforeSubmit(e) | SubmitFailure::Ambiguous(e) => e,
+        }
+    }
+}
+
+/// Cross-process turn lock.
+///
+/// The ChatGPT web surface is concurrency-1: one shared logged-in tab, and an
+/// account that rate-limits hard. Two chatgpt-use processes driving the same
+/// session interleave inside a single composer — B's clear-and-insert lands on
+/// top of A's half-written prompt — which live-reproduced as both processes
+/// aborting with "42 non-whitespace chars present, 21 expected", i.e. two
+/// prompts concatenated. (Before the integrity check they would instead have
+/// silently sent the merged text.) The README claimed this was already
+/// serialized across processes with flock; it was not.
+///
+/// Held for one TURN rather than for the process lifetime, so a long `run` or
+/// `work` never starves a one-shot `ask` — a waiter only blocks until the turn
+/// in flight finishes. Released on drop (closing the fd releases the lock).
+struct TurnLock {
+    _file: Option<File>,
+}
+
+impl TurnLock {
+    /// Block until this process owns the channel, best-effort.
+    ///
+    /// If the lock file can't be created (no HOME, read-only home), run without
+    /// it and say so: refusing to work because we couldn't take an advisory lock
+    /// would be worse than the race it guards.
+    fn acquire() -> Self {
+        let Some(path) = lock_path() else {
+            return TurnLock { _file: None };
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("warning: no channel lock ({e}); concurrent runs may collide");
+                return TurnLock { _file: None };
+            }
+        };
+
+        // Announce a wait rather than appearing to hang: a queued turn can sit
+        // here for as long as the turn ahead of it takes.
+        if file.try_lock().is_err() {
+            eprintln!("waiting for another chatgpt-use turn to finish…");
+            if let Err(e) = file.lock() {
+                eprintln!("warning: could not take the channel lock ({e}); proceeding");
+                return TurnLock { _file: None };
+            }
+        }
+        TurnLock { _file: Some(file) }
+    }
+}
+
+/// `~/.chatgpt-use/channel.lock` — alongside the ledger and auth token.
+fn lock_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-use").join("channel.lock"))
+}
+
 /// Decide whether the tab has drifted off the pinned conversation.
 ///
 /// Returns `None` when it's still the right chat, or `Some(explanation)` when the

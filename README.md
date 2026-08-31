@@ -220,7 +220,10 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   instead of calling a tool. `work --retries` re-nudges on a thin report, and `--loop` lets a task span
   many tool steps — but expect the occasional turn that needs a nudge.
 - **Rate limits are real.** Driving the one shared logged-in tab, the page rate-limits aggressively, so
-  the channel runs at **concurrency 1** and queues across processes (flock), same as `chatgpt-imagegen`.
+  the channel runs at **concurrency 1**. Turns queue across processes on an advisory lock
+  (`~/.chatgpt-use/channel.lock`), taken per *turn* so a long `run`/`work` never starves a one-shot
+  `ask`. (This README used to claim that already existed; it didn't — two processes sharing a session
+  interleaved inside one composer and merged their prompts.)
 - **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
   not for tight latency loops.
 - **Mode 3 is the deep end.** A full chat harness's traffic squeezed through a browser chat box: slow,
