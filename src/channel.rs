@@ -26,6 +26,10 @@ const AB_BIN_CANDIDATES: &[&str] = &["chrome-use", "agent-browser", "agent-brows
 
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
 const WEB_PROJECT_URL_TPL: &str = "https://chatgpt.com/g/{gizmo_id}/project";
+// Reconnect target. The plain /c/<id> form resolves even for a chat filed under
+// a Project — ChatGPT redirects it to /g/<gizmo>/c/<id> — so the conversation id
+// alone is enough to find our way back.
+const WEB_CONVO_URL_TPL: &str = "https://chatgpt.com/c/";
 
 const RATE_LIMIT_MSG: &str =
     "chatgpt.com rate-limited this account ('Too many requests') — the page \
@@ -72,9 +76,12 @@ const JS_STATE: &str = r#"(() => {
       const t = (b.textContent || '').trim();
       return t.length > 0 && t.length <= 24 && ACTIVE.test(t);
     });
+  const cm = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
   return JSON.stringify({
     stop,
     tool_active,
+    convo: cm ? cm[1] : "",
+    user_count: document.querySelectorAll('[data-message-author-role="user"]').length,
     assistant_count: a.length,
     limited: /too many requests|requests too quickly/i.test(dlg),
     atext: lastA ? (lastA.innerText || lastA.textContent || '').trim() : ""
@@ -88,6 +95,73 @@ const JS_LAST_ASSISTANT: &str = r#"(() => {
   if (!lastA) return JSON.stringify("");
   return JSON.stringify((lastA.innerText || lastA.textContent || "").trim());
 })()"#;
+
+// JS: the conversation UUID this tab is currently showing, or "" on a
+// not-yet-persisted new chat (the id only materializes after the first turn).
+const JS_CONVO_ID: &str = r#"(() => {
+  const m = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
+  return JSON.stringify(m ? m[1] : "");
+})()"#;
+
+// JS: how many USER turns are rendered. ChatGPT renders the user bubble
+// optimistically the instant a submit is accepted, so a rise in this count is
+// authoritative, idempotent evidence that THIS turn was submitted — unlike
+// "is the composer empty?", which races React's clear and misreads in both
+// directions.
+const JS_ASSISTANT_COUNT: &str = r#"(() => {
+  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  return JSON.stringify(a.length);
+})()"#;
+
+const JS_USER_COUNT: &str = r#"(() => {
+  const u = document.querySelectorAll('[data-message-author-role="user"]');
+  return JSON.stringify(u.length);
+})()"#;
+
+// JS: empty the composer, so a leftover fragment from an aborted turn can't be
+// prepended to the next message.
+const JS_CLEAR_COMPOSER: &str = r#"(() => {
+  const c = document.querySelector('#prompt-textarea');
+  if (!c) return JSON.stringify({ok: false});
+  c.focus();
+  document.execCommand('selectAll');
+  document.execCommand('delete');
+  return JSON.stringify({ok: true});
+})()"#;
+
+// JS: count the composer's non-whitespace characters. Used as a cheap integrity
+// check that the whole payload actually landed before we submit — whitespace is
+// excluded because ProseMirror renders each line as its own block, so innerText
+// comes back with blank lines between them and a raw length would never match.
+const JS_COMPOSER_NWS: &str = r#"(() => {
+  const c = document.querySelector('#prompt-textarea');
+  const t = c ? (c.innerText || c.textContent || '') : '';
+  return JSON.stringify(t.replace(/\s+/g, '').length);
+})()"#;
+
+/// JS: insert `text` at the caret via `execCommand('insertText')`.
+///
+/// This is deliberately NOT `keyboard type`. A "\n" typed into ProseMirror is an
+/// Enter — i.e. a SUBMIT — so typing any multi-line message (every `run`/`serve`
+/// system prompt) chopped it at each newline and fired the pieces off as many
+/// separate chat messages, which ChatGPT then answered as fragments. Verified
+/// live: `keyboard type "A\nB"` submits "A" and leaves "B" in the box.
+///
+/// `insertText` treats "\n" as literal text while still firing the real
+/// beforeinput/input events ProseMirror and React need, so the send button stays
+/// bound to the live content (which is why `fill` was avoided in the first place).
+fn js_insert_text(text: &str) -> String {
+    let t = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const c = document.querySelector('#prompt-textarea');
+  if (!c) return JSON.stringify({{ok: false, error: 'composer not found'}});
+  c.focus();
+  const ok = document.execCommand('insertText', false, {t});
+  return JSON.stringify({{ok}});
+}})()"#
+    )
+}
 
 // JS: resolve or create a ChatGPT Project by exact display name.
 // Returns {ok, id, created, error?}. Mirrors _JS_ENSURE_PROJECT in chatgpt-imagegen.
@@ -188,6 +262,13 @@ pub struct Channel {
     session: String,
     /// Per-turn timeout in seconds.
     timeout_secs: u64,
+    /// The conversation this channel is pinned to, latched after the first
+    /// successful turn (a fresh chat has no id until then). Every later turn
+    /// verifies the tab still shows it, so a sidebar click, a stray navigation
+    /// or a project opening a new chat can't silently redirect us into a
+    /// DIFFERENT conversation — which would break the "same chat accumulates
+    /// context" contract while still returning a plausible-looking reply.
+    convo_id: Option<String>,
 }
 
 impl Channel {
@@ -260,7 +341,7 @@ impl Channel {
             );
         }
 
-        let chan = Channel { ab, session, timeout_secs };
+        let chan = Channel { ab, session, timeout_secs, convo_id: None };
 
         // Navigate into a ChatGPT Project FIRST — it loads a new page and would
         // reset any model selection, so model selection must come afterwards.
@@ -288,6 +369,182 @@ impl Channel {
         Ok(chan)
     }
 
+    /// Put `message` in the composer and submit it, returning only once a new
+    /// user turn proves the submit landed.
+    fn fill_and_submit(&self, message: &str, baseline_users: u64, budget: f64) -> Result<()> {
+        // Focus and empty the composer, then insert the message as TEXT.
+        ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
+            .context("clicking #prompt-textarea")?;
+        // Clear, then CONFIRM the composer is actually empty. One `delete` is not
+        // enough after a reattach: the page may still be hydrating, and ChatGPT
+        // restores a saved draft into the composer once it is — which silently
+        // prepends a stray character to the prompt. (Seen live: a 26 KB payload
+        // arrived one character long, which the integrity check below correctly
+        // rejected.) Whitespace is ignored, so only real leftover text blocks us.
+        let mut cleared = false;
+        for _ in 0..5 {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            if ab_eval(&self.ab, JS_COMPOSER_NWS, &self.session, budget)
+                .ok()
+                .and_then(|v| v.as_u64())
+                == Some(0)
+            {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !cleared {
+            bail!(
+                "could not empty the ChatGPT composer — leftover text would be \
+                 prepended to the message"
+            );
+        }
+
+        // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
+        // fails with EAGAIN ("Resource temporarily unavailable"). Each chunk
+        // appends at the caret. Split on char boundaries (prompts contain
+        // multibyte text). See `js_insert_text` for why this is not `keyboard
+        // type`: typed newlines submit, which silently shredded every multi-line
+        // prompt into one chat message per line.
+        const INSERT_CHUNK_CHARS: usize = 1500;
+        let chars: Vec<char> = message.chars().collect();
+        for chunk in chars.chunks(INSERT_CHUNK_CHARS) {
+            let piece: String = chunk.iter().collect();
+            let res = ab_eval(&self.ab, &js_insert_text(&piece), &self.session, budget)
+                .context("inserting message text into composer")?;
+            if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                bail!("could not insert text into the ChatGPT composer");
+            }
+        }
+
+        // Integrity check BEFORE submitting: confirm the whole payload is sitting
+        // in the composer. Cheaper and far more useful than discovering a
+        // truncated prompt from a confused reply ten minutes later.
+        let want_nws = message.chars().filter(|c| !c.is_whitespace()).count() as u64;
+        let got_nws = ab_eval(&self.ab, JS_COMPOSER_NWS, &self.session, budget)
+            .ok()
+            .and_then(|v| v.as_u64());
+        if let Some(got) = got_nws {
+            if got != want_nws {
+                bail!(
+                    "composer content doesn't match the message to send \
+                     ({got} non-whitespace chars present, {want_nws} expected) — \
+                     refusing to submit a truncated or polluted prompt"
+                );
+            }
+        }
+
+        ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
+            .context("pressing Enter to submit")?;
+
+        // Confirm the submit actually landed, by EVIDENCE (a new user turn was
+        // rendered) rather than by the old proxy "is the composer empty?". That
+        // proxy raced React's clear and misread in both directions: a slow clear
+        // looked like a failed submit (→ duplicate send), and a swallowed Enter
+        // with an already-cleared box looked like success (→ we then waited on,
+        // and scraped, the PREVIOUS turn).
+        if !self.await_user_turn(baseline_users, Duration::from_secs(3), budget) {
+            // Enter didn't take. Click the send button and demand evidence again.
+            // Note this fallback is naturally inert if the submit did land after
+            // all: once generation starts, the send button becomes the stop
+            // button and this selector matches nothing.
+            let _ = ab_cmd(
+                &self.ab,
+                &["click", r#"button[data-testid="send-button"]"#],
+                &self.session,
+                budget,
+            );
+            if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
+                bail!(
+                    "the message was never submitted — no new user turn appeared \
+                     after pressing Enter and clicking the send button. The \
+                     composer may be disabled (rate limit, expired session) or \
+                     the page layout changed."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The conversation UUID currently shown in the tab, if any.
+    fn current_convo_id(&self, budget: f64) -> Option<String> {
+        ab_eval(&self.ab, JS_CONVO_ID, &self.session, budget)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Fail closed if the tab has drifted off the conversation we pinned.
+    ///
+    /// A `None` pin means "not latched yet" (fresh chat, first turn) and always
+    /// passes. Once latched, a mismatch is never recoverable by carrying on:
+    /// the multi-turn modes rely on context accumulated in the pinned chat, so
+    /// answering from a different one is worse than erroring.
+    fn verify_convo(&self, budget: f64) -> Result<()> {
+        let Some(ref pinned) = self.convo_id else { return Ok(()) };
+        if convo_drift(pinned, self.current_convo_id(budget).as_deref()).is_none() {
+            return Ok(());
+        }
+        // Drifted. Try once to steer back before giving up — a stray navigation
+        // or a sidebar click is recoverable, and the conversation itself (with
+        // all our accumulated context) is still there on the server.
+        self.reopen_pinned(budget)?;
+        match convo_drift(pinned, self.current_convo_id(budget).as_deref()) {
+            None => Ok(()),
+            Some(msg) => bail!("{msg}"),
+        }
+    }
+
+    /// Navigate the session back to the pinned conversation.
+    ///
+    /// This is the whole point of pinning an id: when the tab is closed, the
+    /// browser restarts, or the page wanders off, the conversation and any
+    /// in-flight generation live on SERVER-side — only our observer was lost.
+    /// Reopening `/c/<id>` re-attaches to it, so a turn that would previously
+    /// have burned down to a bare "timed out" can carry on.
+    fn reopen_pinned(&self, budget: f64) -> Result<()> {
+        let Some(ref id) = self.convo_id else {
+            bail!(
+                "lost contact with the ChatGPT tab before this conversation had an \
+                 id (the id only exists once the first turn is persisted), so there \
+                 is nothing to reconnect to — rerun the command."
+            );
+        };
+        let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(20.0, 90.0));
+        let url = format!("{WEB_CONVO_URL_TPL}{id}");
+        eprintln!("reattaching to conversation {id}");
+        ab_open(&self.ab, &self.session, &url, None, deadline)
+            .context("reopening the pinned conversation")?;
+        if !wait_composer(&self.ab, &self.session, deadline, 30)? {
+            bail!("reopened conversation {id} but the composer never appeared");
+        }
+        Ok(())
+    }
+
+    /// Number of rendered user turns, or `None` if the page couldn't be read.
+    fn user_turn_count(&self, budget: f64) -> Option<u64> {
+        ab_eval(&self.ab, JS_USER_COUNT, &self.session, budget)
+            .ok()
+            .and_then(|v| v.as_u64())
+    }
+
+    /// Poll up to `within` for the user-turn count to exceed `baseline` — i.e.
+    /// for positive evidence that our submit was accepted.
+    fn await_user_turn(&self, baseline: u64, within: Duration, budget: f64) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            if self.user_turn_count(budget).is_some_and(|n| n > baseline) {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     /// Send one message and return ChatGPT's completed reply as text/markdown,
     /// using the default (one-shot) completion tuning.
     pub fn send(&mut self, message: &str) -> Result<String> {
@@ -306,66 +563,49 @@ impl Channel {
                 .max(2.0)
         };
 
+        // Refuse to type into a tab that has drifted off our pinned conversation.
+        self.verify_convo(remaining_secs())?;
+
+        // Snapshot rendered user turns: a rise in this count is our submit
+        // receipt (see JS_USER_COUNT).
+        let baseline_users: u64 = self.user_turn_count(remaining_secs()).unwrap_or(0);
+
         // Snapshot the current number of assistant messages so we can detect
         // when a NEW one arrives.
-        let baseline_count: u64 = {
-            let js = r#"(() => {
-              const a = document.querySelectorAll('[data-message-author-role="assistant"]');
-              return JSON.stringify(a.length);
-            })()"#;
-            ab_eval(&self.ab, js, &self.session, remaining_secs())
-                .ok()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-        };
+        let baseline_count: u64 = ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
-        // Click the composer, type the message, press Enter.
-        // Using keyboard type (not fill) fires React's input events so the send
-        // button stays bound to the live content. Mirrors chatgpt-imagegen.
-        ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, remaining_secs())
-            .context("clicking #prompt-textarea")?;
-        // Type the message in CHARACTER chunks. A single `keyboard type` call with
-        // a multi-KB argument overruns chrome-use's IPC and fails with EAGAIN
-        // ("Resource temporarily unavailable"); chunking keeps each call small
-        // while still firing the real input events React/ProseMirror needs.
-        // Split on char boundaries (the prompt contains multibyte chars).
-        const TYPE_CHUNK_CHARS: usize = 400;
-        let chars: Vec<char> = message.chars().collect();
-        if chars.len() <= TYPE_CHUNK_CHARS {
-            ab_cmd(&self.ab, &["keyboard", "type", message], &self.session, remaining_secs())
-                .context("typing message into composer")?;
-        } else {
-            for chunk in chars.chunks(TYPE_CHUNK_CHARS) {
-                let piece: String = chunk.iter().collect();
-                ab_cmd(&self.ab, &["keyboard", "type", &piece], &self.session, remaining_secs())
-                    .context("typing message chunk into composer")?;
+        // Fill + submit, with ONE reattach-and-retry: the tab can vanish between
+        // turns (closed, crashed, browser restarted) and the conversation itself
+        // is still on the server, so losing the window shouldn't lose the turn.
+        if let Err(first) = self.fill_and_submit(message, baseline_users, remaining_secs()) {
+            eprintln!("submit failed: {first:#}");
+            self.reopen_pinned(remaining_secs())
+                .context("could not reattach after a failed submit")?;
+
+            // Never blind-retry: the first attempt may have submitted before it
+            // errored. Re-check the receipt against the reattached page and, if
+            // the turn is already in flight, fall through to observing it rather
+            // than sending the message a second time.
+            let users_now = self.user_turn_count(remaining_secs()).unwrap_or(0);
+            if users_now > baseline_users {
+                eprintln!("the message had already been submitted; observing that turn");
+            } else {
+                self.fill_and_submit(message, users_now, remaining_secs())
+                    .context("resubmitting after reattach")?;
             }
         }
-        ab_cmd(&self.ab, &["press", "Enter"], &self.session, remaining_secs())
-            .context("pressing Enter to submit")?;
 
-        // Fallback: if Enter didn't submit (text still in the box), click send button.
-        let still_there: bool = ab_eval(
-            &self.ab,
-            r#"(() => {
-              const t = (document.querySelector('#prompt-textarea') || {}).textContent || '';
-              return JSON.stringify(t.trim().length > 0);
-            })()"#,
-            &self.session,
-            remaining_secs(),
-        )
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-        if still_there {
-            let _ = ab_cmd(
-                &self.ab,
-                &["click", r#"button[data-testid="send-button"]"#],
-                &self.session,
-                remaining_secs(),
-            );
-        }
+        // Re-read the assistant baseline: if we reattached above, the reloaded
+        // page reflects the server's view and the pre-crash count is meaningless.
+        let baseline_count = baseline_count.min(
+            ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
+                .ok()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(baseline_count),
+        );
 
         // Poll until the stop button is gone AND a new assistant message count
         // is larger than baseline.
@@ -384,6 +624,11 @@ impl Channel {
         // rather than hanging until the total timeout.
         let idle_limit = sopts.idle_limit.max(1);
 
+        // Consecutive unreadable polls. ~3 misses (~6s) is well past a normal
+        // navigation hiccup and reads as "the tab is gone".
+        const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
+        let mut lost_polls = 0u32;
+
         // Heartbeat: the page can think silently for minutes, so emit an
         // elapsed-time progress line to stderr (~every 5s) so the wait is visible.
         let started = Instant::now();
@@ -399,7 +644,79 @@ impl Channel {
             }
             std::thread::sleep(poll_interval);
 
-            let st = match ab_eval(&self.ab, JS_STATE, &self.session, remaining_secs()) {
+            let read = ab_eval(&self.ab, JS_STATE, &self.session, remaining_secs());
+
+            // Is this still OUR conversation? Identity — not "did the eval
+            // error?" — is the reliable signal that we lost the page. Closing
+            // the tab does NOT surface as a failed eval: chrome-use just hands
+            // back a fresh blank session, whose state object reads perfectly
+            // well as "no assistant messages, not generating". The old
+            // failure-based check therefore never fired and the turn silently
+            // spun out the full wall-clock timeout instead of reconnecting.
+            let seen_convo = read
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("convo"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            // Id-independent loss check, and the only one that works on turn one:
+            // ChatGPT doesn't put /c/<id> in the URL until the FIRST turn is
+            // persisted, so mid-turn-one there is no identity to compare. But we
+            // hold a submit receipt — the user-turn count rose — and that count
+            // can never legitimately go DOWN. If it does, we're looking at a
+            // different (blank) page.
+            let users_now = read
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("user_count"))
+                .and_then(|v| v.as_u64());
+            if users_now.is_some_and(|n| n <= baseline_users) {
+                if self.convo_id.is_some() {
+                    lost_polls += 1;
+                    if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        self.reopen_pinned(remaining_secs())
+                            .context("lost the ChatGPT tab and could not reattach")?;
+                        lost_polls = 0;
+                    }
+                    continue;
+                }
+                bail!(
+                    "the ChatGPT page was replaced while the first turn was still \
+                     running, and ChatGPT does not put a conversation id in the URL \
+                     until that turn finishes — so there is no conversation to \
+                     reattach to. The reply may still have completed in your \
+                     browser; rerun the command."
+                );
+            }
+
+            match (&self.convo_id, &seen_convo) {
+                // Latch as soon as the id exists — the server assigns it right
+                // after the first submit, so even turn one becomes recoverable
+                // rather than having to survive un-pinned until it completes.
+                (None, Some(id)) => {
+                    eprintln!("pinned to conversation {id}");
+                    self.convo_id = Some(id.clone());
+                    lost_polls = 0;
+                }
+                (Some(pinned), Some(seen)) if seen == pinned => lost_polls = 0,
+                // Pinned, but the page is showing something else (or nothing).
+                // The generation is still running server-side; only our view of
+                // it was lost. Reattach and keep observing.
+                (Some(_), _) => {
+                    lost_polls += 1;
+                    if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        self.reopen_pinned(remaining_secs())
+                            .context("lost the ChatGPT tab and could not reattach")?;
+                        lost_polls = 0;
+                    }
+                    continue;
+                }
+                (None, None) => {}
+            }
+
+            let st = match read {
                 Ok(v) if v.is_object() => v,
                 _ => continue,
             };
@@ -461,7 +778,13 @@ impl Channel {
             // DOM re-rendering a finished reply (collapsible tool-call disclosures
             // mutating innerText) would reset the counter every poll and wedge us
             // in "waiting for reply" forever.
-            if cur_count > 0 || cur_count > baseline_count {
+            // Require a NEW assistant turn, not merely "some assistant message
+            // exists". Without this, a turn that never actually submitted (Enter
+            // swallowed, send-button fallback missed) lands here on the first
+            // poll — stop button absent, previous reply static — and we scrape
+            // the PREVIOUS turn's text and return it as this turn's answer.
+            // Fail closed: no new turn means we keep waiting, then time out.
+            if cur_count > baseline_count {
                 if !atext.is_empty() && atext == prev_stable {
                     stable_polls += 1;
                     if stable_polls >= stable_needed {
@@ -492,6 +815,16 @@ impl Channel {
 
         if reply_text.trim().is_empty() {
             bail!("scraped an empty reply from ChatGPT");
+        }
+
+        // Latch identity on the first completed turn: a brand-new chat has no
+        // conversation id in its URL until the server persists it, so this is
+        // the earliest point we can pin. Every later turn verifies against it.
+        if self.convo_id.is_none() {
+            if let Some(id) = self.current_convo_id(remaining_secs()) {
+                eprintln!("pinned to conversation {id}");
+                self.convo_id = Some(id);
+            }
         }
 
         Ok(reply_text)
@@ -751,6 +1084,28 @@ impl Channel {
 // ---- chrome-use helpers (mirrors _ab / _ab_eval in chatgpt-imagegen) --------
 
 /// Locate the chrome-use binary: search PATH, then ~/.local/bin.
+/// Decide whether the tab has drifted off the pinned conversation.
+///
+/// Returns `None` when it's still the right chat, or `Some(explanation)` when the
+/// turn must NOT proceed. Fail-closed by design: the multi-turn modes rely on
+/// context accumulated in the pinned chat, so answering from a different one —
+/// or from a blank new chat — is worse than erroring out.
+fn convo_drift(pinned: &str, current: Option<&str>) -> Option<String> {
+    match current {
+        Some(cur) if cur == pinned => None,
+        Some(cur) => Some(format!(
+            "the browser tab moved to a different ChatGPT conversation \
+             (expected {pinned}, found {cur}) — this channel's context lives in \
+             the original chat. Leave the tab alone while it runs, or start a \
+             new run."
+        )),
+        None => Some(format!(
+            "the browser tab is no longer showing conversation {pinned} (it's on \
+             a new/blank chat) — refusing to continue the turn there."
+        )),
+    }
+}
+
 fn find_chrome_use() -> Option<PathBuf> {
     for name in AB_BIN_CANDIDATES {
         if let Some(p) = which_bin(name) {
@@ -964,6 +1319,29 @@ fn detect_logged_in_profiles() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convo_drift_allows_the_same_conversation() {
+        assert!(convo_drift("abc", Some("abc")).is_none());
+    }
+
+    #[test]
+    fn convo_drift_rejects_a_different_conversation() {
+        let msg = convo_drift("abc", Some("xyz")).expect("must fail closed");
+        assert!(msg.contains("abc") && msg.contains("xyz"), "{msg}");
+    }
+
+    #[test]
+    fn convo_drift_rejects_a_blank_new_chat() {
+        let msg = convo_drift("abc", None).expect("must fail closed");
+        assert!(msg.contains("abc"), "{msg}");
+    }
+
+    #[test]
+    fn js_probes_target_the_selectors_we_depend_on() {
+        assert!(JS_CONVO_ID.contains(r"/\/c\/([0-9a-f-]{36})/i"));
+        assert!(JS_USER_COUNT.contains(r#"[data-message-author-role="user"]"#));
+    }
 
     #[test]
     fn js_ensure_project_embeds_name() {
