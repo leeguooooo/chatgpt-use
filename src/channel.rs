@@ -367,13 +367,27 @@ impl Channel {
             }
         }
 
-        // Select the Intelligence level on the now-settled composer (after any
-        // project navigation), best-effort.
+        // Apply an explicitly requested model on the now-settled composer (after
+        // any project navigation).
+        //
+        // This used to warn and carry on with the account default. That quietly
+        // misrepresents the run: `--model pro` reports success while answering
+        // from some other model, and `work` — which must stay OFF Pro, because
+        // Pro cannot use Apps/MCP — silently loses every connector tool and then
+        // looks like a model that "won't use its tools". Only ever set when the
+        // caller named a model, so erring here refuses exactly the request we
+        // cannot honour.
         if let Some(ref model) = opts.model {
             let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
-            if let Err(e) = chan.select_model(model, model_deadline) {
-                eprintln!("warning: could not select model {model:?}: {e}; using account default");
-            }
+            chan.select_model(model, model_deadline).with_context(|| {
+                format!(
+                    "could not select model {model:?} — refusing to run on the account \
+                     default instead. ChatGPT relabelled the composer picker from \
+                     Intelligence levels (instant/high/pro) to model names \
+                     (e.g. \"5.6 SolLight\"), so the selector needs updating; rerun \
+                     without --model to accept whatever the account is set to"
+                )
+            })?;
         }
 
         Ok(chan)

@@ -209,10 +209,15 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   a correct answer. Still: this is a text protocol over a chat surface, not native function-calling —
   expect the occasional malformed turn. Native tool-calling remains better on the **MCP channel**
   (regular GPT-5.5) when it's available to you.
-- **Pro is browser-only.** GPT-5.5 **Pro** — the strongest planner — cannot use Apps/MCP, so it's
-  reachable only through the browser channel. Selecting it *is* automated now (`--model pro`,
-  DOM-reverse-engineered), but the closed loop (`work`) must stay on a non-Pro level so the connector
-  tools are available.
+- **Pro is browser-only, and `--model` is currently broken.** GPT-5.5 **Pro** — the strongest planner
+  — cannot use Apps/MCP, so it's reachable only through the browser channel. Selecting it was
+  automated by reverse-engineering the composer's *Intelligence level* picker (instant / high / pro).
+  ChatGPT has since relabelled that picker to **model names** (observed 2026-08-31: the button reads
+  `5.6 SolLight`), so the selector no longer matches anything and `--model` cannot be applied. It now
+  **errors out** rather than silently running on the account default — which is the dangerous failure,
+  since the closed loop (`work`) must stay on a non-Pro level to keep its connector tools. Run without
+  `--model` to accept whatever the account is set to. Updating the selector needs a look at the new
+  menu (blocked on a rate limit at time of writing).
 - **Connector goes stale on `mcp` restart.** ChatGPT caches `tools/list`, so after you restart the
   server it may not see the tools until a manual Refresh. `chatgpt-use refresh` automates that click
   (live-verified against the settings UI); the closed loop is otherwise hands-off.
