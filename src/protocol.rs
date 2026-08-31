@@ -8,7 +8,6 @@
 //! Owned by the CORE agent. See README "The honest caveats" for why robustness
 //! (strict format + repair re-ask) matters here.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -58,8 +57,14 @@ struct ToolCallEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct ToolCallRaw {
-    id: String,
+    /// Models drop the id when they emit a single call; correlate positionally then.
+    #[serde(default)]
+    id: Option<String>,
     name: String,
+    /// The model picks its own word for the argument bag — observed live as both
+    /// `input` and `arguments`. Accept the common variants, and tolerate it being
+    /// omitted entirely for a no-argument tool.
+    #[serde(default, alias = "arguments", alias = "parameters", alias = "args")]
     input: Value,
 }
 
@@ -142,45 +147,89 @@ Emit your first tool_calls block now. Do not greet, explain, or ask for files."#
 /// so the caller can re-ask rather than crash — in keeping with the README's
 /// robustness goal.
 pub fn parse_reply(assistant_text: &str) -> Reply {
-    // Regex: capture the content between ```json ... ``` (DOTALL via (?s)).
-    // The pattern allows optional language tag variants: ```json or ```JSON.
-    let re = Regex::new(r"(?s)```[jJ][sS][oO][nN]\s*\n(.*?)\n?```").expect("valid regex");
-
-    let captures = re.captures(assistant_text);
-    let block_content = captures.as_ref().and_then(|c| c.get(1)).map(|m| m.as_str());
-
-    match block_content {
-        None => {
-            // No fenced block at all — this is a plain-text final answer.
-            Reply::Text(assistant_text.to_string())
+    // IMPORTANT: this runs on RENDERED text — the innerText we scrape out of the
+    // DOM — not on markdown source. By the time a reply reaches us, a ```json
+    // fence has already been rendered away into a code block whose innerText is
+    // a language-label line ("JSON") followed by the code. A fence-matching
+    // regex therefore NEVER matched a real reply, so every tool call was
+    // misread as a plain-text final answer and the agent loop exited on turn one.
+    //
+    // So: scan the whole reply for a balanced JSON object that actually carries
+    // `tool_calls`, wherever it sits — bare, label-prefixed, or (when a literal
+    // fence does survive) inside one.
+    match find_envelope(assistant_text) {
+        Some(env) => {
+            let calls = env
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| ToolCall {
+                    id: r.id.unwrap_or_else(|| format!("call_{i}")),
+                    name: r.name,
+                    input: r.input,
+                })
+                .collect();
+            Reply::Tools(calls)
         }
-        Some(raw) => {
-            // Try to parse the block as the expected envelope.
-            match serde_json::from_str::<ToolCallEnvelope>(raw.trim()) {
-                Ok(env) if !env.tool_calls.is_empty() => {
-                    let calls = env
-                        .tool_calls
-                        .into_iter()
-                        .map(|r| ToolCall {
-                            id: r.id,
-                            name: r.name,
-                            input: r.input,
-                        })
-                        .collect();
-                    Reply::Tools(calls)
-                }
-                Ok(_) => {
-                    // Parsed successfully but empty tool_calls — treat as text.
-                    Reply::Text(assistant_text.to_string())
-                }
-                Err(_) => {
-                    // Block present but malformed. Prefer Text so the loop can
-                    // re-ask rather than crashing the agent.
-                    Reply::Text(assistant_text.to_string())
-                }
+        // No tool-call envelope anywhere — this is the plain-text final answer.
+        None => Reply::Text(assistant_text.to_string()),
+    }
+}
+
+/// Find the first balanced `{...}` in `text` that deserializes into a non-empty
+/// tool-call envelope.
+fn find_envelope(text: &str) -> Option<ToolCallEnvelope> {
+    for (start, _) in text.char_indices().filter(|(_, c)| *c == '{') {
+        let Some(end) = balanced_object_end(text, start) else { continue };
+        let candidate = &text[start..end];
+        // Cheap prefilter: skip objects that can't be an envelope.
+        if !candidate.contains("tool_calls") {
+            continue;
+        }
+        if let Ok(env) = serde_json::from_str::<ToolCallEnvelope>(candidate) {
+            if !env.tool_calls.is_empty() {
+                return Some(env);
             }
         }
     }
+    None
+}
+
+/// Byte index just past the `}` that closes the object opening at `start`.
+///
+/// Brace-counting alone is not enough: a brace inside a string literal (a tool
+/// argument containing `{`, a regex, a code snippet) would unbalance the count,
+/// so string literals and their escapes are skipped.
+fn balanced_object_end(text: &str, start: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (i, &c) in b.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Render tool results into the next user turn fed back to ChatGPT.
@@ -210,6 +259,73 @@ pub fn render_results(results: &[ToolResult]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The regression that mattered: we parse RENDERED innerText, where a
+    /// ```json fence has become a "JSON" label line + the code. The old
+    /// fence-matching parser returned Text here, so the agent loop exited on
+    /// turn one instead of running the tool.
+    #[test]
+    fn parses_a_rendered_code_block_with_a_language_label() {
+        let rendered = "JSON\n{\"tool_calls\":[{\"id\":\"call_0\",\"name\":\"list_dir\",\"input\":{\"path\":\".\"}}]}";
+        match parse_reply(rendered) {
+            Reply::Tools(c) => {
+                assert_eq!(c.len(), 1);
+                assert_eq!(c[0].name, "list_dir");
+                assert_eq!(c[0].id, "call_0");
+            }
+            Reply::Text(t) => panic!("expected a tool call, got text: {t}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_bare_single_line_envelope() {
+        // What the priming nudge actually asks the model to emit.
+        let bare = r#"{"tool_calls":[{"id":"call_0","name":"list_dir","input":{"path":"."}}]}"#;
+        assert!(matches!(parse_reply(bare), Reply::Tools(_)));
+    }
+
+    #[test]
+    fn parses_an_envelope_surrounded_by_prose() {
+        let msg = "Sure, let me look.\n{\"tool_calls\":[{\"id\":\"a\",\"name\":\"list_dir\",\"input\":{}}]}\nStanding by.";
+        assert!(matches!(parse_reply(msg), Reply::Tools(_)));
+    }
+
+    /// Observed live: the model wrote `arguments` instead of `input`, and the
+    /// strict struct rejected the whole envelope.
+    #[test]
+    fn accepts_arguments_as_an_alias_for_input() {
+        let msg = r#"{"tool_calls":[{"id":"call_1","name":"list_dir","arguments":{}}]}"#;
+        match parse_reply(msg) {
+            Reply::Tools(c) => assert_eq!(c[0].name, "list_dir"),
+            Reply::Text(t) => panic!("expected a tool call, got text: {t}"),
+        }
+    }
+
+    #[test]
+    fn synthesizes_an_id_when_the_model_omits_it() {
+        let msg = r#"{"tool_calls":[{"name":"list_dir","input":{}}]}"#;
+        match parse_reply(msg) {
+            Reply::Tools(c) => assert_eq!(c[0].id, "call_0"),
+            Reply::Text(t) => panic!("expected a tool call, got text: {t}"),
+        }
+    }
+
+    /// A brace inside a string argument must not unbalance the scanner.
+    #[test]
+    fn scans_past_braces_inside_string_arguments() {
+        let msg = r#"{"tool_calls":[{"id":"g","name":"grep","input":{"pattern":"fn \\w+\\{"}}]}"#;
+        match parse_reply(msg) {
+            Reply::Tools(c) => assert_eq!(c[0].name, "grep"),
+            Reply::Text(t) => panic!("expected a tool call, got text: {t}"),
+        }
+    }
+
+    /// A prose answer that merely mentions the word must stay a final answer.
+    #[test]
+    fn plain_prose_is_still_a_final_answer() {
+        let msg = "I could not find any tool_calls to make; the version is 0.0.1.";
+        assert!(matches!(parse_reply(msg), Reply::Text(_)));
+    }
+
     use super::*;
     use serde_json::json;
 
