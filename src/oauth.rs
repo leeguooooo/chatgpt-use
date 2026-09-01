@@ -12,7 +12,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -52,14 +51,13 @@ fn state() -> &'static Mutex<OauthState> {
 }
 
 // ---------------------------------------------------------------------------
-// Random helpers (no RNG crate — /dev/urandom only)
+// Random helpers
 // ---------------------------------------------------------------------------
 
-/// Read `n` random bytes from /dev/urandom and return them.
+/// Generate `n` cryptographically secure random bytes using the OS RNG.
 fn random_bytes(n: usize) -> Vec<u8> {
-    let mut f = std::fs::File::open("/dev/urandom").expect("/dev/urandom must be available");
     let mut buf = vec![0u8; n];
-    f.read_exact(&mut buf).expect("reading /dev/urandom");
+    getrandom::fill(&mut buf).expect("OS random source must be available");
     buf
 }
 

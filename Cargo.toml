@@ -20,6 +20,7 @@ walkdir = "2"
 regex = "1"
 sha2 = "0.10"
 base64 = "0.22"
+getrandom = "0.4"
 
 [profile.release]
 strip = true

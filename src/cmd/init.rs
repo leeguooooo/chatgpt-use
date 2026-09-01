@@ -5,7 +5,6 @@
 
 use crate::cli::InitArgs;
 use anyhow::{Context, Result};
-use std::io::Read;
 
 /// The config directory: `~/.chatgpt-use`.
 pub fn config_dir() -> std::path::PathBuf {
@@ -29,11 +28,10 @@ pub fn load_token() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 16 random bytes from /dev/urandom, hex-encoded (no RNG crate needed).
+/// 16 cryptographically secure random bytes, hex-encoded.
 fn random_token() -> Result<String> {
-    let mut f = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
     let mut buf = [0u8; 16];
-    f.read_exact(&mut buf).context("reading random bytes")?;
+    getrandom::fill(&mut buf).context("generating random token")?;
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("cgu-{hex}"))
 }
