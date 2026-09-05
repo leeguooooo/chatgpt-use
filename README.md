@@ -144,6 +144,8 @@ Live testing + studying three mature projects (see below) converged on one desig
 **don't make web ChatGPT role-play tools — route by what each model tier can actually do.**
 Full write-up: [`docs/architecture.html`](docs/architecture.html).
 
+Failure semantics (conversation identity, reconnect mid-generation, ambiguous submit, completion observation, cross-process contention), specified as browser-state → required outcome so other implementations can run them too: [`docs/failure-semantics-corpus.md`](docs/failure-semantics-corpus.md).
+
 ![plan, then hand off](assets/planner-executor.png)
 
 ```
