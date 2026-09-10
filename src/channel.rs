@@ -141,6 +141,18 @@ const JS_CLEAR_COMPOSER: &str = r#"(() => {
   return JSON.stringify({ok: true});
 })()"#;
 
+// JS: dismiss a blocking dialog (the rate-limit notice has a "Got it" button).
+// Leaving it up keeps the composer unusable even after the throttle lifts.
+const JS_DISMISS_DIALOG: &str = r#"(() => {
+  const dlg = [...document.querySelectorAll('[role="dialog"]')]
+    .find(d => /too many requests|requests too quickly/i.test(d.textContent || ''));
+  if (!dlg) return JSON.stringify({ok: false});
+  const btn = [...dlg.querySelectorAll('button')]
+    .find(b => /got it|ok|dismiss|close/i.test((b.textContent || '').trim()));
+  if (btn) { btn.click(); return JSON.stringify({ok: true}); }
+  return JSON.stringify({ok: false});
+})()"#;
+
 // JS: fingerprint the composer's contents — the non-whitespace character COUNT
 // and an order-sensitive HASH of those characters.
 //
@@ -203,6 +215,41 @@ fn js_insert_text(text: &str) -> String {
     )
 }
 
+/// A JS prelude every backend call shares: fetch the page's bearer token ONCE
+/// and keep it on `window` until it is close to expiring.
+///
+/// `/api/auth/session` was being re-fetched by every single backend call. The
+/// completion check alone runs every ~20s, so a five-minute turn spent fifteen
+/// requests re-asking for a token that had not changed. The throttle that keeps
+/// biting this account counts requests, so that is fifteen requests of pure
+/// waste per turn, on top of whatever the call actually needed.
+///
+/// Cached against the session's own `expires`, with a minute of headroom, and
+/// re-fetched on any failure — a stale token is worse than an extra request.
+const JS_TOKEN_PRELUDE: &str = r#"
+const __cguToken = async () => {
+  try {
+    const now = Date.now();
+    const c = window.__cguTok;
+    if (c && c.token && c.until > now) return c.token;
+    const s = await fetch('/api/auth/session', {credentials: 'include'}).then(r => r.json());
+    if (!s || !s.accessToken) return null;
+    // `expires` on this payload is the SESSION's lifetime — observed 90 days —
+    // not the access token's, so honouring it would cache a bearer far past its
+    // real validity and turn every later call into a 401. Cap the cache at five
+    // minutes: still collapses the ~15 fetches a long turn used to make into
+    // one or two, without betting on a token staying good.
+    const exp = Date.parse(s.expires || '');
+    const cap = now + 300000;
+    const until = Number.isFinite(exp) ? Math.min(exp - 60000, cap) : cap;
+    window.__cguTok = {token: s.accessToken, until: until};
+    return s.accessToken;
+  } catch (e) {
+    return null;
+  }
+};
+"#;
+
 /// JS: ask the SERVER whether this turn is finished, and what it said.
 ///
 /// The DOM can only be inferred from: we watch it stop changing and call that an
@@ -219,13 +266,13 @@ fn js_server_final(convo_id: &str) -> String {
     let c = serde_json::to_string(convo_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"(async () => {{
+  {prelude}
   try {{
-    const sess = await fetch('/api/auth/session', {{credentials: 'include'}})
-      .then(r => r.json()).catch(() => null);
-    if (!sess || !sess.accessToken) return JSON.stringify({{ok: false, error: 'not signed in'}});
+    const tok = await __cguToken();
+    if (!tok) return JSON.stringify({{ok: false, error: 'not signed in'}});
     const r = await fetch('/backend-api/conversation/' + {c}, {{
       credentials: 'include',
-      headers: {{Authorization: 'Bearer ' + sess.accessToken}},
+      headers: {{Authorization: 'Bearer ' + tok}},
     }});
     if (!r.ok) return JSON.stringify({{ok: false, error: 'HTTP ' + r.status}});
     const j = await r.json();
@@ -259,7 +306,8 @@ fn js_server_final(convo_id: &str) -> String {
   }} catch (e) {{
     return JSON.stringify({{ok: false, error: String(e)}});
   }}
-}})()"#
+}})()"#,
+        prelude = JS_TOKEN_PRELUDE
     )
 }
 
@@ -275,14 +323,14 @@ fn js_file_into_project(convo_id: &str, gizmo_id: &str) -> String {
     let g = serde_json::to_string(gizmo_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"(async () => {{
+  {prelude}
   try {{
-    const sess = await fetch('/api/auth/session', {{credentials: 'include'}})
-      .then(r => r.json()).catch(() => null);
-    if (!sess || !sess.accessToken) return JSON.stringify({{ok: false, error: 'not signed in'}});
+    const tok = await __cguToken();
+    if (!tok) return JSON.stringify({{ok: false, error: 'not signed in'}});
     const r = await fetch('/backend-api/conversation/' + {c}, {{
       method: 'PATCH',
       credentials: 'include',
-      headers: {{Authorization: 'Bearer ' + sess.accessToken, 'Content-Type': 'application/json'}},
+      headers: {{Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json'}},
       body: JSON.stringify({{gizmo_id: {g}}}),
     }});
     if (!r.ok) return JSON.stringify({{ok: false, error: 'HTTP ' + r.status}});
@@ -290,7 +338,8 @@ fn js_file_into_project(convo_id: &str, gizmo_id: &str) -> String {
   }} catch (e) {{
     return JSON.stringify({{ok: false, error: String(e)}});
   }}
-}})()"#
+}})()"#,
+        prelude = JS_TOKEN_PRELUDE
     )
 }
 
@@ -1223,6 +1272,8 @@ impl Channel {
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
         let mut polls: u64 = 0;
+        // How many times we have backed off for the page's rate-limit dialog.
+        let mut limited_waits: u32 = 0;
 
         // Heartbeat: the page can think silently for minutes, so emit an
         // elapsed-time progress line to stderr (~every 5s) so the wait is visible.
@@ -1332,11 +1383,42 @@ impl Channel {
             };
 
             if st.get("limited").and_then(|v| v.as_bool()).unwrap_or(false) {
-                bail!(
-                    "{} The prompt was already submitted; check the conversation \
-                     or retry in a few minutes.",
-                    RATE_LIMIT_MSG
+                // The prompt is already in. Handing the user an error here throws
+                // away a turn the model is very likely still completing — the
+                // throttle is on the conversations API, not on generation, which
+                // is why the record keeps filling in while the page shows this
+                // dialog. So wait it out inside our own deadline instead, and
+                // keep asking the server, which is the one source still answering.
+                limited_waits += 1;
+                let backoff = Duration::from_secs(match limited_waits {
+                    1 => 20,
+                    2 => 45,
+                    _ => 90,
+                });
+                if Instant::now() + backoff >= deadline {
+                    bail!(
+                        "{} The prompt was already submitted; check the conversation \
+                         or retry in a few minutes.",
+                        RATE_LIMIT_MSG
+                    );
+                }
+                eprintln!(
+                    "[{:5}.0s] rate-limited by the page; waiting {}s (attempt {}) — the reply \
+                     may still be arriving server-side",
+                    started.elapsed().as_secs(),
+                    backoff.as_secs(),
+                    limited_waits
                 );
+                // Dismiss the dialog so the page is usable if it does recover.
+                let _ = ab_eval(&self.ab, JS_DISMISS_DIALOG, &self.session, remaining_secs());
+                std::thread::sleep(backoff);
+                if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+                    if !text.trim().is_empty() {
+                        eprintln!("the turn completed despite the throttle; taking it from the record");
+                        return self.finish_turn(text, remaining_secs());
+                    }
+                }
+                continue;
             }
 
             let stop = st.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
