@@ -50,6 +50,8 @@ pub fn run(args: &WorkArgs) -> Result<()> {
         project: args.channel.project.clone(),
         timeout_secs,
         model,
+        busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
+        receipt: None,
     };
 
     let sopts = SendOptions::work();

@@ -33,6 +33,8 @@ pub fn run(args: &RefreshArgs) -> Result<()> {
         project: String::new(),
         timeout_secs: args.channel.timeout.max(60),
         model: None,
+        busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
+        receipt: None,
     };
 
     let channel = Channel::connect(&opts)?;

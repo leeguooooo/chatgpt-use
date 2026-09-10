@@ -69,6 +69,11 @@ pub enum ErrorKind {
     /// Enter was pressed but no receipt appeared. The prompt may be on the
     /// server; resending it could post it twice.
     SubmitUnknown,
+    /// Another run holds the ChatGPT window and `--busy fail` was asked for.
+    Busy,
+    /// The `--request-id` already names a request that may have reached
+    /// ChatGPT; it is not sent again.
+    Duplicate,
     /// The prompt was sent but no complete reply arrived.
     Incomplete,
 }
@@ -82,6 +87,8 @@ impl ErrorKind {
             ErrorKind::PageBlocked => "page_blocked",
             ErrorKind::NotSubmitted => "not_submitted",
             ErrorKind::SubmitUnknown => "submit_unknown",
+            ErrorKind::Busy => "busy",
+            ErrorKind::Duplicate => "duplicate_request",
             ErrorKind::Incomplete => "incomplete",
         }
     }
@@ -96,6 +103,8 @@ impl ErrorKind {
             | ErrorKind::PageBlocked => "unavailable",
             ErrorKind::NotSubmitted => "failed",
             ErrorKind::SubmitUnknown | ErrorKind::Incomplete => "incomplete",
+            ErrorKind::Busy => "busy",
+            ErrorKind::Duplicate => "duplicate",
         }
     }
 }
@@ -682,6 +691,10 @@ pub struct ChannelOptions {
     /// Browser-channel model to select: pro | thinking | instant | <raw label>.
     /// None → use the account default. (Pro is reachable only via the browser.)
     pub model: Option<String>,
+    /// Fail with `ErrorKind::Busy` instead of queueing behind another run.
+    pub busy_fail: bool,
+    /// Receipt to update as the turn progresses (`ask --request-id`).
+    pub receipt: Option<PathBuf>,
 }
 
 /// Tuning for how `send` decides a reply is COMPLETE. Multi-step connector turns
@@ -743,6 +756,8 @@ pub struct Channel {
     /// Whether the current turn's prompt is known to be on the server; decides
     /// how a failure of that turn is typed (see `classify`).
     submitted: bool,
+    /// Receipt kept current as the turn progresses (see `receipt`).
+    receipt: Option<PathBuf>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -755,7 +770,7 @@ impl Channel {
     pub fn connect(opts: &ChannelOptions) -> Result<Self> {
         // Take the surface BEFORE touching the browser: opening the tab and
         // entering a project already mutate the shared window.
-        let surface = SurfaceLock::acquire();
+        let surface = SurfaceLock::acquire(opts.busy_fail)?;
 
         let ab = find_chrome_use().ok_or_else(|| {
             anyhow!(
@@ -909,6 +924,7 @@ impl Channel {
             convo_id: None,
             pending_project: None,
             submitted: false,
+            receipt: opts.receipt.clone(),
             _surface: surface,
         };
 
@@ -1340,6 +1356,22 @@ impl Channel {
         self.convo_id.as_deref()
     }
 
+    /// Record in the receipt, if there is one, what is now known: that the
+    /// prompt is on the server, and which conversation it is in.
+    fn touch_receipt(&self) {
+        let Some(path) = &self.receipt else { return };
+        let (submitted, convo) = (self.submitted, self.convo_id.clone());
+        crate::receipt::update(path, |r| {
+            if submitted {
+                r.state = "submitted".into();
+                r.submitted = "yes".into();
+            }
+            if convo.is_some() {
+                r.conversation_id = convo;
+            }
+        });
+    }
+
     /// Text of a visible dialog on the page, if one is up.
     fn blocking_dialog(&self, budget: f64) -> Option<String> {
         let v = ab_eval(&self.ab, JS_BLOCKING_DIALOG, &self.session, budget).ok()?;
@@ -1446,6 +1478,7 @@ impl Channel {
         // Past this point the prompt is on the server: any failure from here
         // on means an incomplete turn, never "not sent, safe to resend".
         self.submitted = true;
+        self.touch_receipt();
 
         // Re-read the assistant baseline: if we reattached above, the reloaded
         // page reflects the server's view and the pre-crash count is meaningless.
@@ -1586,6 +1619,7 @@ impl Channel {
                 (None, Some(id)) => {
                     eprintln!("pinned to conversation {id}");
                     self.convo_id = Some(id.clone());
+                    self.touch_receipt();
                     lost_polls = 0;
                 }
                 (Some(pinned), Some(seen)) if seen == pinned => lost_polls = 0,
@@ -1791,6 +1825,7 @@ impl Channel {
             if let Some(id) = self.current_convo_id(budget) {
                 eprintln!("pinned to conversation {id}");
                 self.convo_id = Some(id);
+                self.touch_receipt();
             }
         }
 
@@ -2198,9 +2233,9 @@ impl SurfaceLock {
     /// If the lock file can't be created (no HOME, read-only home), run without
     /// it and say so: refusing to work because we couldn't take an advisory lock
     /// would be worse than the race it guards.
-    fn acquire() -> Self {
+    fn acquire(fail_fast: bool) -> Result<Self> {
         let Some(path) = lock_path() else {
-            return SurfaceLock { _file: None };
+            return Ok(SurfaceLock { _file: None });
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -2222,7 +2257,7 @@ impl SurfaceLock {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: no channel lock ({e}); concurrent runs may collide");
-                return SurfaceLock { _file: None };
+                return Ok(SurfaceLock { _file: None });
             }
         };
 
@@ -2232,10 +2267,17 @@ impl SurfaceLock {
         // "stuck".
         if file.try_lock().is_err() {
             let who = holder_label(&std::fs::read_to_string(&path).unwrap_or_default());
+            if fail_fast {
+                return Err(ChannelError::new(
+                    ErrorKind::Busy,
+                    format!("{who} is using ChatGPT; not waiting (--busy fail)"),
+                )
+                .into());
+            }
             eprintln!("waiting for {who} to finish with ChatGPT…");
             if let Err(e) = file.lock() {
                 eprintln!("warning: could not take the channel lock ({e}); proceeding");
-                return SurfaceLock { _file: None };
+                return Ok(SurfaceLock { _file: None });
             }
         }
 
@@ -2246,7 +2288,7 @@ impl SurfaceLock {
             .and_then(|_| file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes()))
             .and_then(|_| file.flush());
 
-        SurfaceLock { _file: Some(file) }
+        Ok(SurfaceLock { _file: Some(file) })
     }
 }
 
@@ -2898,7 +2940,10 @@ mod tests {
     #[test]
     fn no_failure_maps_to_completed() {
         use ErrorKind::*;
-        for k in [LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown, Incomplete] {
+        for k in [
+            LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown,
+            Incomplete, Busy, Duplicate,
+        ] {
             assert_ne!(k.status(), "completed", "{k:?}");
         }
         assert_eq!(Incomplete.status(), "incomplete");

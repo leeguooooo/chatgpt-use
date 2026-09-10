@@ -77,6 +77,8 @@ chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.sche
 | `unavailable` | throttled, signed out, wedged session, or a blocking dialog (its text is quoted) | 6 |
 | `failed` | failed before anything was sent (e.g. a context file would not read) | 1 |
 | `schema_error` | your schema would not load or compile; nothing was sent | 8 |
+| `busy` | another run holds the ChatGPT window and you passed `--busy fail` | 7 |
+| `duplicate` | the `--request-id` already names a request that may have been sent | 9 |
 
 Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
 `unknown` means Enter was pressed but no receipt appeared, so a retry could post the prompt
@@ -84,6 +86,28 @@ twice. No failure is ever reported as `completed` with an empty result. A reply 
 validation is **not** repaired with a follow-up turn: that would be another paid turn you did not
 ask for, so the decision to retry stays with the caller. Schemas must be self-contained, because
 a remote `$ref` is not fetched.
+
+#### Request receipts — `--request-id`, `status`, `--busy`
+
+A caller that might lose track of a request (a timeout, a crash, a kill) should name it:
+
+```bash
+chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json \
+  --request-id pr-42-head-9f3c --busy fail
+chatgpt-use status pr-42-head-9f3c   # never touches the browser
+```
+
+- A receipt at `~/.chatgpt-use/requests/<id>.json` is written **before** anything is sent. It
+  moves to `submitted` once the prompt is on the server, picks up the `conversation_id` as soon
+  as ChatGPT assigns one, and records the outcome.
+- **An id is never sent twice** if its request may have reached ChatGPT; that returns
+  `duplicate`. The only id that may be reused is one whose receipt proves nothing was sent
+  (`failed` with `submitted: no`).
+- `status` reports `running` while the owning process is alive. If the owner died, it reports
+  `detached` when the prompt was on the server, and `submission_unknown` when it can't tell.
+  Neither of those is permission to resend.
+- `--busy fail` returns `busy` immediately instead of queueing behind another run of the shared
+  window. The default is to wait.
 
 ### Mode 2 · 大脑 / Brain — `chatgpt-use run`
 

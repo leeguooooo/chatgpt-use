@@ -16,6 +16,9 @@ use crate::channel::{Channel, ChannelOptions};
 use crate::cli::AskArgs;
 use crate::delegation::{self, Mode};
 use crate::structured;
+use crate::channel::{ChannelError, ErrorKind};
+use crate::receipt;
+use std::path::PathBuf;
 use anyhow::{Context, Result};
 use std::fs;
 
@@ -52,13 +55,21 @@ fn ask_message(args: &AskArgs) -> Result<String> {
     Ok(message)
 }
 
-fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
+fn run_ask_mode(args: &AskArgs, mut opts: ChannelOptions) -> Result<()> {
     let message = ask_message(args)?;
+    opts.receipt = claim_receipt(args)?;
 
     // Connect, send one turn, print the reply, always close.
-    let mut channel = Channel::connect(&opts)?;
-    let reply = channel.send(&message);
-    channel.close();
+    let reply = Channel::connect(&opts).and_then(|mut channel| {
+        let reply = channel.send(&message);
+        channel.close();
+        reply
+    });
+    let envelope = match &reply {
+        Ok(_) => serde_json::json!({"status": "completed"}),
+        Err(e) => structured::failure(e),
+    };
+    finish_receipt(opts.receipt.as_deref(), &envelope);
 
     let text = reply?;
     crate::ledger::record(
@@ -80,12 +91,24 @@ fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
 /// Structured ask. Every outcome, failures included, is ONE JSON envelope on
 /// stdout with an exit code to match (see `structured`); progress stays on
 /// stderr. Never returns Err: a caller parsing stdout must always get a line.
-fn run_schema_mode(args: &AskArgs, opts: ChannelOptions, schema_path: &str) -> Result<()> {
-    let envelope = match structured::Schema::load(schema_path) {
-        Err(why) => structured::schema_error(&why),
+fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) -> Result<()> {
+    let claimed = match structured::Schema::load(schema_path) {
+        Err(why) => Err(structured::schema_error(&why)),
         Ok(schema) => match ask_message(args) {
-            Err(e) => structured::failure(&e),
-            Ok(request) => {
+            Err(e) => Err(structured::failure(&e)),
+            Ok(request) => match claim_receipt(args) {
+                Err(e) => Err(structured::failure(&e)),
+                Ok(path) => {
+                    opts.receipt = path;
+                    Ok((schema, request))
+                }
+            },
+        },
+    };
+    let mut envelope = match claimed {
+        Err(envelope) => envelope,
+        Ok((schema, request)) => {
+            {
                 let message = structured::build_message(&request, &schema);
                 match Channel::connect(&opts) {
                     Err(e) => structured::failure(&e),
@@ -101,8 +124,12 @@ fn run_schema_mode(args: &AskArgs, opts: ChannelOptions, schema_path: &str) -> R
                     }
                 }
             }
-        },
+        }
     };
+    finish_receipt(opts.receipt.as_deref(), &envelope);
+    if let Some(id) = &args.request_id {
+        envelope["request_id"] = id.as_str().into();
+    }
 
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
     crate::ledger::record(
@@ -122,6 +149,62 @@ fn run_schema_mode(args: &AskArgs, opts: ChannelOptions, schema_path: &str) -> R
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// Claim the receipt for `--request-id` before anything is sent. Refuses an
+/// id whose earlier request may have reached ChatGPT: the caller asked for a
+/// receipt precisely so that a lost reply is looked up, not sent twice.
+fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
+    let Some(id) = &args.request_id else { return Ok(None) };
+    if !receipt::valid_id(id) {
+        anyhow::bail!("invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)");
+    }
+    let path = receipt::path_for(id);
+    if let Some(existing) = receipt::load(&path) {
+        if !receipt::may_send(Some(&existing)) {
+            return Err(ChannelError::new(
+                ErrorKind::Duplicate,
+                format!(
+                    "request {id:?} already exists (state {}, submitted {}); not sending it \
+                     again. Look it up with: chatgpt-use status {id}",
+                    existing.state, existing.submitted
+                ),
+            )
+            .into());
+        }
+    }
+    receipt::save(&path, &receipt::Receipt::accepted(id))
+        .with_context(|| format!("could not write receipt {}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// Close the receipt with the turn's outcome. A reply that exists (even one
+/// that failed validation) means the turn completed and the prompt was sent;
+/// otherwise the failure says how far it got.
+fn finish_receipt(path: Option<&std::path::Path>, envelope: &serde_json::Value) {
+    let Some(path) = path else { return };
+    let status = envelope["status"].as_str().unwrap_or("failed").to_string();
+    let replied = matches!(status.as_str(), "completed" | "schema_violation" | "unparseable");
+    let submitted = if replied {
+        "yes".to_string()
+    } else {
+        envelope["error"]["submitted"].as_str().unwrap_or("unknown").to_string()
+    };
+    let error = envelope["error"]["message"].as_str().map(str::to_string);
+    let convo = envelope["conversation_id"].as_str().map(str::to_string);
+    receipt::update(path, |r| {
+        r.state = if replied { "completed" } else { "failed" }.into();
+        // Never downgrade: the channel may already have recorded the prompt
+        // as sent, which a later "not submitted" cannot undo.
+        if !(r.submitted == "yes" && submitted != "yes") {
+            r.submitted = submitted;
+        }
+        r.outcome = Some(status);
+        r.error = error;
+        if convo.is_some() {
+            r.conversation_id = convo;
+        }
+    });
 }
 
 // ---- Non-Ask delegation modes -----------------------------------------------
@@ -231,5 +314,7 @@ fn channel_opts_from_args(args: &AskArgs) -> ChannelOptions {
         project: args.channel.project.clone(),
         timeout_secs: args.channel.timeout,
         model: args.channel.model.clone(),
+        busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
+        receipt: None,
     }
 }

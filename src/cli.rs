@@ -37,6 +37,24 @@ pub enum Command {
     /// Refresh the chatgpt-use connector in ChatGPT settings (re-runs tools/list).
     /// Run this after restarting the `mcp` server so ChatGPT re-discovers the tools.
     Refresh(RefreshArgs),
+    /// Report what happened to an `ask --request-id` request, from its receipt.
+    /// Never touches the browser.
+    Status(StatusArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct StatusArgs {
+    /// The id given to `ask --request-id`.
+    pub request_id: String,
+}
+
+/// What to do when another run holds the shared ChatGPT window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BusyPolicy {
+    /// Queue behind it (the default).
+    Wait,
+    /// Fail at once with status "busy".
+    Fail,
 }
 
 #[derive(Args, Debug)]
@@ -106,6 +124,10 @@ pub struct ChannelArgs {
     /// here (it has no Apps/MCP). Default: the account's current level.
     #[arg(long)]
     pub model: Option<String>,
+    /// When another run is using the ChatGPT window: wait for it, or fail at
+    /// once (error kind "busy") without touching the browser.
+    #[arg(long, value_enum, default_value_t = BusyPolicy::Wait)]
+    pub busy: BusyPolicy,
 }
 
 #[derive(Args, Debug)]
@@ -128,6 +150,12 @@ pub struct AskArgs {
     /// matching exit code. Plain ask mode only; implies JSON output.
     #[arg(long = "output-schema", value_name = "FILE")]
     pub output_schema: Option<String>,
+    /// Caller-chosen id for this request (letters, digits, . _ -; up to 128).
+    /// A receipt at ~/.chatgpt-use/requests/<id>.json records it from before
+    /// submission to the end of the turn; `chatgpt-use status <id>` reads it.
+    /// An id whose request may have reached ChatGPT is never sent again.
+    #[arg(long = "request-id", value_name = "ID")]
+    pub request_id: Option<String>,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }

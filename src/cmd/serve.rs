@@ -662,6 +662,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         project: args.channel.project.clone(),
         timeout_secs: args.channel.timeout,
         model: args.channel.model.clone(),
+        busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
+        receipt: None,
     };
     let mut channel = Channel::connect(&opts)?;
 
