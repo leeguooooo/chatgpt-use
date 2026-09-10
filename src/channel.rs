@@ -203,6 +203,66 @@ fn js_insert_text(text: &str) -> String {
     )
 }
 
+/// JS: ask the SERVER whether this turn is finished, and what it said.
+///
+/// The DOM can only be inferred from: we watch it stop changing and call that an
+/// ending. That inference has been observed wrong in both directions — a
+/// mid-stream pause read as finished, and (live, this session) a completed reply
+/// read as a 240s timeout because the page had stopped rendering while the model
+/// worked perfectly. `end_turn` is not an inference; it is the server saying the
+/// turn closed.
+///
+/// The mapping is a TREE — editing a prompt or regenerating forks it and the
+/// abandoned branches stay in the payload — so the live thread is `current_node`'s
+/// parent chain, not `Object.values(mapping)`.
+fn js_server_final(convo_id: &str) -> String {
+    let c = serde_json::to_string(convo_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+  try {{
+    const sess = await fetch('/api/auth/session', {{credentials: 'include'}})
+      .then(r => r.json()).catch(() => null);
+    if (!sess || !sess.accessToken) return JSON.stringify({{ok: false, error: 'not signed in'}});
+    const r = await fetch('/backend-api/conversation/' + {c}, {{
+      credentials: 'include',
+      headers: {{Authorization: 'Bearer ' + sess.accessToken}},
+    }});
+    if (!r.ok) return JSON.stringify({{ok: false, error: 'HTTP ' + r.status}});
+    const j = await r.json();
+    const map = j.mapping || {{}};
+    const chain = [];
+    const seen = {{}};
+    let cur = j.current_node;
+    while (cur && map[cur] && !seen[cur]) {{ seen[cur] = 1; chain.push(map[cur]); cur = map[cur].parent; }}
+    const textOf = (c2) => {{
+      if (!c2) return '';
+      if (Array.isArray(c2.parts)) {{
+        return c2.parts.map(p => typeof p === 'string' ? p : (p && p.text) || '')
+          .filter(Boolean).join('\n').trim();
+      }}
+      return typeof c2.content === 'string' ? c2.content.trim() : '';
+    }};
+    // chain is leaf -> root, so the first qualifying assistant message is the last one.
+    for (const n of chain) {{
+      const m = n.message;
+      if (!m || !m.author || m.author.role !== 'assistant') continue;
+      if (m.weight === 0) continue;
+      const ct = m.content && m.content.content_type;
+      if (ct === 'reasoning_recap' || ct === 'thoughts') continue;
+      const t = textOf(m.content);
+      if (!t) continue;
+      return JSON.stringify({{ok: true, done: m.end_turn === true, text: t,
+                              async_status: j.async_status === undefined ? null : j.async_status}});
+    }}
+    return JSON.stringify({{ok: true, done: false, text: '',
+                            async_status: j.async_status === undefined ? null : j.async_status}});
+  }} catch (e) {{
+    return JSON.stringify({{ok: false, error: String(e)}});
+  }}
+}})()"#
+    )
+}
+
 /// JS: move an existing conversation into a Project, server-side.
 ///
 /// The escape hatch for when ChatGPT's project PAGE will not render — observed
@@ -714,6 +774,21 @@ impl Channel {
         Ok(())
     }
 
+    /// The server's own answer for the pinned conversation: is the turn closed,
+    /// and what is the final assistant text. `None` when there is nothing to ask
+    /// about or the call failed — never an error, because this is a second
+    /// opinion, not the primary path.
+    fn server_final(&self, budget: f64) -> Option<(bool, String)> {
+        let id = self.convo_id.as_ref()?;
+        let res = ab_eval(&self.ab, &js_server_final(id), &self.session, budget).ok()?;
+        if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        let done = res.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = res.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Some((done, text))
+    }
+
     /// Move an existing conversation into a Project through the backend API.
     fn file_into_project(&self, convo_id: &str, gizmo_id: &str, budget: f64) -> Result<()> {
         let res = ab_eval(
@@ -945,6 +1020,10 @@ impl Channel {
         const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
         let mut lost_polls = 0u32;
 
+        // How often to ask the server instead of the page. Every 10th ~2s poll.
+        const SERVER_CHECK_EVERY: u64 = 10;
+        let mut polls: u64 = 0;
+
         // Heartbeat: the page can think silently for minutes, so emit an
         // elapsed-time progress line to stderr (~every 5s) so the wait is visible.
         let started = Instant::now();
@@ -953,6 +1032,21 @@ impl Channel {
 
         loop {
             if Instant::now() >= deadline {
+                // Before giving up, ask the server. The DOM going quiet is an
+                // inference; `end_turn` is not. Live this session: a turn that
+                // timed out here at 240s had in fact completed — the page had
+                // stopped rendering while the model worked fine. Reporting a
+                // timeout for an answer that exists is the worst outcome
+                // available, so spend one call to avoid it.
+                if let Some((true, text)) = self.server_final(30.0) {
+                    if !text.trim().is_empty() {
+                        eprintln!(
+                            "the page stopped updating, but the server says this turn finished \
+                             — taking the reply from the conversation record"
+                        );
+                        return self.finish_turn(text, remaining_secs());
+                    }
+                }
                 bail!(
                     "timed out after {}s waiting for ChatGPT to complete the reply",
                     self.timeout_secs
@@ -1061,6 +1155,23 @@ impl Channel {
             // Throttled heartbeat (~every 5s). Logs msg count + reply length so a
             // hang is diagnosable from the log alone (e.g. msgs=0 → no assistant
             // node yet; len frozen → settling; len climbing → still streaming).
+            // Periodic reconciliation. Cheap enough at this cadence (~every
+            // 20s) and it ends the wait the moment the server says the turn
+            // closed, instead of waiting out the settle heuristics.
+            polls += 1;
+            if polls % SERVER_CHECK_EVERY == 0 && self.convo_id.is_some() {
+                if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+                    if !text.trim().is_empty() {
+                        eprintln!(
+                            "[{:5}.0s] server reports the turn closed; taking the reply from the \
+                             conversation record",
+                            started.elapsed().as_secs()
+                        );
+                        return self.finish_turn(text, remaining_secs());
+                    }
+                }
+            }
+
             let elapsed = started.elapsed().as_secs();
             if elapsed >= last_beat + 5 {
                 last_beat = elapsed;
@@ -1117,6 +1228,25 @@ impl Channel {
             }
         }
 
+        // The DOM has settled. Prefer the SERVER's copy of the reply anyway.
+        //
+        // What we scrape is rendered markdown, not what the model wrote:
+        // `**structural validation**` reaches innerText as `structural
+        // validation`. Measured on one 600-word reply, the scrape lost 87
+        // characters of syntax against the conversation record. For prose that
+        // is a fidelity loss; for the tool protocol it is a correctness bug,
+        // and the same one that made a ```json fence unmatchable — the fence is
+        // simply not in the rendered text.
+        //
+        // So the record is the source of truth whenever we have a conversation
+        // to ask about, and the scrape is the fallback for the turn-one window
+        // where no id exists yet.
+        if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+            if !text.trim().is_empty() {
+                return self.finish_turn(text, remaining_secs());
+            }
+        }
+
         // Scrape the last assistant message — prefer innerText (rendered markdown).
         let reply_text = ab_eval(
             &self.ab,
@@ -1129,6 +1259,14 @@ impl Channel {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| last_atext.clone());
 
+        self.finish_turn(reply_text, remaining_secs())
+    }
+
+    /// Everything a completed turn owes regardless of HOW it completed — the DOM
+    /// settling, or the server saying so. Kept in one place so the two paths
+    /// cannot drift: a reply taken from the conversation record must still pin
+    /// the conversation and still get filed into its project.
+    fn finish_turn(&mut self, reply_text: String, budget: f64) -> Result<String> {
         if reply_text.trim().is_empty() {
             bail!("scraped an empty reply from ChatGPT");
         }
@@ -1137,7 +1275,7 @@ impl Channel {
         // conversation id in its URL until the server persists it, so this is
         // the earliest point we can pin. Every later turn verifies against it.
         if self.convo_id.is_none() {
-            if let Some(id) = self.current_convo_id(remaining_secs()) {
+            if let Some(id) = self.current_convo_id(budget) {
                 eprintln!("pinned to conversation {id}");
                 self.convo_id = Some(id);
             }
@@ -1148,7 +1286,7 @@ impl Channel {
         // Done after the turn rather than at pin time so a metadata write never
         // shares the wire with a generation in flight.
         if let (Some(gizmo), Some(cid)) = (self.pending_project.clone(), self.convo_id.clone()) {
-            match self.file_into_project(&cid, &gizmo, remaining_secs()) {
+            match self.file_into_project(&cid, &gizmo, budget) {
                 Ok(()) => {
                     eprintln!("filed conversation into project {:?}", self.project);
                     self.pending_project = None;

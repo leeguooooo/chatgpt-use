@@ -211,6 +211,13 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   a correct answer. Still: this is a text protocol over a chat surface, not native function-calling —
   expect the occasional malformed turn. Native tool-calling remains better on the **MCP channel**
   (regular GPT-5.5) when it's available to you.
+
+  Replies now come from the **conversation record**, not the rendered page, which removes the class
+  of bug above at the source. Rendered text is lossy: `**bold**` reaches `innerText` as `bold`, and a
+  ` ```json ` fence simply isn't there. Measured on one 600-word reply, scraping lost 87 characters
+  of markdown against the record. We ask the server (`GET /backend-api/conversation/<id>`, walking
+  `current_node`'s parent chain) and fall back to scraping only for the turn-one window before a
+  conversation id exists.
 - **Pro is browser-only, and the picker it lives in keeps moving.** **Pro** — the strongest planner —
   cannot use Apps/MCP, so it's reachable only through the browser channel, and the closed loop
   (`work`) must stay on a non-Pro level to keep its connector tools. `--model` is live-verified
