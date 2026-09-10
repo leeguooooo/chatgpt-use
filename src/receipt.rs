@@ -74,6 +74,23 @@ pub fn save(path: &Path, receipt: &Receipt) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Claim a new id: create its receipt only if none exists. Returns false if
+/// one already does, so two callers racing on the same id cannot both win.
+pub fn create(path: &Path, receipt: &Receipt) -> std::io::Result<bool> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            f.write_all(serde_json::to_string_pretty(receipt)?.as_bytes())?;
+            f.sync_all()?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Load, change, save. Best-effort: a receipt that cannot be updated must not
 /// fail the turn it describes, so the failure is only reported.
 pub fn update(path: &Path, change: impl FnOnce(&mut Receipt)) {
@@ -173,8 +190,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cgu-receipt-{}", std::process::id()));
         let path = dir.join("r.json");
         let r = Receipt::accepted("r");
-        save(&path, &r).unwrap();
-        assert_eq!(load(&path), Some(r));
+        assert!(create(&path, &r).unwrap());
+        assert_eq!(load(&path), Some(r.clone()));
+        assert!(!create(&path, &r).unwrap(), "a second claim on the same id must lose");
         update(&path, |r| r.state = "submitted".into());
         assert_eq!(load(&path).unwrap().state, "submitted");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)

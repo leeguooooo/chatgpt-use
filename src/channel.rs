@@ -139,7 +139,7 @@ impl ChannelError {
         ChannelError { kind, submitted: Submitted::No, message: message.into() }
     }
 
-    fn submitted(mut self, submitted: Submitted) -> Self {
+    pub fn with_submitted(mut self, submitted: Submitted) -> Self {
         self.submitted = submitted;
         self
     }
@@ -175,10 +175,13 @@ fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
     } else {
         (ErrorKind::NotSubmitted, "the prompt was not sent")
     };
-    e.context(ChannelError::new(kind, label).submitted(phase))
+    e.context(ChannelError::new(kind, label).with_submitted(phase))
 }
 
 // JS: is this the signed-out page? Its login/sign-up buttons, or an auth URL.
+// The button test ids are a best guess, not yet checked against a live
+// signed-out page. If they are wrong, the error is the safe one: a real
+// signed-out page reads as session_unavailable, never a false login_required.
 const JS_WANTS_LOGIN: &str = r#"(() => JSON.stringify({login:
   /\/auth\/|auth\.openai\.com/.test(location.href) ||
   !!document.querySelector('[data-testid="login-button"],[data-testid="signup-button"]')}))()"#;
@@ -2196,7 +2199,7 @@ impl SubmitFailure {
                 }
                 e.context(
                     ChannelError::new(ErrorKind::SubmitUnknown, "the prompt may or may not have been sent")
-                        .submitted(Submitted::Unknown),
+                        .with_submitted(Submitted::Unknown),
                 )
             }
         }

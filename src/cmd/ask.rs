@@ -16,7 +16,7 @@ use crate::channel::{Channel, ChannelOptions};
 use crate::cli::AskArgs;
 use crate::delegation::{self, Mode};
 use crate::structured;
-use crate::channel::{ChannelError, ErrorKind};
+use crate::channel::{ChannelError, ErrorKind, Submitted};
 use crate::receipt;
 use std::path::PathBuf;
 use anyhow::{Context, Result};
@@ -160,20 +160,34 @@ fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
         anyhow::bail!("invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)");
     }
     let path = receipt::path_for(id);
-    if let Some(existing) = receipt::load(&path) {
-        if !receipt::may_send(Some(&existing)) {
-            return Err(ChannelError::new(
-                ErrorKind::Duplicate,
-                format!(
-                    "request {id:?} already exists (state {}, submitted {}); not sending it \
-                     again. Look it up with: chatgpt-use status {id}",
-                    existing.state, existing.submitted
-                ),
-            )
-            .into());
-        }
+    let fresh = receipt::Receipt::accepted(id);
+    if receipt::create(&path, &fresh)
+        .with_context(|| format!("could not write receipt {}", path.display()))?
+    {
+        return Ok(Some(path));
     }
-    receipt::save(&path, &receipt::Receipt::accepted(id))
+    // The id is taken. Reuse it only if its receipt proves nothing was sent;
+    // an unreadable receipt proves nothing, so it counts as taken.
+    let existing = receipt::load(&path);
+    if !receipt::may_send(existing.as_ref()) || existing.is_none() {
+        let (state, submitted) = existing
+            .as_ref()
+            .map(|r| (r.state.as_str(), r.submitted.as_str()))
+            .unwrap_or(("unreadable", "unknown"));
+        // `submitted` describes the EARLIER request — the one a caller must
+        // not resend — not this refused call, which sent nothing.
+        let prior = if submitted == "yes" { Submitted::Yes } else { Submitted::Unknown };
+        return Err(ChannelError::new(
+            ErrorKind::Duplicate,
+            format!(
+                "request {id:?} already exists (state {state}, submitted {submitted}); not \
+                 sending it again. Look it up with: chatgpt-use status {id}"
+            ),
+        )
+        .with_submitted(prior)
+        .into());
+    }
+    receipt::save(&path, &fresh)
         .with_context(|| format!("could not write receipt {}", path.display()))?;
     Ok(Some(path))
 }
