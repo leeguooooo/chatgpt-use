@@ -437,15 +437,28 @@ fn js_server_final(convo_id: &str) -> String {
       return typeof c2.content === 'string' ? c2.content.trim() : '';
     }};
     // chain is leaf -> root, so the first qualifying assistant message is the last one.
+    // Only messages AFTER the latest user turn belong to this turn: walking past
+    // it would find the previous turn's reply and report it as this one, done.
     for (const n of chain) {{
       const m = n.message;
-      if (!m || !m.author || m.author.role !== 'assistant') continue;
+      if (!m || !m.author) continue;
+      if (m.author.role === 'user') break;
+      if (m.author.role !== 'assistant') continue;
+      // A stopped or length-capped turn is closed (end_turn true) but its text
+      // is partial; only finish_details tells it from a real finish. Report it
+      // even with no text, which is how a turn stopped early looks.
+      const fd = (m.metadata && m.metadata.finish_details) || {{}};
+      if (fd.type === 'interrupted' || fd.type === 'max_tokens') {{
+        return JSON.stringify({{ok: true, done: true, text: textOf(m.content), finish: fd.type,
+                                reason: fd.reason || null, async_status: null}});
+      }}
       if (m.weight === 0) continue;
       const ct = m.content && m.content.content_type;
       if (ct === 'reasoning_recap' || ct === 'thoughts') continue;
       const t = textOf(m.content);
       if (!t) continue;
       return JSON.stringify({{ok: true, done: m.end_turn === true, text: t,
+                              finish: fd.type || null, reason: fd.reason || null,
                               async_status: j.async_status === undefined ? null : j.async_status}});
     }}
     return JSON.stringify({{ok: true, done: false, text: '',
@@ -1175,15 +1188,29 @@ impl Channel {
     /// and what is the final assistant text. `None` when there is nothing to ask
     /// about or the call failed — never an error, because this is a second
     /// opinion, not the primary path.
-    fn server_final(&self, budget: f64) -> Option<(bool, String)> {
+    fn server_final(&self, budget: f64) -> Option<ServerTurn> {
         let id = self.convo_id.as_ref()?;
         let res = ab_eval(&self.ab, &js_server_final(id), &self.session, budget).ok()?;
         if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return None;
         }
-        let done = res.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
-        let text = strip_private_markers(res.get("text").and_then(|v| v.as_str()).unwrap_or(""));
-        Some((done, text))
+        let field = |k: &str| res.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        Some(ServerTurn {
+            done: res.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
+            text: strip_private_markers(&field("text").unwrap_or_default()),
+            finish: field("finish"),
+            reason: field("reason"),
+        })
+    }
+
+    /// The server's verdict on this turn: its reply once it has properly
+    /// finished, `None` while it is open or the record is unreadable, and an
+    /// error when it closed cut off (see `judge_record`).
+    fn server_verdict(&self, budget: f64) -> Result<Option<String>> {
+        match self.server_final(budget) {
+            Some(turn) => judge_record(turn),
+            None => Ok(None),
+        }
     }
 
     /// Move an existing conversation into a Project through the backend API.
@@ -1389,20 +1416,12 @@ impl Channel {
             bail!("no conversation to wait on");
         };
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
-        let mut read_once = false;
         loop {
-            if let Some((done, text)) = self.server_final(30.0) {
-                read_once = true;
-                if done && !text.trim().is_empty() {
-                    return Ok(text);
-                }
+            if let Some(text) = self.server_verdict(30.0)? {
+                return Ok(text);
             }
             if Instant::now() >= deadline {
-                let why = if read_once {
-                    "the reply has not finished"
-                } else {
-                    "the conversation record could not be read"
-                };
+                let why = "the reply has not finished, or the record could not be read";
                 return Err(ChannelError::new(
                     ErrorKind::Incomplete,
                     format!("{why} after {}s (conversation {id})", self.timeout_secs),
@@ -1589,7 +1608,7 @@ impl Channel {
                 // stopped rendering while the model worked fine. Reporting a
                 // timeout for an answer that exists is the worst outcome
                 // available, so spend one call to avoid it.
-                if let Some((true, text)) = self.server_final(30.0) {
+                if let Some(text) = self.server_verdict(30.0)? {
                     if !text.trim().is_empty() {
                         eprintln!(
                             "the page stopped updating, but the server says this turn finished \
@@ -1735,7 +1754,7 @@ impl Channel {
                 // Dismiss the dialog so the page is usable if it does recover.
                 let _ = ab_eval(&self.ab, JS_DISMISS_DIALOG, &self.session, remaining_secs());
                 std::thread::sleep(backoff);
-                if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+                if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
                     if !text.trim().is_empty() {
                         eprintln!("the turn completed despite the throttle; taking it from the record");
                         return self.finish_turn(text, remaining_secs());
@@ -1765,7 +1784,7 @@ impl Channel {
             // closed, instead of waiting out the settle heuristics.
             polls += 1;
             if polls.is_multiple_of(SERVER_CHECK_EVERY) && self.convo_id.is_some() {
-                if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+                if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
                     if !text.trim().is_empty() {
                         eprintln!(
                             "[{:5}.0s] server reports the turn closed; taking the reply from the \
@@ -1846,7 +1865,7 @@ impl Channel {
         // So the record is the source of truth whenever we have a conversation
         // to ask about, and the scrape is the fallback for the turn-one window
         // where no id exists yet.
-        if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
+        if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
             if !text.trim().is_empty() {
                 return self.finish_turn(text, remaining_secs());
             }
@@ -2258,6 +2277,47 @@ impl SubmitFailure {
                 )
             }
         }
+    }
+}
+
+/// One read of the conversation record for the current turn.
+struct ServerTurn {
+    /// `end_turn` on the turn's last assistant message.
+    done: bool,
+    text: String,
+    /// `finish_details.type`: "stop" for a real finish.
+    finish: Option<String>,
+    reason: Option<String>,
+}
+
+/// Judge a record read. A stopped turn is closed like a finished one
+/// (`end_turn`, `finished_successfully`, `is_complete` all true) and only
+/// `finish_details` sets it apart: observed live, `{"type":"interrupted",
+/// "reason":"client_stopped"}` against `{"type":"stop"}`. Its text is partial,
+/// so it is an incomplete turn, never a reply. Only KNOWN cut-offs count
+/// against a reply; an unrecognised finish type passes as a normal finish, so
+/// a model that labels its stop differently keeps working.
+fn judge_record(turn: ServerTurn) -> Result<Option<String>> {
+    match turn.finish.as_deref() {
+        Some(kind @ ("interrupted" | "max_tokens")) => {
+            let why = match (kind, turn.reason.as_deref()) {
+                ("max_tokens", _) => "hit its length limit and was cut off".to_string(),
+                (_, Some(reason)) => format!("was interrupted ({reason})"),
+                _ => "was interrupted".to_string(),
+            };
+            Err(ChannelError::new(
+                ErrorKind::Incomplete,
+                format!(
+                    "ChatGPT's reply {why} before it finished; the {} characters so far are \
+                     partial, so they are not returned as a reply",
+                    turn.text.chars().count()
+                ),
+            )
+            .with_submitted(Submitted::Yes)
+            .into())
+        }
+        _ if turn.done && !turn.text.trim().is_empty() => Ok(Some(turn.text)),
+        _ => Ok(None),
     }
 }
 
@@ -3006,5 +3066,44 @@ mod tests {
         }
         assert_eq!(Incomplete.status(), "incomplete");
         assert_eq!(RateLimited.status(), "unavailable");
+    }
+
+    fn turn(done: bool, text: &str, finish: Option<&str>, reason: Option<&str>) -> ServerTurn {
+        ServerTurn {
+            done,
+            text: text.into(),
+            finish: finish.map(Into::into),
+            reason: reason.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_stopped_turn_is_incomplete_not_a_reply() {
+        // Exactly what the record showed after the stop button, live.
+        let e = judge_record(turn(true, "partial essay", Some("interrupted"), Some("client_stopped")))
+            .unwrap_err();
+        let ce = channel_error(&e).unwrap();
+        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+        assert!(e.to_string().contains("client_stopped"), "{e}");
+
+        let e = judge_record(turn(true, "", Some("max_tokens"), None)).unwrap_err();
+        assert!(e.to_string().contains("length limit"), "{e}");
+    }
+
+    #[test]
+    fn a_real_finish_is_a_reply_and_an_open_turn_is_not_yet() {
+        assert_eq!(judge_record(turn(true, "done", Some("stop"), None)).unwrap(), Some("done".into()));
+        // An unknown finish type is not treated as a failure.
+        assert_eq!(judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(), Some("done".into()));
+        assert_eq!(judge_record(turn(true, "done", None, None)).unwrap(), Some("done".into()));
+        assert_eq!(judge_record(turn(false, "streaming", None, None)).unwrap(), None);
+        assert_eq!(judge_record(turn(true, "  ", Some("stop"), None)).unwrap(), None);
+    }
+
+    #[test]
+    fn the_record_walk_stops_at_this_turns_prompt() {
+        let js = js_server_final("c-1");
+        assert!(js.contains("m.author.role === 'user') break"), "must not reach the previous turn");
+        assert!(js.contains("finish_details"));
     }
 }

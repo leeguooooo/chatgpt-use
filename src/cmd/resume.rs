@@ -71,6 +71,11 @@ fn resume(args: &ResumeArgs) -> Value {
         (Err(e), None) => structured::failure(&e),
     };
     envelope["conversation_id"] = convo.as_str().into();
+    // Resume never sends, so a failure here says nothing about submission; what
+    // the caller needs is whether the ORIGINAL request reached ChatGPT.
+    if envelope.get("error").is_some() {
+        envelope["error"]["submitted"] = r.submitted.as_str().into();
+    }
     receipt::finish(&path, &envelope);
     envelope
 }
