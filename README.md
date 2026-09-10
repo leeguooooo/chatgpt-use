@@ -236,11 +236,23 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
 - **Instant tool-calling is run-to-run flaky.** On the connector, ChatGPT-Instant sometimes hedges
   instead of calling a tool. `work --retries` re-nudges on a thin report, and `--loop` lets a task span
   many tool steps — but expect the occasional turn that needs a nudge.
-- **Rate limits are real.** Driving the one shared logged-in tab, the page rate-limits aggressively, so
-  the channel runs at **concurrency 1**. Turns queue across processes on an advisory lock
-  (`~/.chatgpt-use/channel.lock`), taken per *turn* so a long `run`/`work` never starves a one-shot
-  `ask`. (This README used to claim that already existed; it didn't — two processes sharing a session
-  interleaved inside one composer and merged their prompts.)
+- **One window, one turn at a time.** The web surface is concurrency-1: a single logged-in tab, and an
+  account that rate-limits per account rather than per tab. Two things enforce that:
+
+  - Every run reuses the same chrome-use session, **`chatgpt-web`**, so there is one ChatGPT window
+    rather than one per invocation. Pass `--session` only when you deliberately want a separate tab.
+    Beyond tidiness: ChatGPT pushes toasts into *every* open chatgpt.com tab, so a second window can
+    let a document-wide read pick up a sibling tab's content.
+  - Runs queue across processes on an advisory lock at **`~/.chatgpt-web.lock`** — deliberately not
+    under `~/.chatgpt-use/`, because [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen)
+    drives the same surface and both tools must agree on one path. A waiter names who it is waiting
+    for: `waiting for chatgpt-imagegen (pid 4321) to finish with ChatGPT…`.
+
+  The lock covers a whole channel — connect through close — not one turn, so a multi-turn `run`/`work`
+  holds the surface for its duration. Per-turn was enough while each process opened its own tab; once
+  they share one window, `connect` itself is destructive, because it navigates that tab to a new chat.
+  (This README used to claim cross-process queueing already existed. It didn't: two processes sharing
+  a session interleaved inside one composer and merged their prompts.)
 - **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
   not for tight latency loops.
 - **Mode 3 is the deep end.** A full chat harness's traffic squeezed through a browser chat box: slow,
