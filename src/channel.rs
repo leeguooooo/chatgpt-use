@@ -309,6 +309,32 @@ fn level_index(want: &str) -> Option<usize> {
     LEVEL_ORDER.iter().position(|l| *l == norm)
 }
 
+// JS: start a fresh chat WITHOUT reloading the page.
+//
+// A full navigation to https://chatgpt.com/ costs 45 backend-api requests on
+// this account — the SPA re-boots and re-fetches every project's metadata and
+// conversation list (9 projects here, so 18 requests before anything else).
+// Clicking the app's own "New chat" control does the same job client-side for
+// exactly ONE request (/backend-api/conversation/init). Measured, both numbers.
+//
+// That difference is the whole rate-limit story: the throttle counts requests,
+// not messages, so reloading the page once per invocation was costing 45x what
+// the work actually needed.
+const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
+  if (!/(^|\.)chatgpt\.com$/.test(location.hostname)) {
+    return JSON.stringify({ok: false, error: 'not on chatgpt.com'});
+  }
+  const cands = [...document.querySelectorAll('a, button, [role="button"]')];
+  const hit = cands.find(el => {
+    const al = (el.getAttribute('aria-label') || '').trim();
+    const tx = (el.textContent || '').trim();
+    return /^new chat$/i.test(al) || /^new chat$/i.test(tx);
+  });
+  if (!hit) return JSON.stringify({ok: false, error: 'no new-chat control'});
+  hit.click();
+  return JSON.stringify({ok: true});
+})()"#;
+
 // JS: locate the composer's model picker WITHOUT relying on its text.
 //
 // Its label tracks the current model and has read "Instant", "5.6 SolLight" and
@@ -535,7 +561,32 @@ impl Channel {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut opened = false;
 
+        // Reuse the tab this session already has, if it is a usable ChatGPT
+        // page. Navigating instead costs 45 backend-api requests to re-boot the
+        // SPA; the app's own "New chat" costs 1. The throttle that has been
+        // biting this account counts REQUESTS, not messages, so this is the
+        // difference between one run and forty-five as far as it is concerned.
+        {
+            let probe = ab_eval(&ab, JS_NEW_CHAT_IN_PLACE, &session, 15.0);
+            let reused = probe
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("ok"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if reused {
+                let settle = Instant::now() + Duration::from_secs(20);
+                if wait_composer(&ab, &session, settle, 20).unwrap_or(false) {
+                    eprintln!("reusing the open ChatGPT tab (new chat, no page reload)");
+                    opened = true;
+                }
+            }
+        }
+
         for prof in &candidates {
+            if opened {
+                break;
+            }
             let label = prof.as_deref().unwrap_or("current Chrome (relay)");
             eprintln!("opening ChatGPT via {label}");
 
