@@ -499,14 +499,12 @@ fn js_ensure_project(name: &str) -> String {
     let name_json = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"(async () => {{
+  {prelude}
   try {{
     const name = {name_json};
-    const sess = await fetch('/api/auth/session', {{credentials: 'include'}})
-      .then(r => r.json()).catch(() => null);
-    if (!sess || !sess.accessToken)
-      return JSON.stringify({{ok: false, error: 'no accessToken in /api/auth/session'}});
-    const h = {{Authorization: 'Bearer ' + sess.accessToken,
-               'Content-Type': 'application/json'}};
+    const tok = await __cguToken();
+    if (!tok) return JSON.stringify({{ok: false, error: 'no accessToken in /api/auth/session'}});
+    const h = {{Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json'}};
     const find = async () => {{
       const r = await fetch(
         '/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0',
@@ -531,6 +529,7 @@ fn js_ensure_project(name: &str) -> String {
     return JSON.stringify({{ok: true, id, created: true}});
   }} catch (e) {{ return JSON.stringify({{ok: false, error: String(e)}}); }}
 }})()"#,
+        prelude = JS_TOKEN_PRELUDE,
         name_json = name_json
     )
 }
@@ -1010,6 +1009,20 @@ impl Channel {
             return Ok(());
         }
         let detail = res.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+        // This is the one place a remembered gizmo id gets tested against the
+        // server, so it is where a stale one has to be dropped. A project that
+        // was deleted, or that belongs to a different account than the browser
+        // is now signed into, would otherwise be retried from cache forever —
+        // the cache would have turned a transient mistake into a permanent one.
+        if detail.contains("404") || detail.contains("400") || detail.contains("403") {
+            forget_gizmo(&self.project);
+            eprintln!(
+                "forgetting the remembered id for project {:?} ({detail}); it will be \
+                 looked up again next run",
+                self.project
+            );
+        }
         bail!("{detail}")
     }
 
@@ -1618,6 +1631,11 @@ impl Channel {
                 .max(2.0)
         };
 
+        // A remembered id skips the account-wide project listing entirely.
+        if let Some(id) = cached_gizmo(name) {
+            return Ok((id, false));
+        }
+
         let js = js_ensure_project(name);
         let res = ab_eval(&self.ab, &js, &self.session, remaining().min(30.0))
             .context("resolving ChatGPT Project")?;
@@ -1640,6 +1658,7 @@ impl Channel {
             .get("created")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        remember_gizmo(name, gizmo_id);
         Ok((gizmo_id.to_string(), created))
     }
 
@@ -2060,6 +2079,56 @@ fn composer_fingerprint(text: &str) -> (u64, u32) {
     (n, h)
 }
 
+/// Remembered project name -> gizmo id, at `~/.chatgpt-use/projects.json`.
+///
+/// Resolving a project costs a request that lists every project on the account,
+/// on every single connect, to learn something that essentially never changes.
+/// Against a throttle that counts requests, that is worth caching. Purely an
+/// optimisation: any read or write failure just means we resolve the slow way.
+fn project_cache_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".chatgpt-use").join("projects.json"))
+}
+
+fn read_project_cache() -> serde_json::Map<String, serde_json::Value> {
+    project_cache_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn cached_gizmo(name: &str) -> Option<String> {
+    read_project_cache()
+        .get(name)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn remember_gizmo(name: &str, gizmo_id: &str) {
+    let Some(path) = project_cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut map = read_project_cache();
+    map.insert(name.to_string(), serde_json::Value::String(gizmo_id.to_string()));
+    if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Drop a remembered id after it turns out not to work — a deleted project, or
+/// one that belongs to a different account than the browser is now signed into.
+fn forget_gizmo(name: &str) {
+    let Some(path) = project_cache_path() else { return };
+    let mut map = read_project_cache();
+    if map.remove(name).is_some() {
+        if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
 /// Describe whoever holds the lock, from the file's first line.
 ///
 /// The contract with chatgpt-imagegen is one line, `<tool> <pid>`. Anything
@@ -2325,6 +2394,44 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// One test, not two: both halves have to move HOME, and cargo runs tests
+    /// in parallel — as two tests they raced and the second read the first's
+    /// directory.
+    #[test]
+    fn project_cache_round_trips_forgets_and_survives_corruption() {
+        let tmp = std::env::temp_dir().join(format!("cgu-projcache-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".chatgpt-use")).ok();
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: the whole test body runs with HOME redirected and restores it.
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        assert_eq!(cached_gizmo("proj"), None);
+        remember_gizmo("proj", "g-p-abc");
+        assert_eq!(cached_gizmo("proj").as_deref(), Some("g-p-abc"));
+
+        // A second project must not clobber the first.
+        remember_gizmo("other", "g-p-def");
+        assert_eq!(cached_gizmo("proj").as_deref(), Some("g-p-abc"));
+        assert_eq!(cached_gizmo("other").as_deref(), Some("g-p-def"));
+
+        // Forgetting a stale id must cost only that entry.
+        forget_gizmo("proj");
+        assert_eq!(cached_gizmo("proj"), None);
+        assert_eq!(cached_gizmo("other").as_deref(), Some("g-p-def"));
+
+        // A corrupt cache degrades to "no entry" and is rewritten, never panics.
+        std::fs::write(tmp.join(".chatgpt-use").join("projects.json"), "{not json").ok();
+        assert_eq!(cached_gizmo("other"), None);
+        remember_gizmo("other", "g-p-def");
+        assert_eq!(cached_gizmo("other").as_deref(), Some("g-p-def"));
+
+        match old_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// The record carries markup the rendered page hides. Observed live in a
     /// `serve` reply: a citation span that would have been handed straight to
     /// Claude Code.
