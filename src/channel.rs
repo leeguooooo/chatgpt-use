@@ -335,6 +335,47 @@ const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
   return JSON.stringify({ok: true});
 })()"#;
 
+/// JS: switch to an already-open conversation through the SPA's own sidebar
+/// link, rather than navigating.
+///
+/// 9 backend-api requests instead of 45. The pinned conversation is always a
+/// recent one, so it is in the sidebar; anything older falls back to a real
+/// navigation, which is still correct, just costlier.
+fn js_open_convo_in_place(convo_id: &str) -> String {
+    let c = serde_json::to_string(convo_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  if (!/(^|\.)chatgpt\.com$/.test(location.hostname)) {{
+    return JSON.stringify({{ok: false, error: 'not on chatgpt.com'}});
+  }}
+  const want = {c};
+  const link = [...document.querySelectorAll('a[href*="/c/"]')]
+    .find(a => (a.getAttribute('href') || '').includes(want));
+  if (!link) return JSON.stringify({{ok: false, error: 'conversation not in the sidebar'}});
+  link.click();
+  return JSON.stringify({{ok: true}});
+}})()"#
+    )
+}
+
+/// JS: open a Project through its sidebar link instead of navigating to it.
+fn js_open_project_in_place(gizmo_id: &str) -> String {
+    let g = serde_json::to_string(gizmo_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  if (!/(^|\.)chatgpt\.com$/.test(location.hostname)) {{
+    return JSON.stringify({{ok: false, error: 'not on chatgpt.com'}});
+  }}
+  const want = {g};
+  const link = [...document.querySelectorAll('a[href*="/g/"]')]
+    .find(a => (a.getAttribute('href') || '').includes(want));
+  if (!link) return JSON.stringify({{ok: false, error: 'project not in the sidebar'}});
+  link.click();
+  return JSON.stringify({{ok: true}});
+}})()"#
+    )
+}
+
 // JS: locate the composer's model picker WITHOUT relying on its text.
 //
 // Its label tracks the current model and has read "Instant", "5.6 SolLight" and
@@ -606,7 +647,29 @@ impl Channel {
                     if msg.contains("rate-limited") || msg.contains("Too many") {
                         bail!("{}", RATE_LIMIT_MSG);
                     }
-                    // non-rate-limit error: log and try next candidate
+                    // A chrome-use session can end up permanently unusable: a
+                    // command that runs too long is judged unresponsive, the
+                    // daemon is stopped, and the NAME stays poisoned — rerunning
+                    // repeats the same error, and `session stop --force`,
+                    // deleting the lifecycle lock and upgrading the CLI all fail
+                    // to clear it. Trying the next candidate cannot help, and
+                    // falling through to "no logged-in ChatGPT browser
+                    // available. Sign in to chatgpt.com" tells the user to fix
+                    // the one thing that is not broken. Say what actually
+                    // happened and how to get moving again.
+                    if msg.contains("session unresponsive") || msg.contains("stuck") {
+                        bail!(
+                            "the chrome-use session {session:?} is wedged and will not recover \
+                             on its own — every command on that name returns \
+                             \"session unresponsive\". You are still signed in; this is not a \
+                             login problem.\n\n  Work around it now:  \
+                             chatgpt-use <cmd> --session chatgpt-web-2\n\n\
+                             It is usually caused by a single very long chrome-use command \
+                             (a large `keyboard inserttext`, for instance) being judged \
+                             unresponsive, after which the name stays poisoned."
+                        );
+                    }
+                    // other errors: log and try the next candidate
                     eprintln!("warning: {label} failed: {e}");
                 }
             }
@@ -940,8 +1003,14 @@ impl Channel {
     fn reopen_fresh(&self, budget: f64) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(20.0, 90.0));
         eprintln!("the ChatGPT tab went away before the first turn; opening a fresh chat");
-        ab_open(&self.ab, &self.session, WEB_NEW_CHAT_URL, None, deadline)
-            .context("reopening ChatGPT")?;
+        let in_place = ab_eval(&self.ab, JS_NEW_CHAT_IN_PLACE, &self.session, budget)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        if !(in_place && wait_composer(&self.ab, &self.session, deadline, 20).unwrap_or(false)) {
+            ab_open(&self.ab, &self.session, WEB_NEW_CHAT_URL, None, deadline)
+                .context("reopening ChatGPT")?;
+        }
         if !wait_composer(&self.ab, &self.session, deadline, 30)? {
             bail!("reopened ChatGPT but the composer never appeared");
         }
@@ -983,8 +1052,20 @@ impl Channel {
             );
         };
         let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(20.0, 90.0));
-        let url = format!("{WEB_CONVO_URL_TPL}{id}");
         eprintln!("reattaching to conversation {id}");
+
+        // Sidebar link first: 9 backend-api requests against 45 for a real
+        // navigation. This path runs often — every page reset on a degraded
+        // front end goes through it — so the difference compounds fast.
+        let in_place = ab_eval(&self.ab, &js_open_convo_in_place(id), &self.session, budget)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        if in_place && wait_composer(&self.ab, &self.session, deadline, 20).unwrap_or(false) {
+            return Ok(());
+        }
+
+        let url = format!("{WEB_CONVO_URL_TPL}{id}");
         ab_open(&self.ab, &self.session, &url, None, deadline)
             .context("reopening the pinned conversation")?;
         if !wait_composer(&self.ab, &self.session, deadline, 30)? {
@@ -1494,8 +1575,22 @@ impl Channel {
                 .as_secs_f64()
                 .max(2.0)
         };
-        let project_url = WEB_PROJECT_URL_TPL.replace("{gizmo_id}", gizmo_id);
-        ab_open(&self.ab, &self.session, &project_url, None, deadline)?;
+        // Sidebar link first, for the same reason as everywhere else: the SPA
+        // route costs a fraction of a reload, and this navigation happens on
+        // every run that names a project.
+        let in_place = ab_eval(
+            &self.ab,
+            &js_open_project_in_place(gizmo_id),
+            &self.session,
+            remaining().min(15.0),
+        )
+        .ok()
+        .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+        if !in_place {
+            let project_url = WEB_PROJECT_URL_TPL.replace("{gizmo_id}", gizmo_id);
+            ab_open(&self.ab, &self.session, &project_url, None, deadline)?;
+        }
 
         // Wait until the SPA has ACTUALLY settled into the project — not just that
         // a `#prompt-textarea` exists. `chrome-use open` can return while the prior
