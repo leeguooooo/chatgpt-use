@@ -985,6 +985,29 @@ impl Channel {
         // Refuse to type into a tab that has drifted off our pinned conversation.
         self.verify_convo(remaining_secs())?;
 
+        // Any deferred project filing happens HERE, before this turn types
+        // anything, rather than after the previous one finished.
+        //
+        // Filing re-routes the open conversation to its project URL and the
+        // composer is gone for that moment, so doing it mid-turn broke the next
+        // send. Doing it at the START of a turn puts the re-route before the
+        // typing, where the idle-wait and page-reset below already absorb it —
+        // and unlike filing in `close`, it also covers `serve`, which holds one
+        // channel for the life of the process and never closes it.
+        if let (Some(gizmo), Some(cid)) = (self.pending_project.clone(), self.convo_id.clone()) {
+            match self.file_into_project(&cid, &gizmo, remaining_secs()) {
+                Ok(()) => {
+                    eprintln!("filed conversation into project {:?}", self.project);
+                    self.pending_project = None;
+                }
+                Err(e) => eprintln!(
+                    "warning: could not file the conversation into {:?} ({e}); it stays in a \
+                     plain chat",
+                    self.project
+                ),
+            }
+        }
+
         // Snapshot rendered user turns: a rise in this count is our submit
         // receipt (see JS_USER_COUNT).
         let mut baseline_users: u64 = self.user_turn_count(remaining_secs()).unwrap_or(0);
