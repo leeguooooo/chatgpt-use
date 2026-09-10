@@ -1159,7 +1159,7 @@ impl Channel {
             // 20s) and it ends the wait the moment the server says the turn
             // closed, instead of waiting out the settle heuristics.
             polls += 1;
-            if polls % SERVER_CHECK_EVERY == 0 && self.convo_id.is_some() {
+            if polls.is_multiple_of(SERVER_CHECK_EVERY) && self.convo_id.is_some() {
                 if let Some((true, text)) = self.server_final(remaining_secs().min(30.0)) {
                     if !text.trim().is_empty() {
                         eprintln!(
