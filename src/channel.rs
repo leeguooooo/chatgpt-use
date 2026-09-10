@@ -203,6 +203,37 @@ fn js_insert_text(text: &str) -> String {
     )
 }
 
+/// JS: move an existing conversation into a Project, server-side.
+///
+/// The escape hatch for when ChatGPT's project PAGE will not render — observed
+/// account-wide for hours, every project showing only a "Try again" button while
+/// the backend API kept answering normally. The UI being broken is not a reason
+/// for `--project` to silently stop working: the conversation can be created in
+/// a plain chat and filed afterwards, which is what this does.
+fn js_file_into_project(convo_id: &str, gizmo_id: &str) -> String {
+    let c = serde_json::to_string(convo_id).unwrap_or_else(|_| "\"\"".to_string());
+    let g = serde_json::to_string(gizmo_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(async () => {{
+  try {{
+    const sess = await fetch('/api/auth/session', {{credentials: 'include'}})
+      .then(r => r.json()).catch(() => null);
+    if (!sess || !sess.accessToken) return JSON.stringify({{ok: false, error: 'not signed in'}});
+    const r = await fetch('/backend-api/conversation/' + {c}, {{
+      method: 'PATCH',
+      credentials: 'include',
+      headers: {{Authorization: 'Bearer ' + sess.accessToken, 'Content-Type': 'application/json'}},
+      body: JSON.stringify({{gizmo_id: {g}}}),
+    }});
+    if (!r.ok) return JSON.stringify({{ok: false, error: 'HTTP ' + r.status}});
+    return JSON.stringify({{ok: true}});
+  }} catch (e) {{
+    return JSON.stringify({{ok: false, error: String(e)}});
+  }}
+}})()"#
+    )
+}
+
 /// The thinking-effort levels, in slider order. The INDEX is the contract with
 /// the page (`aria-valuenow`); the names here are only what a caller types.
 const LEVEL_ORDER: &[&str] = &["instant", "medium", "high", "extra high", "pro"];
@@ -395,6 +426,10 @@ pub struct Channel {
     /// DIFFERENT conversation — which would break the "same chat accumulates
     /// context" contract while still returning a plausible-looking reply.
     convo_id: Option<String>,
+    /// A project this channel could not ENTER but should still file into, set
+    /// when the project page fails to render. Cleared once the conversation has
+    /// been moved server-side.
+    pending_project: Option<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -474,12 +509,13 @@ impl Channel {
             );
         }
 
-        let chan = Channel {
+        let mut chan = Channel {
             ab,
             session,
             timeout_secs,
             project: opts.project.trim().to_string(),
             convo_id: None,
+            pending_project: None,
             _surface: surface,
         };
 
@@ -488,12 +524,33 @@ impl Channel {
         let project = opts.project.trim().to_string();
         if !project.is_empty() {
             let proj_deadline = Instant::now() + Duration::from_secs(timeout_secs);
-            if let Err(e) = chan.enter_project(&project, proj_deadline) {
-                eprintln!("warning: project {project:?} unavailable ({e}); using a plain chat");
-                // best-effort restore to plain chat
-                let restore_deadline = Instant::now() + Duration::from_secs(30);
-                let _ = ab_open(&chan.ab, &chan.session, WEB_NEW_CHAT_URL, None, restore_deadline);
-                let _ = wait_composer(&chan.ab, &chan.session, restore_deadline, 15);
+            match chan.resolve_project(&project, proj_deadline) {
+                Ok((gizmo, created)) => {
+                    eprintln!(
+                        "using project {project:?}{}",
+                        if created { " (created)" } else { "" }
+                    );
+                    if let Err(e) = chan.open_project_page(&gizmo, proj_deadline) {
+                        // The project page would not render. That is ChatGPT's
+                        // front end failing, not a reason for --project to stop
+                        // working: the backend still files conversations fine,
+                        // so start in a plain chat and move it afterwards.
+                        eprintln!(
+                            "warning: the project page didn't load ({e}); starting in a plain \
+                             chat and filing the conversation into {project:?} afterwards"
+                        );
+                        chan.pending_project = Some(gizmo);
+                        let restore_deadline = Instant::now() + Duration::from_secs(30);
+                        let _ =
+                            ab_open(&chan.ab, &chan.session, WEB_NEW_CHAT_URL, None, restore_deadline);
+                        let _ = wait_composer(&chan.ab, &chan.session, restore_deadline, 15);
+                    }
+                }
+                Err(e) => {
+                    // Could not even resolve the project (no id), so there is
+                    // nothing to file into later.
+                    eprintln!("warning: project {project:?} unavailable ({e}); using a plain chat");
+                }
             }
         }
 
@@ -657,6 +714,22 @@ impl Channel {
         Ok(())
     }
 
+    /// Move an existing conversation into a Project through the backend API.
+    fn file_into_project(&self, convo_id: &str, gizmo_id: &str, budget: f64) -> Result<()> {
+        let res = ab_eval(
+            &self.ab,
+            &js_file_into_project(convo_id, gizmo_id),
+            &self.session,
+            budget,
+        )
+        .context("calling the project-filing endpoint")?;
+        if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Ok(());
+        }
+        let detail = res.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        bail!("{detail}")
+    }
+
     /// The conversation UUID currently shown in the tab, if any.
     fn current_convo_id(&self, budget: f64) -> Option<String> {
         ab_eval(&self.ab, JS_CONVO_ID, &self.session, budget)
@@ -702,8 +775,22 @@ impl Channel {
             bail!("reopened ChatGPT but the composer never appeared");
         }
         if !self.project.is_empty() {
-            if let Err(e) = self.enter_project(&self.project, deadline) {
-                eprintln!("warning: project {:?} unavailable ({e}); using a plain chat", self.project);
+            match self.resolve_project(&self.project, deadline) {
+                Ok((gizmo, _)) => {
+                    if self.open_project_page(&gizmo, deadline).is_err() {
+                        // Same degradation as `connect`: keep the project, lose
+                        // only the ability to be born inside it.
+                        eprintln!(
+                            "warning: the project page didn't load; will file the conversation \
+                             into {:?} afterwards",
+                            self.project
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "warning: project {:?} unavailable ({e}); using a plain chat",
+                    self.project
+                ),
             }
         }
         Ok(())
@@ -1056,6 +1143,24 @@ impl Channel {
             }
         }
 
+        // If the project page wouldn't render, the conversation was started in a
+        // plain chat — move it into the project now that it exists server-side.
+        // Done after the turn rather than at pin time so a metadata write never
+        // shares the wire with a generation in flight.
+        if let (Some(gizmo), Some(cid)) = (self.pending_project.clone(), self.convo_id.clone()) {
+            match self.file_into_project(&cid, &gizmo, remaining_secs()) {
+                Ok(()) => {
+                    eprintln!("filed conversation into project {:?}", self.project);
+                    self.pending_project = None;
+                }
+                Err(e) => eprintln!(
+                    "warning: could not file the conversation into {:?} ({e}); it stays in a \
+                     plain chat",
+                    self.project
+                ),
+            }
+        }
+
         Ok(reply_text)
     }
 
@@ -1081,7 +1186,7 @@ impl Channel {
 
     /// Navigate the open session into the named ChatGPT Project, creating it on
     /// first use. Mirrors `_enter_project` in chatgpt-imagegen.
-    fn enter_project(&self, name: &str, deadline: Instant) -> Result<()> {
+    fn resolve_project(&self, name: &str, deadline: Instant) -> Result<(String, bool)> {
         let remaining = || {
             deadline
                 .checked_duration_since(Instant::now())
@@ -1112,11 +1217,23 @@ impl Channel {
             .get("created")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        eprintln!(
-            "using project {name:?}{}",
-            if created { " (created)" } else { "" }
-        );
+        Ok((gizmo_id.to_string(), created))
+    }
 
+    /// Navigate into the project's page so the next message is composed inside it.
+    ///
+    /// This is the preferred route — a conversation born in the project needs no
+    /// repair afterwards — but it depends on ChatGPT's project page rendering,
+    /// which is not something we control. See `file_into_project` for what
+    /// happens when it doesn't.
+    fn open_project_page(&self, gizmo_id: &str, deadline: Instant) -> Result<()> {
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::from_secs(2))
+                .as_secs_f64()
+                .max(2.0)
+        };
         let project_url = WEB_PROJECT_URL_TPL.replace("{gizmo_id}", gizmo_id);
         ab_open(&self.ab, &self.session, &project_url, None, deadline)?;
 

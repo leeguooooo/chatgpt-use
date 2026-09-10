@@ -230,6 +230,12 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
     default. That silent fallback is the dangerous failure: it makes `work` lose every connector tool
     and then look like a model that just won't use its tools. Run without `--model` to accept
     whatever the account is set to.
+- **A broken ChatGPT page shouldn't cost you the feature.** ChatGPT's *project* page has been observed
+  failing account-wide for hours — every project rendering only a "Try again" button — while the
+  backend API answered normally. `--project` no longer gives up when that happens: it starts the
+  conversation in a plain chat and files it into the project through the API once the conversation
+  exists (`PATCH /backend-api/conversation/<id>`). You lose only *being born* inside the project, not
+  the filing. Entering the project directly is still the preferred route and is tried first.
 - **Connector goes stale on `mcp` restart.** ChatGPT caches `tools/list`, so after you restart the
   server it may not see the tools until a manual Refresh. `chatgpt-use refresh` automates that click
   (live-verified against the settings UI); the closed loop is otherwise hands-off.
