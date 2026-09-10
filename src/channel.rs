@@ -18,6 +18,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::File;
+use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -366,6 +367,9 @@ pub struct Channel {
     /// DIFFERENT conversation — which would break the "same chat accumulates
     /// context" contract while still returning a plausible-looking reply.
     convo_id: Option<String>,
+    /// Exclusive claim on the shared ChatGPT window, released when the channel
+    /// is dropped or closed.
+    _surface: SurfaceLock,
 }
 
 impl Channel {
@@ -373,6 +377,10 @@ impl Channel {
     /// the project if set), and wait for the composer. Errors clearly if no
     /// logged-in browser is available or the account is rate-limited.
     pub fn connect(opts: &ChannelOptions) -> Result<Self> {
+        // Take the surface BEFORE touching the browser: opening the tab and
+        // entering a project already mutate the shared window.
+        let surface = SurfaceLock::acquire();
+
         let ab = find_chrome_use().ok_or_else(|| {
             anyhow!(
                 "`chrome-use` is not installed — install it (no npm, no token):\n  \
@@ -444,6 +452,7 @@ impl Channel {
             timeout_secs,
             project: opts.project.trim().to_string(),
             convo_id: None,
+            _surface: surface,
         };
 
         // Navigate into a ChatGPT Project FIRST — it loads a new page and would
@@ -723,9 +732,6 @@ impl Channel {
                 .as_secs_f64()
                 .max(2.0)
         };
-
-        // One turn at a time, across processes. Dropped at the end of the turn.
-        let _turn = TurnLock::acquire();
 
         // Refuse to type into a tab that has drifted off our pinned conversation.
         self.verify_convo(remaining_secs())?;
@@ -1317,60 +1323,101 @@ impl SubmitFailure {
     }
 }
 
-/// Cross-process turn lock.
+/// Cross-process lock on the shared ChatGPT web surface.
 ///
-/// The ChatGPT web surface is concurrency-1: one shared logged-in tab, and an
-/// account that rate-limits hard. Two chatgpt-use processes driving the same
-/// session interleave inside a single composer — B's clear-and-insert lands on
-/// top of A's half-written prompt — which live-reproduced as both processes
-/// aborting with "42 non-whitespace chars present, 21 expected", i.e. two
-/// prompts concatenated. (Before the integrity check they would instead have
-/// silently sent the merged text.) The README claimed this was already
-/// serialized across processes with flock; it was not.
+/// The surface is concurrency-1: one logged-in tab, and an account that
+/// rate-limits hard. Two processes driving it interleave inside a single
+/// composer — B's clear-and-insert lands on top of A's half-written prompt —
+/// which live-reproduced as both aborting with "42 non-whitespace chars
+/// present, 21 expected", i.e. two prompts concatenated.
 ///
-/// Held for one TURN rather than for the process lifetime, so a long `run` or
-/// `work` never starves a one-shot `ask` — a waiter only blocks until the turn
-/// in flight finishes. Released on drop (closing the fd releases the lock).
-struct TurnLock {
+/// Held for the whole CHANNEL — connect through close — not per turn. Per-turn
+/// was enough while every process opened its own tab, but once they share one
+/// window (see DEFAULT_SESSION) `connect` itself is destructive: it navigates
+/// the shared tab to a new chat. Live: a second `ask` starting mid-turn blew
+/// away the first one's page (the first survived only because it had pinned its
+/// conversation and could reattach), and then failed itself because the tab had
+/// moved on again by the time it got the lock. Whoever holds the surface owns
+/// the tab for as long as it needs it.
+struct SurfaceLock {
     _file: Option<File>,
 }
 
-impl TurnLock {
-    /// Block until this process owns the channel, best-effort.
+impl SurfaceLock {
+    /// Block until this process owns the surface, best-effort.
     ///
     /// If the lock file can't be created (no HOME, read-only home), run without
     /// it and say so: refusing to work because we couldn't take an advisory lock
     /// would be worse than the race it guards.
     fn acquire() -> Self {
         let Some(path) = lock_path() else {
-            return TurnLock { _file: None };
+            return SurfaceLock { _file: None };
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let file = match std::fs::OpenOptions::new()
+        // NOT opened in append mode. The holder line is rewritten in place at
+        // offset 0, and with O_APPEND every write silently goes to end-of-file
+        // and the seek is ignored — which would leave the PREVIOUS holder's line
+        // first and make every waiter name the wrong process. Not truncated
+        // either: truncating a locked file is a sharing violation on Windows,
+        // and since our line ends in "\n" any longer remnant lands on line 2,
+        // which the reader ignores.
+        let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(&path)
         {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: no channel lock ({e}); concurrent runs may collide");
-                return TurnLock { _file: None };
+                return SurfaceLock { _file: None };
             }
         };
 
         // Announce a wait rather than appearing to hang: a queued turn can sit
-        // here for as long as the turn ahead of it takes.
+        // here for as long as the turn ahead of it takes — an image generation
+        // holds it for a minute or more — and "waiting" with no subject reads as
+        // "stuck".
         if file.try_lock().is_err() {
-            eprintln!("waiting for another chatgpt turn to finish…");
+            let who = holder_label(&std::fs::read_to_string(&path).unwrap_or_default());
+            eprintln!("waiting for {who} to finish with ChatGPT…");
             if let Err(e) = file.lock() {
                 eprintln!("warning: could not take the channel lock ({e}); proceeding");
-                return TurnLock { _file: None };
+                return SurfaceLock { _file: None };
             }
         }
-        TurnLock { _file: Some(file) }
+
+        // Claim it by name so the next waiter can say who it is waiting for.
+        // Best-effort: a lock we hold but could not stamp is still a good lock.
+        let _ = file
+            .seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes()))
+            .and_then(|_| file.flush());
+
+        SurfaceLock { _file: Some(file) }
+    }
+}
+
+/// Describe whoever holds the lock, from the file's first line.
+///
+/// The contract with chatgpt-imagegen is one line, `<tool> <pid>`. Anything
+/// else — empty file, a stale remnant on later lines, a tool that stamped only
+/// its name, garbage — degrades to a usable phrase rather than failing: the
+/// point is a legible waiter line, and the lock itself is what provides safety.
+fn holder_label(contents: &str) -> String {
+    let first = contents.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return "another chatgpt turn".to_string();
+    }
+    match first.split_once(char::is_whitespace) {
+        Some((tool, rest)) => match rest.trim().parse::<u32>() {
+            Ok(pid) => format!("{tool} (pid {pid})"),
+            Err(_) => first.to_string(),
+        },
+        None => first.to_string(),
     }
 }
 
@@ -1619,6 +1666,28 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn holder_label_reads_tool_and_pid() {
+        assert_eq!(holder_label("chatgpt-imagegen 4321\n"), "chatgpt-imagegen (pid 4321)");
+    }
+
+    /// The case that caught the O_APPEND bug on the imagegen side: a PREVIOUS
+    /// holder's longer line left behind after ours. Ours is line 1; the remnant
+    /// must be ignored, never reported as the holder.
+    #[test]
+    fn holder_label_ignores_a_longer_stale_remnant() {
+        let f = "chatgpt-use 77\nchatgpt-imagegen 4321 some older longer line\n";
+        assert_eq!(holder_label(f), "chatgpt-use (pid 77)");
+    }
+
+    #[test]
+    fn holder_label_degrades_instead_of_failing() {
+        assert_eq!(holder_label(""), "another chatgpt turn");
+        assert_eq!(holder_label("   \n"), "another chatgpt turn");
+        assert_eq!(holder_label("chatgpt-imagegen\n"), "chatgpt-imagegen");
+        assert_eq!(holder_label("garbage not-a-pid\n"), "garbage not-a-pid");
+    }
+
     #[test]
     fn level_index_maps_the_slider_positions() {
         assert_eq!(level_index("instant"), Some(0));
