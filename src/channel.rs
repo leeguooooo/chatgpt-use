@@ -695,26 +695,28 @@ impl Channel {
                     if msg.contains("rate-limited") || msg.contains("Too many") {
                         bail!("{}", RATE_LIMIT_MSG);
                     }
-                    // A chrome-use session can end up permanently unusable: a
-                    // command that runs too long is judged unresponsive, the
-                    // daemon is stopped, and the NAME stays poisoned — rerunning
-                    // repeats the same error, and `session stop --force`,
-                    // deleting the lifecycle lock and upgrading the CLI all fail
-                    // to clear it. Trying the next candidate cannot help, and
-                    // falling through to "no logged-in ChatGPT browser
-                    // available. Sign in to chatgpt.com" tells the user to fix
-                    // the one thing that is not broken. Say what actually
-                    // happened and how to get moving again.
+                    // A chrome-use session name can go temporarily unusable: a
+                    // command that runs too long is judged unresponsive and its
+                    // daemon is stopped, after which every command on that NAME
+                    // returns the same error for a while. It does clear on its
+                    // own — observed recovering roughly an hour later — but none
+                    // of `session stop --force`, deleting the lifecycle lock or
+                    // upgrading the CLI made it clear on demand.
+                    //
+                    // Trying the next candidate cannot help, and falling through
+                    // to "no logged-in ChatGPT browser available. Sign in to
+                    // chatgpt.com" tells the user to fix the one thing that is
+                    // not broken. Say what happened and give a way through now.
                     if msg.contains("session unresponsive") || msg.contains("stuck") {
                         bail!(
-                            "the chrome-use session {session:?} is wedged and will not recover \
-                             on its own — every command on that name returns \
-                             \"session unresponsive\". You are still signed in; this is not a \
-                             login problem.\n\n  Work around it now:  \
-                             chatgpt-use <cmd> --session chatgpt-web-2\n\n\
-                             It is usually caused by a single very long chrome-use command \
-                             (a large `keyboard inserttext`, for instance) being judged \
-                             unresponsive, after which the name stays poisoned."
+                            "the chrome-use session {session:?} is wedged — every command on \
+                             that name is returning \"session unresponsive\". You are still \
+                             signed in; this is not a login problem.\n\n  Use another name \
+                             meanwhile:  chatgpt-use <cmd> --session chatgpt-web-2\n\n\
+                             It is usually caused by one very long chrome-use command (a large \
+                             `keyboard inserttext`, say) being judged unresponsive. The name \
+                             frees itself later — about an hour, in the case we measured — so \
+                             the original is worth retrying rather than abandoning."
                         );
                     }
                     // other errors: log and try the next candidate
