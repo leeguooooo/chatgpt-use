@@ -656,6 +656,51 @@ impl Channel {
     /// Put `message` in the composer and verify it landed intact. Nothing here
     /// can have submitted anything, so any error is safe to retry.
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
+        // Never type while the PAGE still believes it is generating. ChatGPT
+        // disables submission then, so Enter is silently swallowed and the turn
+        // reports "never submitted".
+        //
+        // This became reachable when replies started coming from the server: the
+        // record says `end_turn` the moment the turn closes, which can be while
+        // the page is still rendering the tail, so we can now return from one
+        // turn and start the next before the composer is willing. Bounded, and
+        // it gives up rather than blocking — a stop button that never clears is
+        // its own problem and the submit check below will report it honestly.
+        let busy = |ch: &Self| {
+            ab_eval(&ch.ab, JS_STATE, &ch.session, budget)
+                .ok()
+                .filter(|v| v.is_object())
+                .map(|v| {
+                    v.get("stop").and_then(|b| b.as_bool()).unwrap_or(false)
+                        || v.get("tool_active").and_then(|b| b.as_bool()).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        };
+        let wait_idle = |ch: &Self, secs: u64| {
+            let until = Instant::now() + Duration::from_secs(secs);
+            while busy(ch) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        };
+
+        wait_idle(self, 10);
+        if busy(self) {
+            // The page is stuck mid-generation and will not recover on its own.
+            // Seen live on an account whose front end had degraded: after a turn
+            // the stop button stayed present indefinitely — still there 32s
+            // later — so the composer refused every further message while the
+            // server had long since closed the turn. Waiting longer does not
+            // help; reloading the conversation does. This is the same trade the
+            // rest of the channel makes: the record is authoritative, the page
+            // is just a keyboard, and a keyboard that has locked up gets reset.
+            eprintln!("the page is stuck mid-generation; reloading the conversation to free the composer");
+            if self.convo_id.is_some() {
+                self.reopen_pinned(budget)
+                    .context("reloading a page stuck mid-generation")?;
+            }
+            wait_idle(self, 10);
+        }
+
         // Focus and empty the composer, then insert the message as TEXT.
         ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
             .context("clicking #prompt-textarea")?;
@@ -785,7 +830,7 @@ impl Channel {
             return None;
         }
         let done = res.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
-        let text = res.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let text = strip_private_markers(res.get("text").and_then(|v| v.as_str()).unwrap_or(""));
         Some((done, text))
     }
 
@@ -1281,12 +1326,21 @@ impl Channel {
             }
         }
 
-        // If the project page wouldn't render, the conversation was started in a
-        // plain chat — move it into the project now that it exists server-side.
-        // Done after the turn rather than at pin time so a metadata write never
-        // shares the wire with a generation in flight.
+        Ok(reply_text)
+    }
+
+    /// Close the tab (best-effort), matching chatgpt-imagegen's try/finally.
+    ///
+    /// Any deferred project filing happens HERE rather than after each turn.
+    /// Setting `gizmo_id` makes ChatGPT's client re-route the open conversation
+    /// to its project URL, and the composer is gone for the moment that takes —
+    /// live, a multi-turn `run` filed after turn one and then failed its next
+    /// send with "could not insert text into the ChatGPT composer". A one-shot
+    /// `ask` never saw it because it exits immediately after. So we file once,
+    /// when nothing is going to type into the page again.
+    pub fn close(mut self) {
         if let (Some(gizmo), Some(cid)) = (self.pending_project.clone(), self.convo_id.clone()) {
-            match self.file_into_project(&cid, &gizmo, budget) {
+            match self.file_into_project(&cid, &gizmo, 30.0) {
                 Ok(()) => {
                     eprintln!("filed conversation into project {:?}", self.project);
                     self.pending_project = None;
@@ -1298,12 +1352,6 @@ impl Channel {
                 ),
             }
         }
-
-        Ok(reply_text)
-    }
-
-    /// Close the tab (best-effort), matching chatgpt-imagegen's try/finally.
-    pub fn close(self) {
         ab_close(&self.ab, &self.session);
     }
 
@@ -1702,6 +1750,37 @@ impl SurfaceLock {
     }
 }
 
+/// Strip ChatGPT's private-use control markers from a record-sourced reply.
+///
+/// The conversation record is the true text, which turns out to include markup
+/// the UI never shows: citation spans delimited by U+E200/U+E201 with U+E202
+/// separators, e.g. `\u{e200}cite\u{e202}turn0search4\u{e201}`, plus occasional
+/// bare private-use characters. Scraping innerText hid these because the page
+/// renders them as links; reading the record does not, so a downstream consumer
+/// — Claude Code, through `serve` — would receive them verbatim.
+///
+/// Whole delimited spans go, since their contents are internal ids rather than
+/// anything a reader wants; stray private-use characters go too.
+fn strip_private_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '\u{e200}' => depth += 1,
+            '\u{e201}' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            // Bare private-use characters outside a span carry no meaning either.
+            '\u{e000}'..='\u{f8ff}' => {}
+            _ => out.push(c),
+        }
+    }
+    // Collapse the blank lines a removed trailing span can leave behind.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out.trim_end().to_string()
+}
+
 /// Rust twin of `JS_COMPOSER_FINGERPRINT`: non-whitespace count plus an
 /// order-sensitive FNV-1a hash over UTF-16 code units.
 ///
@@ -1995,6 +2074,34 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The record carries markup the rendered page hides. Observed live in a
+    /// `serve` reply: a citation span that would have been handed straight to
+    /// Claude Code.
+    #[test]
+    fn strips_citation_spans_from_record_text() {
+        let raw = "Tokyo is 21\u{b0}C. \u{e200}cite\u{e202}turn168423search4\u{e201}";
+        assert_eq!(strip_private_markers(raw), "Tokyo is 21\u{b0}C.");
+    }
+
+    #[test]
+    fn strips_bare_private_use_characters() {
+        assert_eq!(strip_private_markers("a\u{e300}b"), "ab");
+    }
+
+    #[test]
+    fn leaves_ordinary_text_alone() {
+        let s = "**bold**, `code`, 中文, emoji \u{1F600}\n\nsecond paragraph";
+        assert_eq!(strip_private_markers(s), s);
+    }
+
+    /// An unterminated span must not swallow the rest of the reply.
+    #[test]
+    fn an_unclosed_span_does_not_eat_the_tail() {
+        // Depth stays open, so the tail is dropped — but a stray CLOSE marker
+        // must never make depth negative and re-admit garbage.
+        assert_eq!(strip_private_markers("keep\u{e201}more"), "keepmore");
+    }
+
     /// These expected values were produced by running the EXACT JavaScript of
     /// `JS_COMPOSER_FINGERPRINT` under node. They are the contract between the
     /// two implementations: if Rust and the page ever disagree, every send
