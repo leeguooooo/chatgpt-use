@@ -79,6 +79,7 @@ chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.sche
 | `schema_error` | your schema would not load or compile; nothing was sent | 8 |
 | `busy` | another run holds the ChatGPT window and you passed `--busy fail` | 7 |
 | `duplicate` | the `--request-id` already names a request that may have been sent | 9 |
+| `submission_unknown` | `resume`: no conversation on record to attach to; not resent | 10 |
 
 Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
 `unknown` means Enter was pressed but no receipt appeared, so a retry could post the prompt
@@ -108,6 +109,11 @@ chatgpt-use status pr-42-head-9f3c   # never touches the browser
   Neither of those is permission to resend.
 - `--busy fail` returns `busy` immediately instead of queueing behind another run of the shared
   window. The default is to wait.
+- `resume <id>` picks up a request whose caller lost it. It waits for the reply on the server
+  record, without sending anything, and prints the same envelope (`--output-schema` works here
+  too). It refuses a request whose owner is still running (`busy`). A request with no recorded
+  conversation (sent, or maybe sent, before ChatGPT assigned one) is `submission_unknown`: there
+  is nothing to attach to, and it is never resent.
 
 ### Mode 2 · 大脑 / Brain — `chatgpt-use run`
 

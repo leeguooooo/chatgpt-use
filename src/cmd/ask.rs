@@ -192,33 +192,11 @@ fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Close the receipt with the turn's outcome. A reply that exists (even one
-/// that failed validation) means the turn completed and the prompt was sent;
-/// otherwise the failure says how far it got.
+/// Close the receipt, if there is one, with the turn's outcome.
 fn finish_receipt(path: Option<&std::path::Path>, envelope: &serde_json::Value) {
-    let Some(path) = path else { return };
-    let status = envelope["status"].as_str().unwrap_or("failed").to_string();
-    let replied = matches!(status.as_str(), "completed" | "schema_violation" | "unparseable");
-    let submitted = if replied {
-        "yes".to_string()
-    } else {
-        envelope["error"]["submitted"].as_str().unwrap_or("unknown").to_string()
-    };
-    let error = envelope["error"]["message"].as_str().map(str::to_string);
-    let convo = envelope["conversation_id"].as_str().map(str::to_string);
-    receipt::update(path, |r| {
-        r.state = if replied { "completed" } else { "failed" }.into();
-        // Never downgrade: the channel may already have recorded the prompt
-        // as sent, which a later "not submitted" cannot undo.
-        if !(r.submitted == "yes" && submitted != "yes") {
-            r.submitted = submitted;
-        }
-        r.outcome = Some(status);
-        r.error = error;
-        if convo.is_some() {
-            r.conversation_id = convo;
-        }
-    });
+    if let Some(path) = path {
+        receipt::finish(path, envelope);
+    }
 }
 
 // ---- Non-Ask delegation modes -----------------------------------------------

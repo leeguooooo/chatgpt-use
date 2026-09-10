@@ -118,6 +118,7 @@ pub fn exit_code(status: &str) -> i32 {
         "busy" => 7,
         "schema_error" => 8,
         "duplicate" => 9,
+        "submission_unknown" => 10,
         _ => 1,
     }
 }
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn only_completed_exits_zero_and_each_status_has_its_own_code() {
         let statuses =
-            ["completed", "schema_violation", "unparseable", "incomplete", "unavailable", "busy", "schema_error", "duplicate", "failed"];
+            ["completed", "schema_violation", "unparseable", "incomplete", "unavailable", "busy", "schema_error", "duplicate", "submission_unknown", "failed"];
         let codes: Vec<i32> = statuses.iter().map(|s| exit_code(s)).collect();
         assert_eq!(codes.iter().filter(|&&c| c == 0).count(), 1);
         let mut unique = codes.clone();

@@ -1359,6 +1359,61 @@ impl Channel {
         self.convo_id.as_deref()
     }
 
+    /// Attach to an existing conversation to read its reply, without typing.
+    ///
+    /// Opens a plain chat (no project entry, no model change) and uses its tab
+    /// only as a signed-in origin for the conversation API: the conversation
+    /// itself is never navigated to, typed into or filed, so attaching cannot
+    /// disturb it or any other one.
+    pub fn attach(opts: &ChannelOptions, convo_id: &str) -> Result<Self> {
+        let plain = ChannelOptions {
+            profile: opts.profile.clone(),
+            session: opts.session.clone(),
+            project: String::new(),
+            timeout_secs: opts.timeout_secs,
+            model: None,
+            busy_fail: opts.busy_fail,
+            receipt: None,
+        };
+        let mut chan = Channel::connect(&plain)?;
+        chan.convo_id = Some(convo_id.to_string());
+        chan.submitted = true;
+        Ok(chan)
+    }
+
+    /// Wait for the pinned conversation's reply to finish, reading only the
+    /// server record (`end_turn`). Used to resume a request whose owner went
+    /// away; it never sends anything.
+    pub fn await_record(&mut self) -> Result<String> {
+        let Some(id) = self.convo_id.clone() else {
+            bail!("no conversation to wait on");
+        };
+        let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
+        let mut read_once = false;
+        loop {
+            if let Some((done, text)) = self.server_final(30.0) {
+                read_once = true;
+                if done && !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+            if Instant::now() >= deadline {
+                let why = if read_once {
+                    "the reply has not finished"
+                } else {
+                    "the conversation record could not be read"
+                };
+                return Err(ChannelError::new(
+                    ErrorKind::Incomplete,
+                    format!("{why} after {}s (conversation {id})", self.timeout_secs),
+                )
+                .with_submitted(Submitted::Yes)
+                .into());
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
     /// Record in the receipt, if there is one, what is now known: that the
     /// prompt is on the server, and which conversation it is in.
     fn touch_receipt(&self) {

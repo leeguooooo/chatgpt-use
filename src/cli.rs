@@ -40,6 +40,20 @@ pub enum Command {
     /// Report what happened to an `ask --request-id` request, from its receipt.
     /// Never touches the browser.
     Status(StatusArgs),
+    /// Pick up an `ask --request-id` request whose caller lost it: wait for its
+    /// reply on the server without sending anything. Prints one JSON envelope.
+    Resume(ResumeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ResumeArgs {
+    /// The id given to `ask --request-id`.
+    pub request_id: String,
+    /// Validate the reply against this JSON Schema, as `ask --output-schema` does.
+    #[arg(long = "output-schema", value_name = "FILE")]
+    pub output_schema: Option<String>,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
 }
 
 #[derive(clap::Args, Debug)]

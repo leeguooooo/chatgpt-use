@@ -33,6 +33,7 @@ fn main() {
         Command::Work(args) => cmd::work::run(args),
         Command::Refresh(args) => cmd::refresh::run(args),
         Command::Status(args) => cmd::status::run(args),
+        Command::Resume(args) => cmd::resume::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
