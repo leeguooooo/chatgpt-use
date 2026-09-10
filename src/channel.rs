@@ -141,14 +141,42 @@ const JS_CLEAR_COMPOSER: &str = r#"(() => {
   return JSON.stringify({ok: true});
 })()"#;
 
-// JS: count the composer's non-whitespace characters. Used as a cheap integrity
-// check that the whole payload actually landed before we submit — whitespace is
-// excluded because ProseMirror renders each line as its own block, so innerText
-// comes back with blank lines between them and a raw length would never match.
-const JS_COMPOSER_NWS: &str = r#"(() => {
+// JS: fingerprint the composer's contents — the non-whitespace character COUNT
+// and an order-sensitive HASH of those characters.
+//
+// Whitespace is excluded because ProseMirror renders each line as its own block,
+// so innerText comes back with blank lines between them and a raw length would
+// never match. The whitespace set is written out explicitly rather than using
+// `\s`, because JavaScript's `\s` and Rust's `char::is_whitespace` disagree on a
+// few code points (U+0085 is whitespace only to Rust, U+FEFF only to JS) and a
+// single such character in a 30 KB prompt would fail the check for no reason.
+//
+// The hash is what makes this worth doing. A count alone catches truncation and
+// pollution but is blind to REORDERING, and reordering is a real failure mode
+// here: chrome-use's `keyboard inserttext` interleaves the tail of one chunk
+// with the head of the next while preserving total length (leeguooooo/chrome-use#301,
+// reproduced against this very composer). A payload can therefore arrive
+// complete, correctly sized, and scrambled. FNV-1a over UTF-16 code units, which
+// both sides can compute identically.
+const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
   const c = document.querySelector('#prompt-textarea');
   const t = c ? (c.innerText || c.textContent || '') : '';
-  return JSON.stringify(t.replace(/\s+/g, '').length);
+  const isWs = (u) =>
+    (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
+    u === 0x1680 || (u >= 0x2000 && u <= 0x200a) || u === 0x2028 ||
+    u === 0x2029 || u === 0x202f || u === 0x205f || u === 0x3000 || u === 0xfeff;
+  let n = 0;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < t.length; i++) {
+    const u = t.charCodeAt(i);
+    if (isWs(u)) continue;
+    n++;
+    h = (h ^ (u & 0xff)) >>> 0;
+    h = Math.imul(h, 0x01000193) >>> 0;
+    h = (h ^ (u >>> 8)) >>> 0;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return JSON.stringify({n: n, h: h});
 })()"#;
 
 /// JS: insert `text` at the caret via `execCommand('insertText')`.
@@ -523,9 +551,9 @@ impl Channel {
         let mut cleared = false;
         for _ in 0..5 {
             let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
-            if ab_eval(&self.ab, JS_COMPOSER_NWS, &self.session, budget)
+            if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
                 .ok()
-                .and_then(|v| v.as_u64())
+                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
                 == Some(0)
             {
                 cleared = true;
@@ -558,18 +586,32 @@ impl Channel {
         }
 
         // Integrity check BEFORE submitting: confirm the whole payload is sitting
-        // in the composer. Cheaper and far more useful than discovering a
-        // truncated prompt from a confused reply ten minutes later.
-        let want_nws = message.chars().filter(|c| !c.is_whitespace()).count() as u64;
-        let got_nws = ab_eval(&self.ab, JS_COMPOSER_NWS, &self.session, budget)
-            .ok()
-            .and_then(|v| v.as_u64());
-        if let Some(got) = got_nws {
-            if got != want_nws {
+        // in the composer, in the right ORDER. Cheaper and far more useful than
+        // discovering a mangled prompt from a confused reply ten minutes later.
+        //
+        // Both halves matter. The count catches truncation (a chunk that never
+        // landed) and pollution (a restored draft prepended); the hash catches
+        // reordering, which the count cannot see because it preserves length —
+        // and reordering is not hypothetical here, it is what
+        // leeguooooo/chrome-use#301 does to chunked inserts.
+        let (want_n, want_h) = composer_fingerprint(message);
+        let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
+        let got_n = got.as_ref().and_then(|v| v.get("n")).and_then(|v| v.as_u64());
+        let got_h = got.as_ref().and_then(|v| v.get("h")).and_then(|v| v.as_u64());
+        if let (Some(n), Some(h)) = (got_n, got_h) {
+            if n != want_n {
                 bail!(
                     "composer content doesn't match the message to send \
-                     ({got} non-whitespace chars present, {want_nws} expected) — \
+                     ({n} non-whitespace chars present, {want_n} expected) — \
                      refusing to submit a truncated or polluted prompt"
+                );
+            }
+            if h != want_h as u64 {
+                bail!(
+                    "composer holds the right number of characters ({n}) but not in \
+                     the right order (fingerprint {h:#x}, expected {:#x}) — refusing \
+                     to submit a scrambled prompt",
+                    want_h
                 );
             }
         }
@@ -1401,6 +1443,34 @@ impl SurfaceLock {
     }
 }
 
+/// Rust twin of `JS_COMPOSER_FINGERPRINT`: non-whitespace count plus an
+/// order-sensitive FNV-1a hash over UTF-16 code units.
+///
+/// Must stay byte-for-byte equivalent to the JS. The whitespace set is spelled
+/// out for the same reason it is there: `char::is_whitespace` and JavaScript's
+/// `\s` classify U+0085 and U+FEFF differently, and disagreeing by one
+/// character fails an otherwise perfect 30 KB prompt.
+fn composer_fingerprint(text: &str) -> (u64, u32) {
+    fn is_wire_ws(u: u16) -> bool {
+        matches!(u,
+            0x09..=0x0d | 0x20 | 0x85 | 0xa0 | 0x1680 | 0x2000..=0x200a
+            | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff)
+    }
+    let mut n: u64 = 0;
+    let mut h: u32 = 0x811c_9dc5;
+    for u in text.encode_utf16() {
+        if is_wire_ws(u) {
+            continue;
+        }
+        n += 1;
+        h ^= u as u32 & 0xff;
+        h = h.wrapping_mul(0x0100_0193);
+        h ^= (u >> 8) as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (n, h)
+}
+
 /// Describe whoever holds the lock, from the file's first line.
 ///
 /// The contract with chatgpt-imagegen is one line, `<tool> <pid>`. Anything
@@ -1666,6 +1736,45 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// These expected values were produced by running the EXACT JavaScript of
+    /// `JS_COMPOSER_FINGERPRINT` under node. They are the contract between the
+    /// two implementations: if Rust and the page ever disagree, every send
+    /// fails the integrity check, so the agreement is pinned here rather than
+    /// discovered in production.
+    #[test]
+    fn composer_fingerprint_matches_the_javascript() {
+        assert_eq!(composer_fingerprint(""), (0, 2166136261));
+        assert_eq!(composer_fingerprint("hello world"), (10, 942532069));
+        assert_eq!(composer_fingerprint("AAA\nBBB\nCCC"), (9, 1755253517));
+        assert_eq!(composer_fingerprint("中文测试 ABC"), (7, 1526566950));
+        // Surrogate pair: four UTF-16 code units, not three chars.
+        assert_eq!(composer_fingerprint("a\u{1F600}b"), (4, 957716613));
+    }
+
+    /// The three code points where `char::is_whitespace` and JavaScript's `\s`
+    /// disagree must be classified the same by both sides. All three collapse
+    /// to plain "ab".
+    #[test]
+    fn composer_fingerprint_agrees_on_contested_whitespace() {
+        let plain = composer_fingerprint("ab");
+        assert_eq!(plain, (2, 2174188438));
+        assert_eq!(composer_fingerprint("a\u{00a0}b"), plain); // NBSP
+        assert_eq!(composer_fingerprint("a\u{0085}b"), plain); // NEL — Rust-only in std
+        assert_eq!(composer_fingerprint("a\u{feff}b"), plain); // BOM — JS-only in \s
+    }
+
+    /// The reason the hash exists at all: chrome-use#301 scrambles chunked
+    /// inserts while PRESERVING length, so a count-only check waves it through.
+    #[test]
+    fn composer_fingerprint_detects_reordering_at_equal_length() {
+        let (n1, h1) = composer_fingerprint("abcdef");
+        let (n2, h2) = composer_fingerprint("abcdfe");
+        assert_eq!(n1, n2, "the failure mode under test keeps the count identical");
+        assert_ne!(h1, h2, "a reordered payload must not pass the integrity check");
+        assert_eq!((n1, h1), (6, 829399410));
+        assert_eq!((n2, h2), (6, 793662762));
+    }
+
     #[test]
     fn holder_label_reads_tool_and_pid() {
         assert_eq!(holder_label("chatgpt-imagegen 4321\n"), "chatgpt-imagegen (pid 4321)");
