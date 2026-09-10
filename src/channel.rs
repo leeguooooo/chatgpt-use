@@ -2073,7 +2073,7 @@ impl Channel {
         Ok(reply_text)
     }
 
-    /// Close the tab (best-effort), matching chatgpt-imagegen's try/finally.
+    /// End the channel. Files any deferred project; keeps the tab (see below).
     ///
     /// Any deferred project filing happens HERE rather than after each turn.
     /// Setting `gizmo_id` makes ChatGPT's client re-route the open conversation
@@ -2096,7 +2096,12 @@ impl Channel {
                 ),
             }
         }
-        ab_close(&self.ab, &self.session);
+        // The tab is deliberately LEFT OPEN. The next run finds it and starts a
+        // new chat in place, which costs one backend request; closing it here
+        // made every run reopen chatgpt.com from scratch, about 45 requests.
+        // Measured: seven runs in a row, all full reloads, none reused, until
+        // the account throttle tripped. It is also the one ChatGPT window the
+        // shared session is meant to keep.
     }
 
     /// Navigate the open session's tab to `url` and wait for it to settle.
