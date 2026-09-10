@@ -25,6 +25,11 @@ base64 = "0.22"
 # a caller's schema must not need.
 jsonschema = { version = "0.55", default-features = false }
 
+# SIGTERM/SIGINT → graceful cancel for `ask --request-id` (stop the reply,
+# confirm it). Only the flag API is used, so no default features.
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.4", default-features = false }
+
 [profile.release]
 strip = true
 lto = "thin"

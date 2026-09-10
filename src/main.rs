@@ -34,6 +34,7 @@ fn main() {
         Command::Refresh(args) => cmd::refresh::run(args),
         Command::Status(args) => cmd::status::run(args),
         Command::Resume(args) => cmd::resume::run(args),
+        Command::Cancel(args) => cmd::cancel::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");

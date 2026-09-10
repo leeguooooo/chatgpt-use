@@ -80,8 +80,12 @@ chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.sche
 | `busy` | another run holds the ChatGPT window and you passed `--busy fail` | 7 |
 | `duplicate` | the `--request-id` already names a request that may have been sent | 9 |
 | `submission_unknown` | `resume`: no conversation on record to attach to; not resent | 10 |
+| `cancelled` | the request was cancelled, and that is confirmed | 11 |
+| `cancel_requested` | stop was pressed but not confirmed; it may still be generating | 12 |
 
-Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
+A reply that was stopped or cut off at the length limit is `incomplete`, never `completed`. The
+conversation record marks such a turn as closed, just like a finished one, and only
+`finish_details` tells them apart. Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
 `unknown` means Enter was pressed but no receipt appeared, so a retry could post the prompt
 twice. No failure is ever reported as `completed` with an empty result. A reply that fails
 validation is **not** repaired with a follow-up turn: that would be another paid turn you did not
@@ -109,6 +113,16 @@ chatgpt-use status pr-42-head-9f3c   # never touches the browser
   Neither of those is permission to resend.
 - `--busy fail` returns `busy` immediately instead of queueing behind another run of the shared
   window. The default is to wait.
+- `cancel <id>` stops that request's generation. If the owner is alive, it is sent SIGTERM and
+  presses stop in its own tab, which only ever shows its own pinned conversation. If the owner is
+  gone, `cancel` attaches to the recorded conversation and stops that one. The possible results:
+  - `cancelled`: confirmed, either because nothing had been sent yet, or because the
+    conversation record shows the reply stopped (`finish_details.type: "interrupted"`);
+  - `cancel_requested`: stop was pressed but the record hasn't confirmed it;
+  - `already_finished`: the reply finished first;
+  - `unknown`.
+
+  With `--request-id`, SIGTERM or Ctrl-C does the same, and a second signal exits at once.
 - `resume <id>` picks up a request whose caller lost it. It waits for the reply on the server
   record, without sending anything, and prints the same envelope (`--output-schema` works here
   too). It refuses a request whose owner is still running (`busy`). A request with no recorded

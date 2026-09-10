@@ -24,6 +24,11 @@ use std::fs;
 
 pub fn run(args: &AskArgs) -> Result<()> {
     let opts = channel_opts_from_args(args);
+    // A request with a receipt is one a caller may cancel: SIGTERM stops its
+    // reply and records how that ended, instead of killing us mid-generation.
+    if args.request_id.is_some() {
+        crate::channel::install_cancel_handler();
+    }
 
     if let Some(schema) = &args.output_schema {
         if args.mode != Mode::Ask {

@@ -74,6 +74,13 @@ pub enum ErrorKind {
     /// The `--request-id` already names a request that may have reached
     /// ChatGPT; it is not sent again.
     Duplicate,
+    /// Cancelled, and confirmed: either before anything was sent, or the
+    /// conversation record shows the reply stopped (`finish_details`
+    /// "interrupted").
+    Cancelled,
+    /// Stop was pressed but the record has not confirmed it; the reply may
+    /// still be generating.
+    CancelRequested,
     /// The prompt was sent but no complete reply arrived.
     Incomplete,
 }
@@ -89,6 +96,8 @@ impl ErrorKind {
             ErrorKind::SubmitUnknown => "submit_unknown",
             ErrorKind::Busy => "busy",
             ErrorKind::Duplicate => "duplicate_request",
+            ErrorKind::Cancelled => "cancelled",
+            ErrorKind::CancelRequested => "cancel_requested",
             ErrorKind::Incomplete => "incomplete",
         }
     }
@@ -105,6 +114,8 @@ impl ErrorKind {
             ErrorKind::SubmitUnknown | ErrorKind::Incomplete => "incomplete",
             ErrorKind::Busy => "busy",
             ErrorKind::Duplicate => "duplicate",
+            ErrorKind::Cancelled => "cancelled",
+            ErrorKind::CancelRequested => "cancel_requested",
         }
     }
 }
@@ -178,13 +189,61 @@ fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
     e.context(ChannelError::new(kind, label).with_submitted(phase))
 }
 
+/// Set by SIGTERM / SIGINT once `install_cancel_handler` has run. Every wait
+/// in a turn watches it, so a cancel is honoured within about a second.
+static CANCEL: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Turn SIGTERM and SIGINT into a graceful cancel of the current request: stop
+/// its reply and confirm it, instead of dying with the generation still
+/// running. A second signal exits at once. Installed only by `ask
+/// --request-id`, so every other command keeps the default behaviour.
+pub fn install_cancel_handler() {
+    #[cfg(unix)]
+    {
+        let flag = CANCEL
+            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone();
+        for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+            // Order matters: the conditional shutdown sees the flag the first
+            // signal is about to set, so only a SECOND signal exits.
+            let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, flag.clone());
+            let _ = signal_hook::flag::register(sig, flag.clone());
+        }
+    }
+}
+
+fn cancel_requested() -> bool {
+    CANCEL.get().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Sleep that wakes early for a cancel.
+fn nap(d: Duration) {
+    let end = Instant::now() + d;
+    while !cancel_requested() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(200)));
+    }
+}
+
+// JS: press the stop button, if the page is generating.
+const JS_CLICK_STOP: &str = r#"(() => {
+  const b = document.querySelector('button[data-testid="stop-button"]');
+  if (b) b.click();
+  return JSON.stringify({clicked: !!b});
+})()"#;
+
 // JS: is this the signed-out page? Its login/sign-up buttons, or an auth URL.
 // The button test ids are a best guess, not yet checked against a live
 // signed-out page. If they are wrong, the error is the safe one: a real
 // signed-out page reads as session_unavailable, never a false login_required.
 const JS_WANTS_LOGIN: &str = r#"(() => JSON.stringify({login:
   /\/auth\/|auth\.openai\.com/.test(location.href) ||
-  !!document.querySelector('[data-testid="login-button"],[data-testid="signup-button"]')}))()"#;
+  !!document.querySelector('[data-testid="login-button"],[data-testid="signup-button"]'),
+  path: location.pathname, title: document.title.slice(0, 80)}))()"#;
 
 // JS: text of a visible dialog, if any. Read only once a turn has stalled, to
 // report WHAT is blocking it rather than guess (a usage-limit notice, say).
@@ -854,7 +913,21 @@ impl Channel {
             let label = prof.as_deref().unwrap_or("current Chrome (relay)");
             eprintln!("opening ChatGPT via {label}");
 
-            match try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline) {
+            // Observed twice: opening right after the previous run closed its tab
+            // gave a page whose composer never appeared, and an unchanged rerun
+            // seconds later worked. So a candidate whose page merely failed to
+            // render gets one more try before we move on.
+            let mut opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+            if matches!(opened_now, Ok(false)) {
+                let (login, what) = page_probe(&ab, &session);
+                if !login {
+                    eprintln!("the ChatGPT page never showed its composer ({what}); retrying once");
+                    ab_close(&ab, &session);
+                    std::thread::sleep(Duration::from_secs(3));
+                    opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+                }
+            }
+            match opened_now {
                 Ok(true) => {
                     eprintln!("using {label}");
                     opened = true;
@@ -862,11 +935,13 @@ impl Channel {
                 }
                 Ok(false) => {
                     // composer never appeared — try next candidate
-                    if page_wants_login(&ab, &session) {
+                    let (login, what) = page_probe(&ab, &session);
+                    if login {
                         saw_login = true;
                     } else {
-                        last_failure =
-                            Some(format!("{label}: the ChatGPT page never showed its composer"));
+                        last_failure = Some(format!(
+                            "{label}: the ChatGPT page never showed its composer ({what})"
+                        ));
                     }
                     ab_close(&ab, &session);
                 }
@@ -1433,6 +1508,77 @@ impl Channel {
         }
     }
 
+    /// Honour a cancel mid-turn: press stop, and report `Cancelled` only once
+    /// the conversation record confirms the reply stopped.
+    ///
+    /// Stop is pressed only while the tab shows OUR pinned conversation — the
+    /// stop button acts on whatever page is open, and a cancel must never stop
+    /// somebody else's reply. A reply that finished before the stop took
+    /// effect is returned as the reply it is.
+    fn stop_generation(&mut self, budget: f64) -> Result<String> {
+        eprintln!("cancel requested; stopping this conversation's reply");
+        let give_up = Instant::now() + Duration::from_secs(20);
+        loop {
+            let current = self.current_convo_id(10.0);
+            let on_ours = match &self.convo_id {
+                Some(pinned) => convo_drift(pinned, current.as_deref()).is_none(),
+                // Turn one, before ChatGPT has assigned an id: the session's
+                // tab is the fresh chat this channel opened.
+                None => true,
+            };
+            if on_ours {
+                let _ = ab_eval(&self.ab, JS_CLICK_STOP, &self.session, 10.0);
+            }
+            if self.convo_id.is_none() && current.is_some() {
+                self.convo_id = current;
+                self.touch_receipt();
+            }
+            if let Some(turn) = self.server_final(10.0) {
+                if turn.finish.as_deref() == Some("interrupted") {
+                    return Err(ChannelError::new(
+                        ErrorKind::Cancelled,
+                        format!(
+                            "cancelled: the conversation record confirms the reply stopped \
+                             ({} characters were generated)",
+                            turn.text.chars().count()
+                        ),
+                    )
+                    .with_submitted(Submitted::Yes)
+                    .into());
+                }
+                if let Some(text) = judge_record(turn)? {
+                    eprintln!("the reply finished before the stop took effect");
+                    return self.finish_turn(text, budget);
+                }
+            }
+            if Instant::now() >= give_up {
+                return Err(ChannelError::new(
+                    ErrorKind::CancelRequested,
+                    "pressed stop, but the conversation record has not confirmed it; the reply \
+                     may still be generating",
+                )
+                .with_submitted(Submitted::Yes)
+                .into());
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Cancel the pinned conversation's reply from a channel made by `attach`,
+    /// for a request whose owner is gone. A reply that already finished is
+    /// returned (nothing to cancel); one still open is reopened so its own
+    /// stop button can be pressed.
+    pub fn cancel_pinned(&mut self) -> Result<String> {
+        let open = match self.server_final(20.0) {
+            Some(turn) => !(turn.done || turn.finish.is_some()),
+            None => true,
+        };
+        if open {
+            self.reopen_pinned(60.0)?;
+        }
+        self.stop_generation(60.0)
+    }
+
     /// Record in the receipt, if there is one, what is now known: that the
     /// prompt is on the server, and which conversation it is in.
     fn touch_receipt(&self) {
@@ -1517,6 +1663,14 @@ impl Channel {
         // Fill + submit, with ONE reattach-and-retry: the tab can vanish between
         // turns (closed, crashed, browser restarted) and the conversation itself
         // is still on the server, so losing the window shouldn't lose the turn.
+        if cancel_requested() {
+            return Err(ChannelError::new(
+                ErrorKind::Cancelled,
+                "cancelled before the prompt was sent",
+            )
+            .into());
+        }
+
         if let Err(first) = self.fill_and_submit(message, baseline_users, remaining_secs()) {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
@@ -1640,7 +1794,10 @@ impl Channel {
                 )
                 .into());
             }
-            std::thread::sleep(poll_interval);
+            nap(poll_interval);
+            if cancel_requested() {
+                return self.stop_generation(remaining_secs());
+            }
 
             let read = ab_eval(&self.ab, JS_STATE, &self.session, remaining_secs());
 
@@ -1753,7 +1910,7 @@ impl Channel {
                 );
                 // Dismiss the dialog so the page is usable if it does recover.
                 let _ = ab_eval(&self.ab, JS_DISMISS_DIALOG, &self.session, remaining_secs());
-                std::thread::sleep(backoff);
+                nap(backoff);
                 if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
                     if !text.trim().is_empty() {
                         eprintln!("the turn completed despite the throttle; taking it from the record");
@@ -2393,9 +2550,24 @@ impl SurfaceLock {
                 .into());
             }
             eprintln!("waiting for {who} to finish with ChatGPT…");
-            if let Err(e) = file.lock() {
-                eprintln!("warning: could not take the channel lock ({e}); proceeding");
-                return Ok(SurfaceLock { _file: None });
+            // Poll rather than block, so a queued request can be cancelled.
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        eprintln!("warning: could not take the channel lock ({e}); proceeding");
+                        return Ok(SurfaceLock { _file: None });
+                    }
+                }
+                if cancel_requested() {
+                    return Err(ChannelError::new(
+                        ErrorKind::Cancelled,
+                        "cancelled while queued for the ChatGPT window; nothing was sent",
+                    )
+                    .into());
+                }
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
 
@@ -2735,13 +2907,18 @@ fn try_open(
     wait_composer(ab, session, deadline, 15)
 }
 
-/// Whether the open page is ChatGPT's signed-out screen. Anything we cannot
-/// read counts as "no": a login claim needs positive evidence.
-fn page_wants_login(ab: &PathBuf, session: &str) -> bool {
-    ab_eval(ab, JS_WANTS_LOGIN, session, 10.0)
-        .ok()
-        .and_then(|v| v.get("login").and_then(|b| b.as_bool()))
-        .unwrap_or(false)
+/// What the open page is, when the composer never appeared: whether it is
+/// ChatGPT's signed-out screen (anything unreadable counts as "no": a login
+/// claim needs positive evidence), and a short description for the error.
+fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
+    match ab_eval(ab, JS_WANTS_LOGIN, session, 10.0) {
+        Ok(v) => {
+            let login = v.get("login").and_then(|b| b.as_bool()).unwrap_or(false);
+            let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            (login, format!("path {:?}, title {:?}", field("path"), field("title")))
+        }
+        Err(e) => (false, format!("page unreadable: {e}")),
+    }
 }
 
 /// Poll until `#prompt-textarea` is on the page (mirrors `_wait_composer`).
@@ -3060,7 +3237,7 @@ mod tests {
         use ErrorKind::*;
         for k in [
             LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown,
-            Incomplete, Busy, Duplicate,
+            Incomplete, Busy, Duplicate, Cancelled, CancelRequested,
         ] {
             assert_ne!(k.status(), "completed", "{k:?}");
         }

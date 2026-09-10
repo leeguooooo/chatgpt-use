@@ -43,6 +43,17 @@ pub enum Command {
     /// Pick up an `ask --request-id` request whose caller lost it: wait for its
     /// reply on the server without sending anything. Prints one JSON envelope.
     Resume(ResumeArgs),
+    /// Stop the generation behind an `ask --request-id` request; reports
+    /// `cancelled` only when the conversation record confirms it.
+    Cancel(CancelArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CancelArgs {
+    /// The id given to `ask --request-id`.
+    pub request_id: String,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
 }
 
 #[derive(clap::Args, Debug)]
