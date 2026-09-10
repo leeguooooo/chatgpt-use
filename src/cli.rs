@@ -91,7 +91,8 @@ pub struct ChannelArgs {
     /// Which Chrome profile to drive: auto (default) | relay | "Profile 3".
     #[arg(long, default_value = "auto")]
     pub profile: String,
-    /// chrome-use session name to reuse a tab group across runs.
+    /// chrome-use session name. Defaults to the shared "chatgpt-web" session so
+    /// every run reuses ONE ChatGPT window; override only to get a separate tab.
     #[arg(long)]
     pub session: Option<String>,
     /// File the conversation under a ChatGPT Project (empty = plain chat).

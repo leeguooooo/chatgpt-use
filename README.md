@@ -211,15 +211,25 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   a correct answer. Still: this is a text protocol over a chat surface, not native function-calling —
   expect the occasional malformed turn. Native tool-calling remains better on the **MCP channel**
   (regular GPT-5.5) when it's available to you.
-- **Pro is browser-only, and `--model` is currently broken.** GPT-5.5 **Pro** — the strongest planner
-  — cannot use Apps/MCP, so it's reachable only through the browser channel. Selecting it was
-  automated by reverse-engineering the composer's *Intelligence level* picker (instant / high / pro).
-  ChatGPT has since relabelled that picker to **model names** (observed 2026-08-31: the button reads
-  `5.6 SolLight`), so the selector no longer matches anything and `--model` cannot be applied. It now
-  **errors out** rather than silently running on the account default — which is the dangerous failure,
-  since the closed loop (`work`) must stay on a non-Pro level to keep its connector tools. Run without
-  `--model` to accept whatever the account is set to. Updating the selector needs a look at the new
-  menu (blocked on a rate limit at time of writing).
+- **Pro is browser-only, and the picker it lives in keeps moving.** **Pro** — the strongest planner —
+  cannot use Apps/MCP, so it's reachable only through the browser channel, and the closed loop
+  (`work`) must stay on a non-Pro level to keep its connector tools. `--model` is live-verified
+  again (2026-09-10), but it has broken twice now for the same reason, so it's worth saying what the
+  control actually is:
+
+  - The picker **button's text is not stable and is never matched on**. One account, three weeks:
+    `Instant`, then `5.6 SolLight`, then `6Pro` — plus `Thinking effort` while its own menu is open.
+    Those are `shortLabel`s from a model catalogue that changes with the line-up. We find the button
+    structurally instead: the one `aria-haspopup="menu"` button sharing the composer toolbar row with
+    the "+" button.
+  - The five effort levels are **no longer menu items**. They're a slider (`aria-valuenow` 0–4 →
+    instant / medium / high / extra high / pro) driven with arrow keys, so selection is verified on
+    the **index**, which is stable, never on the rendered name, which isn't. Model *family*
+    (`Latest`, `GPT-5.5`, …) is a separate axis and `--model` accepts those names too.
+  - If the control changes again, `--model` **errors out** instead of silently running on the account
+    default. That silent fallback is the dangerous failure: it makes `work` lose every connector tool
+    and then look like a model that just won't use its tools. Run without `--model` to accept
+    whatever the account is set to.
 - **Connector goes stale on `mcp` restart.** ChatGPT caches `tools/list`, so after you restart the
   server it may not see the tools until a manual Refresh. `chatgpt-use refresh` automates that click
   (live-verified against the settings UI); the closed loop is otherwise hands-off.
@@ -459,7 +469,7 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
 - [x] **OAuth 2.1 + PKCE** — `mcp --auth-mode oauth` (discovery/register/authorize/token); full flow
   verified locally. Token-in-URL stays the ChatGPT-verified default. (from `coding-tools-mcp`)
 - [x] **`init`** — `chatgpt-use init` writes `~/.chatgpt-use/auth.json`; `mcp` auto-loads it. (from `devspace`)
-- [x] **`--model` flag** — select the composer Intelligence level (instant/medium/high/extra high/**pro**)
+- [x] **`--model` flag** — select the composer effort level (instant/medium/high/extra high/**pro**) or a model family (`Latest`, `GPT-5.5`, …). Rewritten 2026-09-10 for ChatGPT's slider-based picker; located structurally and verified on the slider index, because the button label drifts
   on the browser channel. **Live-verified** (DOM-reverse-engineered: CDP-click the picker, JS-click the item).
 - [x] **Executor handoff** — pipe a delegation packet into a local agent. `--to` is **required** (never a
   silent codex default); dry-run by default. **Live-verified** (dry-run + a real run). Optional side-bridge.

@@ -26,6 +26,16 @@ use std::time::{Duration, Instant};
 const AB_BIN_CANDIDATES: &[&str] = &["chrome-use", "agent-browser", "agent-browser-stealth", "abs"];
 
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
+/// One shared chrome-use session name — deliberately NOT per-process.
+///
+/// A different session name is a different tab, so the old `chatgpt-use-<pid>`
+/// default opened a fresh ChatGPT window for every invocation. That is not just
+/// untidy: ChatGPT pushes toasts into EVERY open chatgpt.com tab (so a
+/// document-wide read can pick up a sibling tab's content), and the account
+/// rate-limits per account, not per tab. Both tools that drive this surface
+/// (chatgpt-use and chatgpt-imagegen) use this name, so there is one window.
+/// Pass `--session` to override when you deliberately want a separate tab.
+const DEFAULT_SESSION: &str = "chatgpt-web";
 const WEB_PROJECT_URL_TPL: &str = "https://chatgpt.com/g/{gizmo_id}/project";
 // Reconnect target. The plain /c/<id> form resolves even for a chat filed under
 // a Project — ChatGPT redirects it to /g/<gizmo>/c/<id> — so the conversation id
@@ -164,6 +174,89 @@ fn js_insert_text(text: &str) -> String {
     )
 }
 
+/// The thinking-effort levels, in slider order. The INDEX is the contract with
+/// the page (`aria-valuenow`); the names here are only what a caller types.
+const LEVEL_ORDER: &[&str] = &["instant", "medium", "high", "extra high", "pro"];
+
+/// Map a `--model` value to a slider index, or `None` if it names a model
+/// family rather than an effort level.
+fn level_index(want: &str) -> Option<usize> {
+    let norm = want.trim().to_lowercase().replace(['-', '_'], " ");
+    let norm = norm.split_whitespace().collect::<Vec<_>>().join(" ");
+    if norm == "extrahigh" {
+        return Some(3);
+    }
+    LEVEL_ORDER.iter().position(|l| *l == norm)
+}
+
+// JS: locate the composer's model picker WITHOUT relying on its text.
+//
+// Its label tracks the current model and has read "Instant", "5.6 SolLight" and
+// "6Pro" on one account inside three weeks, so any word list goes stale. What is
+// stable is where it sits: the composer toolbar row, identified by the plus
+// button's testid, holding exactly one other `aria-haspopup="menu"` button.
+const JS_FIND_PICKER: &str = r#"(() => {
+  const plus = document.querySelector('[data-testid="composer-plus-btn"]');
+  if (!plus) return JSON.stringify({ok: false, error: 'composer toolbar not found'});
+  const rowTop = plus.getBoundingClientRect().top;
+  const hits = [...document.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
+    if (b.getAttribute('data-testid') === 'composer-plus-btn') return false;
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && Math.abs(r.top - rowTop) < 6;
+  });
+  if (hits.length !== 1) {
+    return JSON.stringify({ok: false,
+      error: 'expected one model picker on the composer row, found ' + hits.length});
+  }
+  const r = hits[0].getBoundingClientRect();
+  return JSON.stringify({ok: true, label: (hits[0].textContent || '').trim(),
+                         x: Math.round(r.left + r.width / 2),
+                         y: Math.round(r.top + r.height / 2)});
+})()"#;
+
+// JS: read the opened picker — the effort slider (index + thumb position) and
+// the model-family radios. `level` is the name the page currently shows for the
+// slider position; it is for logging only, never for matching.
+const JS_PICKER_MENU: &str = r#"(() => {
+  const menu = document.querySelector('[role="menu"]');
+  const sl = document.querySelector('[role="slider"]');
+  let slider = null;
+  if (sl) {
+    const r = sl.getBoundingClientRect();
+    slider = {now: Number(sl.getAttribute('aria-valuenow')),
+              min: Number(sl.getAttribute('aria-valuemin')),
+              max: Number(sl.getAttribute('aria-valuemax')),
+              thumbX: Math.round(r.left + r.width / 2),
+              thumbY: Math.round(r.top + r.height / 2)};
+  }
+  const shown = [...document.querySelectorAll('[role="menuitem"]')]
+    .find(e => e.getAttribute('aria-label') === 'Select model');
+  const radios = [...document.querySelectorAll('[role="menuitemradio"]')].map(e => ({
+    text: (e.textContent || '').trim(),
+    checked: e.getAttribute('aria-checked') === 'true'
+  }));
+  return JSON.stringify({open: !!menu, slider, radios,
+                         level: shown ? (shown.textContent || '').trim() : ''});
+})()"#;
+
+/// JS: click the model-family radio whose text matches exactly. Unlike the
+/// picker button and the slider thumb, these DO respond to `element.click()`.
+fn js_click_radio(text: &str) -> String {
+    let t = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const target = {t};
+  for (const el of document.querySelectorAll('[role="menuitemradio"]')) {{
+    if ((el.textContent || '').trim() === target) {{
+      el.click();
+      return JSON.stringify({{ok: true}});
+    }}
+  }}
+  return JSON.stringify({{ok: false}});
+}})()"#
+    )
+}
+
 // JS: resolve or create a ChatGPT Project by exact display name.
 // Returns {ok, id, created, error?}. Mirrors _JS_ENSURE_PROJECT in chatgpt-imagegen.
 fn js_ensure_project(name: &str) -> String {
@@ -290,7 +383,7 @@ impl Channel {
         let session = opts
             .session
             .clone()
-            .unwrap_or_else(|| format!("chatgpt-use-{}", std::process::id()));
+            .unwrap_or_else(|| DEFAULT_SESSION.to_string());
 
         let timeout_secs = opts.timeout_secs;
 
@@ -1019,21 +1112,28 @@ impl Channel {
         Ok(())
     }
 
-    /// Select an "Intelligence" level in the ChatGPT composer (verified against
-    /// the live UI 2026-06: the composer has one picker button whose text is the
-    /// current level — Instant / Medium / High / Extra High / Pro — and opens a
-    /// menu of those items). GPT-5.5 *Pro* is the "Pro" level here.
+    /// Set the composer's model, verified against the live UI on 2026-09-10.
     ///
-    /// Two non-obvious facts the live DOM forced:
-    ///   1. The picker opens ONLY on a real input click — a JS `element.click()`
-    ///      does nothing — so we fetch its coords and click via `chrome-use click
-    ///      x y` (a CDP input event).
-    ///   2. The menu ITEMS, by contrast, respond fine to JS `element.click()`.
+    /// ChatGPT rebuilt this control and the old "click the menu item named Pro"
+    /// approach cannot work any more. What is there now:
     ///
-    /// Best-effort: warns and continues with the account default if anything
-    /// can't be found. Labels are normalised case-insensitively:
-    ///   pro → "Pro", instant → "Instant", medium → "Medium", high → "High",
-    ///   "extra high" → "Extra High"; anything else passes through verbatim.
+    ///   * The picker BUTTON's text is not stable and must never be matched on.
+    ///     Observed on one account inside three weeks: "Instant", "5.6 SolLight",
+    ///     "6Pro" — and "Thinking effort" while its own menu is open. Those come
+    ///     from a model catalogue whose `shortLabel` changes with the model
+    ///     line-up. We locate it structurally instead: the one
+    ///     `button[aria-haspopup="menu"]` sharing the composer toolbar row with
+    ///     `[data-testid="composer-plus-btn"]` (excluding the plus button).
+    ///   * The five intelligence levels are NO LONGER menu items. They are a
+    ///     `[role="slider"]` with `aria-valuenow` 0..4 — Instant, Medium, High,
+    ///     Extra High, Pro — driven with arrow keys. So we verify on the INDEX,
+    ///     which is stable, never on the rendered name, which is not.
+    ///   * Model family is a separate axis: `[role="menuitemradio"]` entries
+    ///     ("Latest", "GPT-5.6 Sol", "GPT-5.5"). A `--model` that isn't a level
+    ///     name is matched against those.
+    ///
+    /// Two clicks must be REAL input events, not `element.click()`: opening the
+    /// picker, and focusing the slider thumb. JS clicks are ignored by both.
     fn select_model(&self, model: &str, deadline: Instant) -> Result<()> {
         let remaining = || {
             deadline
@@ -1043,48 +1143,13 @@ impl Channel {
                 .max(2.0)
         };
 
-        let model_lower = model.trim().to_lowercase();
-        let target_label: &str = match model_lower.as_str() {
-            "pro" => "Pro",
-            "instant" => "Instant",
-            "medium" => "Medium",
-            "high" => "High",
-            "extra high" | "extrahigh" | "extra-high" => "Extra High",
-            _ => model.trim(), // raw label passed through unchanged
-        };
-        let target_json = serde_json::to_string(target_label)
-            .unwrap_or_else(|_| format!("\"{}\"", target_label));
+        let want = model.trim().to_lowercase();
+        let want_level = level_index(&want);
 
-        // Step 1: locate the composer picker button and return its CENTER coords.
-        // The picker is a button whose ENTIRE text is the current level label
-        // (Instant / Medium / High / Extra High / Pro). Search document-wide (the
-        // project page nests the composer deeper than a fixed parent-walk reaches)
-        // and exclude the account/profile button ("ChatGPT Pro …"). The picker can
-        // render a beat after #prompt-textarea, so the caller retries.
-        let js_find_picker = r#"(() => {
-  const LEVELS = ['instant','medium','high','extra high','pro'];
-  const isProfile = el => {
-    const al = (el.getAttribute('aria-label') || '').toLowerCase();
-    return al.includes('profile') || al.includes('account');
-  };
-  for (const b of document.querySelectorAll('button')) {
-    if (isProfile(b)) continue;
-    const txt = (b.textContent || '').trim();
-    if (txt.length === 0 || txt.length > 16) continue;
-    if (!LEVELS.includes(txt.toLowerCase())) continue;
-    const r = b.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) continue;        // not visible
-    if (r.top < 0 || r.left < 0) continue;
-    return JSON.stringify({ok: true, x: Math.round(r.left + r.width/2),
-                           y: Math.round(r.top + r.height/2), label: txt});
-  }
-  return JSON.stringify({ok: false, error: 'composer level picker not found'});
-})()"#;
-
-        // Retry: the picker can appear shortly after the composer.
+        // 1. Locate the picker structurally and open it with a real click.
         let mut pick = serde_json::Value::Null;
         for attempt in 0..6 {
-            pick = ab_eval(&self.ab, js_find_picker, &self.session, remaining())?;
+            pick = ab_eval(&self.ab, JS_FIND_PICKER, &self.session, remaining())?;
             if pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 break;
             }
@@ -1094,79 +1159,138 @@ impl Channel {
         }
         if !pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            bail!("model picker button not found: {detail}");
+            bail!("could not find the composer model picker: {detail}");
         }
-        let (x, y) = match (pick.get("x").and_then(|v| v.as_i64()), pick.get("y").and_then(|v| v.as_i64())) {
+        let (px, py) = match (
+            pick.get("x").and_then(|v| v.as_i64()),
+            pick.get("y").and_then(|v| v.as_i64()),
+        ) {
             (Some(x), Some(y)) => (x, y),
-            _ => bail!("model picker coords missing"),
+            _ => bail!("composer model picker has no usable coordinates"),
+        };
+        ab_cmd(&self.ab, &["click", &px.to_string(), &py.to_string()], &self.session, remaining())
+            .context("opening the composer model picker")?;
+        std::thread::sleep(Duration::from_millis(500));
+
+        let st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+        if !st.get("open").and_then(|v| v.as_bool()).unwrap_or(false) {
+            bail!("clicked the model picker but its menu did not open");
+        }
+
+        let outcome = match want_level {
+            Some(idx) => self.set_level(&st, idx, &remaining),
+            None => self.set_model_family(&st, model.trim(), &remaining),
         };
 
-        // Real CDP click to open the menu (JS .click() does NOT open it).
-        let (xs, ys) = (x.to_string(), y.to_string());
-        ab_cmd(&self.ab, &["click", &xs, &ys], &self.session, remaining())
-            .context("clicking the composer level picker")?;
-        std::thread::sleep(Duration::from_millis(450));
+        // Close the menu whether or not we succeeded, so the composer is usable.
+        let _ = ab_cmd(&self.ab, &["press", "Escape"], &self.session, remaining());
+        outcome
+    }
 
-        // Step 2: click the menu item whose text whole-word matches the target.
-        // Menu items DO respond to JS element.click().
-        let js_select_item = format!(
-            r#"(() => {{
-  const target = {target_json};
-  const norm = s => (s || '').toLowerCase();
-  const wordEq = (txt, t) => {{
-    const tt = norm(t);
-    if (norm(txt) === tt) return true;
-    return norm(txt).split(/[^a-z0-9.]+/).filter(Boolean).includes(tt);
-  }};
-  const items = document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"]');
-  for (const el of items) {{
-    const txt = (el.textContent || '').trim();
-    if (wordEq(txt, target)) {{ el.click(); return JSON.stringify({{ok: true, matched: txt}}); }}
-  }}
-  return JSON.stringify({{ok: false, error: 'menu item not found for: ' + target}});
-}})()"#,
-            target_json = target_json
-        );
-
-        let select_result = ab_eval(&self.ab, &js_select_item, &self.session, remaining())?;
-        if !select_result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let detail = select_result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            bail!("model menu item not found: {detail}");
+    /// Walk the thinking-effort slider to `idx` with arrow keys.
+    fn set_level(
+        &self,
+        st: &serde_json::Value,
+        idx: usize,
+        remaining: &dyn Fn() -> f64,
+    ) -> Result<()> {
+        let slider = st.get("slider").filter(|v| !v.is_null()).ok_or_else(|| {
+            anyhow!(
+                "the composer menu has no thinking-effort slider — ChatGPT has \\
+                 changed this control again. Rerun without --model to use the \\
+                 account default."
+            )
+        })?;
+        let now = slider.get("now").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let max = slider.get("max").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let last = (LEVEL_ORDER.len() - 1) as i64;
+        if max != last {
+            bail!(
+                "the thinking-effort slider now has {} positions but this build \\
+                 knows {} levels ({}) — refusing to guess which is which",
+                max + 1,
+                LEVEL_ORDER.len(),
+                LEVEL_ORDER.join(", ")
+            );
         }
-        std::thread::sleep(Duration::from_millis(350));
+        let (tx, ty) = match (
+            slider.get("thumbX").and_then(|v| v.as_i64()),
+            slider.get("thumbY").and_then(|v| v.as_i64()),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            _ => bail!("the thinking-effort slider has no usable thumb coordinates"),
+        };
 
-        // Step 3: verify the picker label now reflects the target (whole-word).
-        let verify_json = target_json.clone();
-        let js_verify = format!(
-            r#"(() => {{
-  const target = {verify_json};
-  const ta = document.querySelector('#prompt-textarea');
-  let area = ta;
-  for (let i = 0; i < 6 && area && area.parentElement; i++) area = area.parentElement;
-  area = area || document;
-  const norm = s => (s || '').toLowerCase();
-  for (const b of area.querySelectorAll('button')) {{
-    const txt = (b.textContent || '').trim();
-    if (txt.length > 0 && txt.length <= 16 && norm(txt) === norm(target)) {{
-      return JSON.stringify({{ok: true, label: txt}});
-    }}
-  }}
-  return JSON.stringify({{ok: false}});
-}})()"#,
-            verify_json = verify_json
-        );
-        let verified = ab_eval(&self.ab, &js_verify, &self.session, remaining())
-            .ok()
-            .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
-            .unwrap_or(false);
-        if verified {
-            eprintln!("model selected: {target_label:?}");
-        } else {
-            eprintln!("warning: clicked {target_label:?} but could not confirm the picker switched");
+        // A real click on the thumb; this focuses the slider WITHOUT closing the
+        // menu, which `press --selector` does not manage (focusing through a
+        // selector dismisses the popover and the arrow keys go nowhere).
+        ab_cmd(&self.ab, &["click", &tx.to_string(), &ty.to_string()], &self.session, remaining())
+            .context("focusing the thinking-effort slider")?;
+        std::thread::sleep(Duration::from_millis(300));
+
+        let target = idx as i64;
+        let key = if target >= now { "ArrowRight" } else { "ArrowLeft" };
+        for _ in 0..(target - now).abs() {
+            ab_cmd(&self.ab, &["press", key], &self.session, remaining())
+                .context("moving the thinking-effort slider")?;
+            std::thread::sleep(Duration::from_millis(250));
         }
+        std::thread::sleep(Duration::from_millis(300));
 
+        let after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+        let got = after
+            .get("slider")
+            .and_then(|v| v.get("now"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        if got != target {
+            bail!(
+                "could not move the thinking-effort slider to {} ({}): it sits at {}",
+                LEVEL_ORDER[idx],
+                target,
+                got
+            );
+        }
+        let shown = after.get("level").and_then(|v| v.as_str()).unwrap_or("");
+        eprintln!("model: {} (slider {}{})", LEVEL_ORDER[idx], target,
+            if shown.is_empty() { String::new() } else { format!(", shown as {shown:?}") });
         Ok(())
     }
+
+    /// Pick a model family (`Latest`, `GPT-5.5`, …) from the menu's radio items.
+    fn set_model_family(
+        &self,
+        st: &serde_json::Value,
+        want: &str,
+        remaining: &dyn Fn() -> f64,
+    ) -> Result<()> {
+        let empty = vec![];
+        let radios = st.get("radios").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let names: Vec<String> = radios
+            .iter()
+            .filter_map(|r| r.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        let wl = want.to_lowercase();
+        let hit = names.iter().find(|n| n.to_lowercase() == wl).cloned().or_else(|| {
+            names.iter().find(|n| n.to_lowercase().contains(&wl)).cloned()
+        });
+        let Some(hit) = hit else {
+            bail!(
+                "{want:?} is neither a thinking-effort level ({}) nor one of the \\
+                 models this account offers ({})",
+                LEVEL_ORDER.join(", "),
+                if names.is_empty() { "none listed".to_string() } else { names.join(", ") }
+            );
+        };
+
+        let res = ab_eval(&self.ab, &js_click_radio(&hit), &self.session, remaining())?;
+        if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            bail!("could not select model {hit:?}");
+        }
+        eprintln!("model: {hit}");
+        Ok(())
+    }
+
 }
 
 // ---- chrome-use helpers (mirrors _ab / _ab_eval in chatgpt-imagegen) --------
@@ -1240,7 +1364,7 @@ impl TurnLock {
         // Announce a wait rather than appearing to hang: a queued turn can sit
         // here for as long as the turn ahead of it takes.
         if file.try_lock().is_err() {
-            eprintln!("waiting for another chatgpt-use turn to finish…");
+            eprintln!("waiting for another chatgpt turn to finish…");
             if let Err(e) = file.lock() {
                 eprintln!("warning: could not take the channel lock ({e}); proceeding");
                 return TurnLock { _file: None };
@@ -1250,9 +1374,15 @@ impl TurnLock {
     }
 }
 
-/// `~/.chatgpt-use/channel.lock` — alongside the ledger and auth token.
+/// `~/.chatgpt-web.lock` — deliberately NOT under `~/.chatgpt-use/`.
+///
+/// What this guards is the shared ChatGPT web surface, not one tool's state, and
+/// more than one tool drives it (chatgpt-imagegen too). A lock living under one
+/// project's directory invites the other project to pick its own path, and two
+/// names mean no mutual exclusion at all — which is exactly the state that let
+/// two prompts land in one composer.
 fn lock_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-use").join("channel.lock"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-web.lock"))
 }
 
 /// Decide whether the tab has drifted off the pinned conversation.
@@ -1489,6 +1619,35 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn level_index_maps_the_slider_positions() {
+        assert_eq!(level_index("instant"), Some(0));
+        assert_eq!(level_index("Pro"), Some(4));
+        assert_eq!(level_index("extra high"), Some(3));
+        assert_eq!(level_index("extra-high"), Some(3));
+        assert_eq!(level_index("EXTRA   HIGH"), Some(3));
+        assert_eq!(level_index("extrahigh"), Some(3));
+    }
+
+    /// A model family name must fall through to the radio path, not be
+    /// mistaken for an effort level.
+    #[test]
+    fn level_index_rejects_model_family_names() {
+        assert_eq!(level_index("GPT-5.5"), None);
+        assert_eq!(level_index("Latest"), None);
+        assert_eq!(level_index("5.6 Sol"), None);
+    }
+
+    #[test]
+    fn picker_probe_is_structural_not_text_matched() {
+        // The whole point: never key off the button label, which drifts.
+        assert!(JS_FIND_PICKER.contains("composer-plus-btn"));
+        assert!(JS_FIND_PICKER.contains(r#"button[aria-haspopup="menu"]"#));
+        assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
+        assert!(JS_PICKER_MENU.contains(r#"[role="slider"]"#));
+        assert!(JS_PICKER_MENU.contains("aria-valuenow"));
+    }
+
     use super::*;
 
     #[test]
