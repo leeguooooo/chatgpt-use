@@ -635,8 +635,15 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
     return JSON.stringify({{ok: false, error: 'not on chatgpt.com'}});
   }}
   const want = {g};
+  // Only the link to the project PAGE. The sidebar also lists conversations
+  // inside the project, whose hrefs carry the same gizmo id; clicking one opens
+  // that old conversation, and the readiness check (URL contains the gizmo id)
+  // would pass on it, so the new prompt would land in the old chat.
   const link = [...document.querySelectorAll('a[href*="/g/"]')]
-    .find(a => (a.getAttribute('href') || '').includes(want));
+    .find(a => {{
+      const href = a.getAttribute('href') || '';
+      return href.includes(want) && /\/project\/?$/.test(href);
+    }});
   if (!link) return JSON.stringify({{ok: false, error: 'project not in the sidebar'}});
   link.click();
   return JSON.stringify({{ok: true}});
@@ -3282,5 +3289,11 @@ mod tests {
         let js = js_server_final("c-1");
         assert!(js.contains("m.author.role === 'user') break"), "must not reach the previous turn");
         assert!(js.contains("finish_details"));
+    }
+
+    #[test]
+    fn opening_a_project_in_place_only_clicks_the_project_page_link() {
+        let js = js_open_project_in_place("g-p-abc");
+        assert!(js.contains(r"/\/project\/?$/"), "{js}");
     }
 }
