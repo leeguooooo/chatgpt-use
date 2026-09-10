@@ -133,8 +133,63 @@ protocol re-dressed as an Anthropic API so an *existing* harness can wear ChatGP
 ```
 
 Everything page-side goes through `chrome-use eval <js>` (run JS in the page, get JSON back). Sending
-a prompt = fill `#prompt-textarea` + click send. "Reply done" = poll until the stop/streaming control
-disappears, watching for the *"Too many requests"* dialog. All proven in `chatgpt-imagegen`.
+a prompt = fill `#prompt-textarea` + insert text + submit.
+
+That was once the whole design, and the parts that are gone are worth naming, because each was
+removed after it produced a wrong answer rather than an error:
+
+- **"Reply done" is no longer "the page stopped changing."** DOM quiescence is an inference, and it
+  was wrong in both directions — a mid-stream pause read as an ending, and a completed reply read as
+  a 240s timeout while the page had simply stopped rendering. The turn is finished when the server
+  says `end_turn`, which is a fact.
+- **The reply no longer comes from the page.** `innerText` is *rendered* markdown: `**bold**` arrives
+  as `bold`, and a ` ```json ` fence is not there at all — which is exactly why the tool-call parser
+  could never match one. Measured on one 600-word reply, scraping lost 87 characters of syntax.
+  Replies now come from the conversation record.
+- **Text is no longer typed.** A newline handed to `keyboard type` is an Enter, i.e. a *submit*, so
+  every multi-line prompt was being chopped at each `\n` and fired off as that many separate chat
+  messages. The model was answering fragments, which for a long time was misread as the model
+  refusing the protocol.
+
+## When the surface misbehaves
+
+ChatGPT's web app is not an API and does break — during one day of development its project pages
+rendered nothing but a "Try again" button account-wide, and its streaming wedged so the stop control
+never cleared. None of that is a reason for this tool to stop working, because in every one of those
+cases the *model* was fine and only the *page* was broken. So each failure has a way through rather
+than an error message:
+
+| when | instead of failing |
+|---|---|
+| the page never reports the turn finished | ask the server; take the reply from the conversation record |
+| the page wedges mid-generation and the composer locks | reload the pinned conversation to free it |
+| the project page won't render | start in a plain chat, then file the conversation into the project through the API |
+| the account is throttled | back off inside the deadline (20s / 45s / 90s) and keep asking the server — a turn that finished during the throttle is returned, not lost |
+| the tab is closed or navigated away | reattach by conversation id; before the first turn has an id, start a fresh chat |
+
+The rule underneath all of them: **the record is authoritative, the page is a keyboard.** When the
+keyboard locks up, reset it; do not ask it what happened.
+
+## Request economy
+
+chatgpt.com throttles on **requests**, not messages — its own wording is "You're making requests too
+quickly. We've temporarily limited access to your conversations". So the number of HTTP calls per run
+decides how long the tool keeps working, and it is worth counting.
+
+A full navigation to `https://chatgpt.com/` costs **45 backend-api requests**: the SPA cold-boots and
+re-fetches every project's metadata and conversation list separately (18 of the 45, on an account
+with nine projects). The app's own client-side routes do the same jobs for far less.
+
+| action | requests |
+|---|---|
+| navigate to `chatgpt.com` | 45 |
+| the app's own "New chat" | 1 |
+| a sidebar link to an existing conversation | 9 |
+
+So connecting reuses the open tab instead of reloading it, reattaching clicks the sidebar link, the
+bearer token is fetched once per five minutes rather than per call, and a project's id is remembered
+in `~/.chatgpt-use/projects.json` rather than re-listing every project each run. Per-invocation cost
+went from roughly 90 requests to single digits.
 
 ---
 
