@@ -122,6 +122,12 @@ pub struct AskArgs {
     /// For non-ask modes, emit the parsed delegation packet as JSON on stdout.
     #[arg(long)]
     pub json: bool,
+    /// Ask for one JSON value, validate it against this JSON Schema file and
+    /// print ONE result envelope on stdout: status completed | schema_violation
+    /// | unparseable | incomplete | unavailable | failed | schema_error, with a
+    /// matching exit code. Plain ask mode only; implies JSON output.
+    #[arg(long = "output-schema", value_name = "FILE")]
+    pub output_schema: Option<String>,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }

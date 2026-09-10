@@ -225,7 +225,7 @@ pub fn parse_packet(reply: &str) -> Result<DelegationPacket> {
 /// browser channel scrapes the RENDERED message: a fenced code block shows up as
 /// `JSON\n{ … }` (a language label + the code), with NO literal backticks — so a
 /// fence-only parser would reject a perfectly good packet.
-fn extract_json_object(reply: &str) -> Option<String> {
+pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
     // 1. Literal ```json ... ``` fence (raw markdown source case).
     if let Ok(re) = Regex::new(r"(?s)```[jJ][sS][oO][nN]\s*\n(.*?)\n?```") {
         if let Some(m) = re.captures(reply).and_then(|c| c.get(1)) {

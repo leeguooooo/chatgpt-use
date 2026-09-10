@@ -47,6 +47,141 @@ const RATE_LIMIT_MSG: &str =
     "chatgpt.com rate-limited this account ('Too many requests') — the page \
      surface needs a few minutes of quiet before it will serve again.";
 
+/// Why a channel operation failed, in the terms a caller has to act on.
+///
+/// Most failures stay plain `anyhow` errors; only the ones that decide what a
+/// caller should do next are typed. Retrieve one with [`channel_error`] —
+/// it survives any `.context()` layered on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// No signed-in ChatGPT tab could be opened.
+    LoginRequired,
+    /// chatgpt.com's "Too many requests" throttle.
+    RateLimited,
+    /// The chrome-use session is wedged (see `Channel::connect`).
+    SessionUnavailable,
+    /// The turn never completed and the page is showing a dialog we do not
+    /// recognise — a plan or usage-limit notice, say. Its text is in the
+    /// message; we do not guess what it means.
+    PageBlocked,
+    /// Failed before the prompt reached ChatGPT. Safe to retry.
+    NotSubmitted,
+    /// Enter was pressed but no receipt appeared. The prompt may be on the
+    /// server; resending it could post it twice.
+    SubmitUnknown,
+    /// The prompt was sent but no complete reply arrived.
+    Incomplete,
+}
+
+impl ErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::LoginRequired => "login_required",
+            ErrorKind::RateLimited => "rate_limited",
+            ErrorKind::SessionUnavailable => "session_unavailable",
+            ErrorKind::PageBlocked => "page_blocked",
+            ErrorKind::NotSubmitted => "not_submitted",
+            ErrorKind::SubmitUnknown => "submit_unknown",
+            ErrorKind::Incomplete => "incomplete",
+        }
+    }
+
+    /// The caller-facing status this failure maps to. None of them is
+    /// "completed": that status belongs to a reply that exists.
+    pub fn status(self) -> &'static str {
+        match self {
+            ErrorKind::LoginRequired
+            | ErrorKind::RateLimited
+            | ErrorKind::SessionUnavailable
+            | ErrorKind::PageBlocked => "unavailable",
+            ErrorKind::NotSubmitted => "failed",
+            ErrorKind::SubmitUnknown | ErrorKind::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Whether the prompt of the failed turn reached ChatGPT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submitted {
+    No,
+    Yes,
+    Unknown,
+}
+
+impl Submitted {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Submitted::No => "no",
+            Submitted::Yes => "yes",
+            Submitted::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ChannelError {
+    pub kind: ErrorKind,
+    pub submitted: Submitted,
+    message: String,
+}
+
+impl ChannelError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        ChannelError { kind, submitted: Submitted::No, message: message.into() }
+    }
+
+    fn submitted(mut self, submitted: Submitted) -> Self {
+        self.submitted = submitted;
+        self
+    }
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ChannelError {}
+
+/// The typed cause of a channel failure, if it has one.
+pub fn channel_error(e: &anyhow::Error) -> Option<&ChannelError> {
+    e.downcast_ref::<ChannelError>()
+        .or_else(|| e.chain().find_map(|c| c.downcast_ref::<ChannelError>()))
+}
+
+/// Type a failed turn by how far it got. A typed error keeps its kind but
+/// takes its `submitted` from the turn, except `Unknown`, which only the
+/// submit step can know and nothing later may downgrade.
+fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
+    let phase = if submitted { Submitted::Yes } else { Submitted::No };
+    if let Some(ce) = e.downcast_mut::<ChannelError>() {
+        if ce.submitted != Submitted::Unknown {
+            ce.submitted = phase;
+        }
+        return e;
+    }
+    let (kind, label) = if submitted {
+        (ErrorKind::Incomplete, "the prompt was sent but the reply did not complete")
+    } else {
+        (ErrorKind::NotSubmitted, "the prompt was not sent")
+    };
+    e.context(ChannelError::new(kind, label).submitted(phase))
+}
+
+// JS: is this the signed-out page? Its login/sign-up buttons, or an auth URL.
+const JS_WANTS_LOGIN: &str = r#"(() => JSON.stringify({login:
+  /\/auth\/|auth\.openai\.com/.test(location.href) ||
+  !!document.querySelector('[data-testid="login-button"],[data-testid="signup-button"]')}))()"#;
+
+// JS: text of a visible dialog, if any. Read only once a turn has stalled, to
+// report WHAT is blocking it rather than guess (a usage-limit notice, say).
+const JS_BLOCKING_DIALOG: &str = r#"(() => {
+  const d = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]
+    .find(x => x.getClientRects().length > 0);
+  return JSON.stringify({text: d ? (d.innerText || '').trim().slice(0, 400) : ''});
+})()"#;
+
 // JS: poll composer presence + rate-limit dialog (mirrors _JS_COMPOSER in chatgpt-imagegen).
 const JS_COMPOSER: &str = r#"(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
@@ -605,6 +740,9 @@ pub struct Channel {
     /// when the project page fails to render. Cleared once the conversation has
     /// been moved server-side.
     pending_project: Option<String>,
+    /// Whether the current turn's prompt is known to be on the server; decides
+    /// how a failure of that turn is typed (see `classify`).
+    submitted: bool,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -649,6 +787,12 @@ impl Channel {
 
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut opened = false;
+        // "Sign in" is advice only for a page that actually asked for it. A
+        // relay that cannot attach, or a page that never renders, used to end
+        // in the same "no logged-in browser" line — sending the user off to
+        // fix the one thing that was working.
+        let mut saw_login = false;
+        let mut last_failure: Option<String> = None;
 
         // Reuse the tab this session already has, if it is a usable ChatGPT
         // page. Navigating instead costs 45 backend-api requests to re-boot the
@@ -687,13 +831,19 @@ impl Channel {
                 }
                 Ok(false) => {
                     // composer never appeared — try next candidate
+                    if page_wants_login(&ab, &session) {
+                        saw_login = true;
+                    } else {
+                        last_failure =
+                            Some(format!("{label}: the ChatGPT page never showed its composer"));
+                    }
                     ab_close(&ab, &session);
                 }
                 Err(e) => {
                     ab_close(&ab, &session);
                     let msg = e.to_string();
                     if msg.contains("rate-limited") || msg.contains("Too many") {
-                        bail!("{}", RATE_LIMIT_MSG);
+                        return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
                     }
                     // A chrome-use session name can go temporarily unusable: a
                     // command that runs too long is judged unresponsive and its
@@ -708,7 +858,7 @@ impl Channel {
                     // chatgpt.com" tells the user to fix the one thing that is
                     // not broken. Say what happened and give a way through now.
                     if msg.contains("session unresponsive") || msg.contains("stuck") {
-                        bail!(
+                        return Err(ChannelError::new(ErrorKind::SessionUnavailable, format!(
                             "the chrome-use session {session:?} is wedged — every command on \
                              that name is returning \"session unresponsive\". You are still \
                              signed in; this is not a login problem.\n\n  Use another name \
@@ -717,20 +867,38 @@ impl Channel {
                              `keyboard inserttext`, say) being judged unresponsive. The name \
                              frees itself later — about an hour, in the case we measured — so \
                              the original is worth retrying rather than abandoning."
-                        );
+                        ))
+                        .into());
                     }
                     // other errors: log and try the next candidate
                     eprintln!("warning: {label} failed: {e}");
+                    last_failure = Some(format!("{label}: {e}"));
                 }
             }
         }
 
+        if let (false, false, Some(last)) = (opened, saw_login, &last_failure) {
+            return Err(ChannelError::new(
+                ErrorKind::SessionUnavailable,
+                format!(
+                    "could not open ChatGPT through chrome-use (tried {} candidate(s)). This is \
+                     the browser connection, not your login. Last failure — {last}\n\n  \
+                     Check:  chrome-use status",
+                    candidates.len()
+                ),
+            )
+            .into());
+        }
         if !opened {
-            bail!(
-                "no logged-in ChatGPT browser available (tried {} candidate(s)). \
-                 Sign in to chatgpt.com in Chrome.",
-                candidates.len()
-            );
+            return Err(ChannelError::new(
+                ErrorKind::LoginRequired,
+                format!(
+                    "no logged-in ChatGPT browser available (tried {} candidate(s)). \
+                     Sign in to chatgpt.com in Chrome.",
+                    candidates.len()
+                ),
+            )
+            .into());
         }
 
         let mut chan = Channel {
@@ -740,6 +908,7 @@ impl Channel {
             project: opts.project.trim().to_string(),
             convo_id: None,
             pending_project: None,
+            submitted: false,
             _surface: surface,
         };
 
@@ -1166,8 +1335,29 @@ impl Channel {
         self.send_with(message, &SendOptions::default())
     }
 
+    /// The conversation this channel is pinned to, once a turn has latched one.
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.convo_id.as_deref()
+    }
+
+    /// Text of a visible dialog on the page, if one is up.
+    fn blocking_dialog(&self, budget: f64) -> Option<String> {
+        let v = ab_eval(&self.ab, JS_BLOCKING_DIALOG, &self.session, budget).ok()?;
+        let text = v.get("text")?.as_str()?.trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Send one message with explicit completion tuning (see `SendOptions`).
+    ///
+    /// A failure carries a [`ChannelError`] saying whether the prompt reached
+    /// ChatGPT, so a caller knows if retrying could post it twice.
     pub fn send_with(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+        self.submitted = false;
+        let result = self.send_turn(message, sopts);
+        result.map_err(|e| classify(e, self.submitted))
+    }
+
+    fn send_turn(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
 
         let remaining_secs = || {
@@ -1253,6 +1443,10 @@ impl Channel {
             }
         }
 
+        // Past this point the prompt is on the server: any failure from here
+        // on means an incomplete turn, never "not sent, safe to resend".
+        self.submitted = true;
+
         // Re-read the assistant baseline: if we reattached above, the reloaded
         // page reflects the server's view and the pre-crash count is meaningless.
         let baseline_count = baseline_count.min(
@@ -1313,10 +1507,28 @@ impl Channel {
                         return self.finish_turn(text, remaining_secs());
                     }
                 }
-                bail!(
-                    "timed out after {}s waiting for ChatGPT to complete the reply",
-                    self.timeout_secs
-                );
+                // Say what is in the way if something visibly is. A plan or
+                // usage limit shows up as a dialog whose wording we cannot
+                // trigger on demand to match against, so report its text.
+                if let Some(text) = self.blocking_dialog(10.0) {
+                    return Err(ChannelError::new(
+                        ErrorKind::PageBlocked,
+                        format!(
+                            "the reply did not complete after {}s and ChatGPT is showing a \
+                             dialog: {text:?}",
+                            self.timeout_secs
+                        ),
+                    )
+                    .into());
+                }
+                return Err(ChannelError::new(
+                    ErrorKind::Incomplete,
+                    format!(
+                        "timed out after {}s waiting for ChatGPT to complete the reply",
+                        self.timeout_secs
+                    ),
+                )
+                .into());
             }
             std::thread::sleep(poll_interval);
 
@@ -1411,11 +1623,15 @@ impl Channel {
                     _ => 90,
                 });
                 if Instant::now() + backoff >= deadline {
-                    bail!(
-                        "{} The prompt was already submitted; check the conversation \
-                         or retry in a few minutes.",
-                        RATE_LIMIT_MSG
-                    );
+                    return Err(ChannelError::new(
+                        ErrorKind::RateLimited,
+                        format!(
+                            "{} The prompt was already submitted; check the conversation \
+                             or retry in a few minutes.",
+                            RATE_LIMIT_MSG
+                        ),
+                    )
+                    .into());
                 }
                 eprintln!(
                     "[{:5}.0s] rate-limited by the page; waiting {}s (attempt {}) — the reply \
@@ -1935,7 +2151,19 @@ enum SubmitFailure {
 impl SubmitFailure {
     fn into_error(self) -> anyhow::Error {
         match self {
-            SubmitFailure::BeforeSubmit(e) | SubmitFailure::Ambiguous(e) => e,
+            SubmitFailure::BeforeSubmit(e) => e,
+            // Whatever the proximate cause, the prompt may be on the server and
+            // the caller must not resend it.
+            SubmitFailure::Ambiguous(mut e) => {
+                if let Some(ce) = e.downcast_mut::<ChannelError>() {
+                    ce.submitted = Submitted::Unknown;
+                    return e;
+                }
+                e.context(
+                    ChannelError::new(ErrorKind::SubmitUnknown, "the prompt may or may not have been sent")
+                        .submitted(Submitted::Unknown),
+                )
+            }
         }
     }
 }
@@ -2347,6 +2575,15 @@ fn try_open(
     wait_composer(ab, session, deadline, 15)
 }
 
+/// Whether the open page is ChatGPT's signed-out screen. Anything we cannot
+/// read counts as "no": a login claim needs positive evidence.
+fn page_wants_login(ab: &PathBuf, session: &str) -> bool {
+    ab_eval(ab, JS_WANTS_LOGIN, session, 10.0)
+        .ok()
+        .and_then(|v| v.get("login").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
 /// Poll until `#prompt-textarea` is on the page (mirrors `_wait_composer`).
 /// Returns `Ok(true)` when the composer is ready, `Ok(false)` on timeout.
 /// Bails with an error if the rate-limit dialog is detected.
@@ -2367,7 +2604,7 @@ fn wait_composer(
         match ab_eval(ab, JS_COMPOSER, session, remaining) {
             Ok(st) if st.is_object() => {
                 if st.get("limited").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    bail!("{}", RATE_LIMIT_MSG);
+                    return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
                 }
                 if st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false) {
                     return Ok(true);
@@ -2612,5 +2849,59 @@ mod tests {
         // /bin/sh should always exist on Unix.
         let result = which_bin("sh");
         assert!(result.is_some(), "sh should be findable on PATH");
+    }
+
+    fn typed(kind: ErrorKind) -> anyhow::Error {
+        ChannelError::new(kind, "boom").into()
+    }
+
+    #[test]
+    fn channel_error_survives_context_layers() {
+        let e = typed(ErrorKind::RateLimited).context("resubmitting").context("outer");
+        assert_eq!(channel_error(&e).map(|c| c.kind), Some(ErrorKind::RateLimited));
+    }
+
+    #[test]
+    fn untyped_failures_are_typed_by_how_far_the_turn_got() {
+        let before = classify(anyhow!("tab vanished"), false);
+        let ce = channel_error(&before).unwrap();
+        assert_eq!((ce.kind, ce.submitted), (ErrorKind::NotSubmitted, Submitted::No));
+        assert!(format!("{before:#}").contains("tab vanished"), "the cause is kept");
+
+        let after = classify(anyhow!("page swapped"), true);
+        let ce = channel_error(&after).unwrap();
+        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+    }
+
+    #[test]
+    fn a_typed_failure_keeps_its_kind_and_takes_the_turn_phase() {
+        let e = classify(typed(ErrorKind::RateLimited).context("while polling"), true);
+        let ce = channel_error(&e).unwrap();
+        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Yes));
+    }
+
+    #[test]
+    fn nothing_downgrades_an_ambiguous_submit() {
+        for phase in [false, true] {
+            let e = SubmitFailure::Ambiguous(anyhow!("no receipt")).into_error();
+            let e = classify(e.context("x"), phase);
+            let ce = channel_error(&e).map(|c| (c.kind, c.submitted));
+            assert_eq!(ce, Some((ErrorKind::SubmitUnknown, Submitted::Unknown)));
+        }
+        // Also when the ambiguity was itself caused by a typed failure.
+        let e = SubmitFailure::Ambiguous(typed(ErrorKind::RateLimited)).into_error();
+        let e = classify(e, false);
+        let ce = channel_error(&e).unwrap();
+        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Unknown));
+    }
+
+    #[test]
+    fn no_failure_maps_to_completed() {
+        use ErrorKind::*;
+        for k in [LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown, Incomplete] {
+            assert_ne!(k.status(), "completed", "{k:?}");
+        }
+        assert_eq!(Incomplete.status(), "incomplete");
+        assert_eq!(RateLimited.status(), "unavailable");
     }
 }

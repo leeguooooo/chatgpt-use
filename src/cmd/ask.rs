@@ -15,13 +15,19 @@
 use crate::channel::{Channel, ChannelOptions};
 use crate::cli::AskArgs;
 use crate::delegation::{self, Mode};
+use crate::structured;
 use anyhow::{Context, Result};
 use std::fs;
 
 pub fn run(args: &AskArgs) -> Result<()> {
     let opts = channel_opts_from_args(args);
 
-    if args.mode == Mode::Ask {
+    if let Some(schema) = &args.output_schema {
+        if args.mode != Mode::Ask {
+            anyhow::bail!("--output-schema works with plain ask only, not --mode {:?}", args.mode);
+        }
+        run_schema_mode(args, opts, schema)
+    } else if args.mode == Mode::Ask {
         run_ask_mode(args, opts)
     } else {
         run_delegation_mode(args, opts)
@@ -30,8 +36,8 @@ pub fn run(args: &AskArgs) -> Result<()> {
 
 // ---- Mode::Ask (unchanged plain-text behavior) ------------------------------
 
-fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
-    // Build the message: prepend each --file as a fenced context block, then the prompt.
+/// The ask message: each --file as a fenced context block, then the prompt.
+fn ask_message(args: &AskArgs) -> Result<String> {
     let mut message = String::new();
 
     for file_path in &args.files {
@@ -43,6 +49,11 @@ fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     }
 
     message.push_str(&args.prompt);
+    Ok(message)
+}
+
+fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
+    let message = ask_message(args)?;
 
     // Connect, send one turn, print the reply, always close.
     let mut channel = Channel::connect(&opts)?;
@@ -61,6 +72,55 @@ fn run_ask_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     );
     println!("{text}");
 
+    Ok(())
+}
+
+// ---- --output-schema --------------------------------------------------------
+
+/// Structured ask. Every outcome, failures included, is ONE JSON envelope on
+/// stdout with an exit code to match (see `structured`); progress stays on
+/// stderr. Never returns Err: a caller parsing stdout must always get a line.
+fn run_schema_mode(args: &AskArgs, opts: ChannelOptions, schema_path: &str) -> Result<()> {
+    let envelope = match structured::Schema::load(schema_path) {
+        Err(why) => structured::schema_error(&why),
+        Ok(schema) => match ask_message(args) {
+            Err(e) => structured::failure(&e),
+            Ok(request) => {
+                let message = structured::build_message(&request, &schema);
+                match Channel::connect(&opts) {
+                    Err(e) => structured::failure(&e),
+                    Ok(mut channel) => {
+                        let reply = channel.send(&message);
+                        let convo = channel.conversation_id().map(str::to_string);
+                        channel.close();
+                        let mut envelope = structured::evaluate(reply, &schema);
+                        if let Some(id) = convo {
+                            envelope["conversation_id"] = id.into();
+                        }
+                        envelope
+                    }
+                }
+            }
+        },
+    };
+
+    let status = envelope["status"].as_str().unwrap_or("failed").to_string();
+    crate::ledger::record(
+        "ask_schema",
+        serde_json::json!({
+            "prompt_chars": args.prompt.len(),
+            "files": args.files.len(),
+            "model": args.channel.model,
+            "status": status,
+        }),
+    );
+    println!("{envelope}");
+    let code = structured::exit_code(&status);
+    if code != 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
     Ok(())
 }
 

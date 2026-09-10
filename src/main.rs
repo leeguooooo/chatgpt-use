@@ -14,6 +14,7 @@ mod delegation; // structured delegation packets (the planner/reviewer main line
 mod ledger; // append-only audit trail at ~/.chatgpt-use/ledger.jsonl
 mod oauth; // OAuth 2.1 + PKCE provider for the MCP server
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
+mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
 
 use clap::Parser;

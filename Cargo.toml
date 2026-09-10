@@ -20,6 +20,10 @@ walkdir = "2"
 regex = "1"
 sha2 = "0.10"
 base64 = "0.22"
+# JSON Schema validation for `ask --output-schema`. No default features: those
+# pull an HTTP client (reqwest + a TLS stack) only to fetch remote $refs, which
+# a caller's schema must not need.
+jsonschema = { version = "0.55", default-features = false }
 
 [profile.release]
 strip = true

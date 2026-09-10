@@ -59,6 +59,32 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
   (`relay` → logged-in profile), composer polling, rate-limit-dialog detection, in-page
   authenticated `fetch`, and conversation filing under a ChatGPT **Project**.
 
+#### Structured output — `ask --output-schema`
+
+For a caller that parses the answer (a PR-review service, a CI step), pass a JSON Schema. The
+reply is validated locally, and stdout carries **one JSON line**, whatever happened:
+
+```bash
+chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json
+```
+
+| `status` | meaning | exit |
+|---|---|---|
+| `completed` | `result` is present and validated against your schema | 0 |
+| `schema_violation` | valid JSON, wrong shape; `errors[]` carries `{path, message}`, plus `raw` | 3 |
+| `unparseable` | no parseable JSON in the reply (prose, truncated output); `raw` has the text | 4 |
+| `incomplete` | the prompt was sent but no complete reply arrived | 5 |
+| `unavailable` | throttled, signed out, wedged session, or a blocking dialog (its text is quoted) | 6 |
+| `failed` | failed before anything was sent (e.g. a context file would not read) | 1 |
+| `schema_error` | your schema would not load or compile; nothing was sent | 8 |
+
+Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
+`unknown` means Enter was pressed but no receipt appeared, so a retry could post the prompt
+twice. No failure is ever reported as `completed` with an empty result. A reply that fails
+validation is **not** repaired with a follow-up turn: that would be another paid turn you did not
+ask for, so the decision to retry stays with the caller. Schemas must be self-contained, because
+a remote `$ref` is not fetched.
+
 ### Mode 2 · 大脑 / Brain — `chatgpt-use run`
 
 ![brain](assets/mode2-brain.png)
