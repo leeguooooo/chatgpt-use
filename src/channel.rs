@@ -1381,6 +1381,10 @@ impl SubmitFailure {
 /// conversation and could reattach), and then failed itself because the tab had
 /// moved on again by the time it got the lock. Whoever holds the surface owns
 /// the tab for as long as it needs it.
+///
+/// Verified with two concurrent `ask` runs: the second prints its wait line
+/// BEFORE "opening ChatGPT", i.e. it blocks before touching the browser at all,
+/// and both turns then complete with neither having to reattach.
 struct SurfaceLock {
     _file: Option<File>,
 }
