@@ -30,6 +30,7 @@ jobs:
           - { os: macos-14,      target: x86_64-apple-darwin }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,6 +55,7 @@ jobs:
 
       - name: Package
         id: package
+        if: matrix.os != 'windows-latest'
         run: |
           BIN=chatgpt-use
           ASSET="$BIN-${{ matrix.target }}.tar.gz"
@@ -61,10 +63,32 @@ jobs:
           if command -v sha256sum >/dev/null; then sha256sum "$ASSET" > "$ASSET.sha256"; else shasum -a 256 "$ASSET" > "$ASSET.sha256"; fi
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
+      - name: Package (Windows)
+        id: package-windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "chatgpt-use-${{ matrix.target }}"
+          $asset = "$bin.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/chatgpt-use.exe" -DestinationPath $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File "$asset.sha256" -Encoding ascii
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
+        if: matrix.os != 'windows-latest'
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.asset }}.sha256
+
+      - name: Upload Windows release
+        uses: softprops/action-gh-release@v2
+        if: matrix.os == 'windows-latest'
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package-windows.outputs.asset }}
+            ${{ steps.package-windows.outputs.asset }}.sha256

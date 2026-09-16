@@ -13,6 +13,7 @@ mod cmd; // subcommand entry points (ask / run / serve / mcp / handoff)
 mod delegation; // structured delegation packets (the planner/reviewer main line)
 mod ledger; // append-only audit trail at ~/.chatgpt-use/ledger.jsonl
 mod oauth; // OAuth 2.1 + PKCE provider for the MCP server
+mod platform; // OS-specific paths and process conventions
 mod receipt; // ask --request-id: durable per-request receipts
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
 mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema

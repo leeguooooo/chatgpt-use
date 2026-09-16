@@ -166,6 +166,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "getrandom",
  "jsonschema",
  "regex",
  "serde",

@@ -156,12 +156,23 @@ pub fn live_state(r: &Receipt, alive: impl Fn(u32) -> bool) -> String {
 
 /// Whether `pid` is still a chatgpt-use process. Pids are reused, and `cancel`
 /// signals this pid, so a live process that is something else must not count.
+#[cfg(unix)]
 pub fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .stderr(std::process::Stdio::null())
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("chatgpt-use"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist.exe")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).to_lowercase().contains("chatgpt-use"))
         .unwrap_or(false)
 }
 

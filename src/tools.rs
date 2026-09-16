@@ -528,7 +528,8 @@ fn format_output(stdout: &str, stderr: &str, exit_code: i32, note: Option<&str>)
     result
 }
 
-/// Original stateless behavior: one fresh `sh -c` at `cwd`, no timeout.
+/// Original stateless behavior: one fresh platform shell at `cwd`, no timeout.
+#[cfg(unix)]
 fn run_oneshot(command: &str, cwd: &Path, perm: PermissionMode) -> Result<String, String> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command).current_dir(cwd);
@@ -541,10 +542,23 @@ fn run_oneshot(command: &str, cwd: &Path, perm: PermissionMode) -> Result<String
     Ok(format_output(&stdout, &stderr, output.status.code().unwrap_or(-1), None))
 }
 
+#[cfg(windows)]
+fn run_oneshot(command: &str, cwd: &Path, perm: PermissionMode) -> Result<String, String> {
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command])
+        .current_dir(cwd);
+    apply_env_filter(&mut cmd, perm);
+    let output = cmd.output().map_err(|e| format!("bash: failed to spawn PowerShell: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(format_output(&stdout, &stderr, output.status.code().unwrap_or(-1), None))
+}
+
 /// Persistent-terminal behavior: the working directory and exported env carry
 /// over between calls, with a per-command timeout. Output is redirected to files
 /// inside the state dir (no pipes → no buffer deadlock while we poll for the
 /// timeout). On timeout the child is killed and partial output is returned.
+#[cfg(unix)]
 fn run_persistent(
     command: &str,
     default_cwd: &Path,
@@ -628,6 +642,47 @@ fn run_persistent(
     } else {
         None
     };
+    Ok(format_output(&stdout, &stderr, exit_code, note.as_deref()))
+}
+
+#[cfg(windows)]
+fn run_persistent(
+    command: &str,
+    default_cwd: &Path,
+    perm: PermissionMode,
+    cfg: &ShellConfig,
+) -> Result<String, String> {
+    let dir = &cfg.state_dir;
+    std::fs::create_dir_all(dir).map_err(|e| format!("bash: cannot create state dir: {e}"))?;
+    let cwd_file = dir.join("cwd");
+    let env_file = dir.join("env");
+    let out_file = dir.join("out");
+    let err_file = dir.join("err");
+    let _ = std::fs::remove_file(&out_file);
+    let _ = std::fs::remove_file(&err_file);
+    let q = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
+    let script = format!(
+        "$cwdFile={cwd}; $envFile={env}; $outFile={out}; $errFile={err}; if (Test-Path $cwdFile) {{ $saved=Get-Content $cwdFile -Raw; if ($saved) {{ Set-Location $saved.Trim() }} }} else {{ Set-Location {def} }}; if (Test-Path $envFile) {{ $savedEnv=Get-Content $envFile -Raw | ConvertFrom-Json; $savedEnv | ForEach-Object {{ Set-Item \"Env:$($_.Name)\" $_.Value }} }}; & {{\n{cmd}\n}} 2> $errFile | Out-File -FilePath $outFile -Encoding utf8; $rc=if ($LASTEXITCODE -ne $null) {{ $LASTEXITCODE }} else {{ 0 }}; (Get-Location).Path | Set-Content $cwdFile; Get-ChildItem Env: | Select-Object Name,Value | ConvertTo-Json -Compress | Set-Content $envFile; exit $rc",
+        cwd=q(&cwd_file), env=q(&env_file), out=q(&out_file), err=q(&err_file), def=q(default_cwd), cmd=command
+    );
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .current_dir(default_cwd);
+    apply_env_filter(&mut cmd, perm);
+    let mut child = cmd.spawn().map_err(|e| format!("bash: failed to spawn PowerShell: {e}"))?;
+    let mut timed_out = false;
+    let exit_code = if cfg.timeout_secs == 0 { child.wait().map_err(|e| format!("bash: wait failed: {e}"))?.code().unwrap_or(-1) } else {
+        let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
+        loop { match child.try_wait() {
+            Ok(Some(s)) => break s.code().unwrap_or(-1),
+            Ok(None) if Instant::now() >= deadline => { let _ = child.kill(); let _ = child.wait(); timed_out = true; break -1; }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(format!("bash: wait failed: {e}")),
+        }}
+    };
+    let stdout = std::fs::read_to_string(&out_file).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&err_file).unwrap_or_default();
+    let note = timed_out.then(|| format!("[timed out after {}s — process killed; output is partial]", cfg.timeout_secs));
     Ok(format_output(&stdout, &stderr, exit_code, note.as_deref()))
 }
 
@@ -1059,19 +1114,22 @@ mod tests {
         let cfg = shell_cfg("cwd", 30);
         let def = std::env::temp_dir();
         // First command changes directory…
-        let r1 = run_persistent("cd /tmp && echo step1", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let first = if cfg!(windows) { "Set-Location $env:TEMP; Write-Output step1" } else { "cd /tmp && echo step1" };
+        let r1 = run_persistent(first, &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(r1.contains("step1"), "r1: {r1}");
         // …and the next command should already be there.
         let r2 = run_persistent("pwd", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(r2.contains("tmp"), "cwd should persist to /tmp, got: {r2}");
+        assert!(r2.to_lowercase().contains("temp"), "cwd should persist to temp, got: {r2}");
     }
 
     #[test]
     fn persistent_shell_keeps_exported_env() {
         let cfg = shell_cfg("env", 30);
         let def = std::env::temp_dir();
-        run_persistent("export GREETING=hi_there_42", &def, PermissionMode::Trusted, &cfg).unwrap();
-        let r = run_persistent("echo $GREETING", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let set = if cfg!(windows) { "$env:GREETING='hi_there_42'" } else { "export GREETING=hi_there_42" };
+        let get = if cfg!(windows) { "Write-Output $env:GREETING" } else { "echo $GREETING" };
+        run_persistent(set, &def, PermissionMode::Trusted, &cfg).unwrap();
+        let r = run_persistent(get, &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(r.contains("hi_there_42"), "exported env should persist, got: {r}");
     }
 
@@ -1080,7 +1138,8 @@ mod tests {
         let cfg = shell_cfg("timeout", 1);
         let def = std::env::temp_dir();
         let start = Instant::now();
-        let r = run_persistent("sleep 10 && echo done", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let hung = if cfg!(windows) { "Start-Sleep 10; Write-Output done" } else { "sleep 10 && echo done" };
+        let r = run_persistent(hung, &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(start.elapsed() < Duration::from_secs(6), "should be killed near the 1s timeout");
         assert!(r.contains("timed out"), "should report a timeout, got: {r}");
         assert!(!r.contains("done"), "the command should not have completed");

@@ -105,6 +105,11 @@ fn cancel(args: &CancelArgs) -> Value {
 
 /// Signal the live owner and wait for it to record how the cancel ended.
 fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
+    #[cfg(windows)]
+    let sent = std::process::Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    #[cfg(not(windows))]
     let sent = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
