@@ -2757,18 +2757,45 @@ fn convo_drift(pinned: &str, current: Option<&str>) -> Option<String> {
 }
 
 fn find_chrome_use() -> Option<PathBuf> {
+    // Prefer a companion binary next to chatgpt-use. This makes portable
+    // Windows installs work even when the user's PATH is full or stale.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in AB_BIN_CANDIDATES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                #[cfg(windows)]
+                {
+                    let candidate = dir.join(format!("{name}.exe"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
     for name in AB_BIN_CANDIDATES {
         if let Some(p) = which_bin(name) {
             return Some(p);
         }
     }
     // Also check ~/.local/bin — common for manual installs on macOS/Linux.
-    if let Some(home) = std::env::var_os("HOME") {
-        let local_bin = PathBuf::from(home).join(".local").join("bin");
-        for name in AB_BIN_CANDIDATES {
-            let candidate = local_bin.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+    if let Some(home) = crate::platform::home_dir() {
+        for local_bin in [home.join("chrome-tools"), home.join(".local").join("bin")] {
+            for name in AB_BIN_CANDIDATES {
+                let candidate = local_bin.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                #[cfg(windows)]
+                {
+                    let candidate = local_bin.join(format!("{name}.exe"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
             }
         }
     }
@@ -2778,7 +2805,7 @@ fn find_chrome_use() -> Option<PathBuf> {
 /// Minimal `which`-equivalent: search PATH for a binary name.
 fn which_bin(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
+    for dir in path_var.split(crate::platform::path_separator()) {
         if dir.is_empty() {
             continue;
         }
@@ -3194,10 +3221,9 @@ mod tests {
     }
 
     #[test]
-    fn which_bin_finds_sh_on_unix() {
-        // /bin/sh should always exist on Unix.
-        let result = which_bin("sh");
-        assert!(result.is_some(), "sh should be findable on PATH");
+    fn which_bin_finds_platform_shell() {
+        let shell = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        assert!(which_bin(shell).is_some(), "{shell} should be findable on PATH");
     }
 
     fn typed(kind: ErrorKind) -> anyhow::Error {

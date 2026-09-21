@@ -409,6 +409,16 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
 
 > Distribution follows the GitHub-Release route (no npm, no token). Once the first binary ships:
 
+Windows PowerShell users can install the latest Windows release with:
+
+```powershell
+irm https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.ps1 | iex
+```
+
+On Windows, the `bash` tool runs commands through PowerShell (`powershell.exe`),
+and its persistent working directory/environment are retained between calls.
+The browser dependency (`chrome-use`) must also be installed and available on `PATH`.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
 ```
