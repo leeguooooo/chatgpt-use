@@ -18,7 +18,8 @@ try {
   Copy-Item (Join-Path $tmp 'chatgpt-use.exe') (Join-Path $binDir 'chatgpt-use.exe') -Force
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (($userPath -split ';') -notcontains $binDir -and (($env:Path -split ';') -notcontains $binDir)) {
-    $newPath = (($userPath.TrimEnd(';') + ';' + $binDir).Trim(';'))
+    $currentUserPath = if ($userPath) { $userPath.TrimEnd(';') } else { '' }
+    $newPath = (($currentUserPath + ';' + $binDir).Trim(';'))
     if ($newPath.Length -le 2047) { [Environment]::SetEnvironmentVariable('Path', $newPath, 'User') }
     else { Write-Warning "PATH is too long; add $binDir manually or use a PowerShell profile alias." }
   }

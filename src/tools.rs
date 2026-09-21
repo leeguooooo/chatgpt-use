@@ -422,15 +422,37 @@ fn destructive_reason(cmd: &str) -> Option<String> {
     let pats = [
         "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -fr /", "rm -rf --no-preserve-root",
         "mkfs", "dd if=", ":(){", "> /dev/sd", "of=/dev/", "chmod -r 777 /", "chown -r",
+        // PowerShell / cmd.exe equivalents (Windows runs commands in PowerShell).
+        "format-volume", "clear-disk", "initialize-disk", "remove-partition",
+        "format c:", "rd /s /q c:\\", "rmdir /s /q c:\\", "del /s /q c:\\",
     ];
-    pats.iter()
-        .find(|p| c.contains(**p))
-        .map(|p| format!("destructive pattern {p:?}"))
+    if let Some(p) = pats.iter().find(|p| c.contains(**p)) {
+        return Some(format!("destructive pattern {p:?}"));
+    }
+    // `Remove-Item -Recurse` (or its aliases) aimed at a drive root or home.
+    let removes = ["remove-item", "rm ", "ri ", "del ", "rmdir ", "rd ", "erase "];
+    let roots = [" c:\\", " c:/", " \\ ", " / ", " ~", " $home", " $env:userprofile", " $env:systemroot"];
+    if c.contains("-recurse")
+        && removes.iter().any(|r| c.contains(r))
+        && roots.iter().any(|r| format!("{c} ").contains(r))
+    {
+        return Some("recursive Remove-Item on a root or home directory".to_string());
+    }
+    None
 }
 
 /// Network-reaching commands, blocked in `safe` mode.
 fn network_reason(cmd: &str) -> Option<String> {
-    let tools = ["curl", "wget", "nc ", "ncat", "netcat", "ssh ", "scp ", "sftp", "telnet", "ftp "];
+    let tools = [
+        "curl", "wget", "nc ", "ncat", "netcat", "ssh ", "scp ", "sftp", "telnet", "ftp ",
+        // PowerShell cmdlets and aliases, plus Windows-native downloaders.
+        "invoke-webrequest", "invoke-restmethod", "iwr", "irm", "start-bitstransfer",
+        "test-netconnection", "bitsadmin", "certutil",
+    ];
+    let cmd = &cmd.to_lowercase();
+    if cmd.contains("net.webclient") || cmd.contains("net.http.httpclient") || cmd.contains("net.sockets.") {
+        return Some("network command \"System.Net\"".to_string());
+    }
     // crude word-ish check on the command head + after pipes/&&/;
     let segments: Vec<&str> = cmd.split(|ch| ch == '|' || ch == ';' || ch == '&').collect();
     for seg in segments {
@@ -675,7 +697,11 @@ fn run_persistent(
         let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
         loop { match child.try_wait() {
             Ok(Some(s)) => break s.code().unwrap_or(-1),
-            Ok(None) if Instant::now() >= deadline => { let _ = child.kill(); let _ = child.wait(); timed_out = true; break -1; }
+            Ok(None) if Instant::now() >= deadline => {
+                // Kill the whole tree: PowerShell's children outlive a plain kill.
+                let _ = Command::new("taskkill.exe").args(["/PID", &child.id().to_string(), "/T", "/F"]).status();
+                let _ = child.kill(); let _ = child.wait(); timed_out = true; break -1;
+            }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(format!("bash: wait failed: {e}")),
         }}
@@ -971,6 +997,19 @@ fn prompt_approval(description: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_blocks_powershell_network_and_destructive() {
+        assert!(gate_command("Invoke-WebRequest https://x.test -OutFile a", PermissionMode::Safe).is_some());
+        assert!(gate_command("iwr https://x.test", PermissionMode::Safe).is_some());
+        assert!(gate_command("(New-Object Net.WebClient).DownloadString('u')", PermissionMode::Safe).is_some());
+        assert!(gate_command("Invoke-WebRequest https://x.test", PermissionMode::Trusted).is_none());
+        assert!(gate_command("Remove-Item -Recurse -Force C:\\", PermissionMode::Trusted).is_some());
+        assert!(gate_command("Remove-Item -Recurse -Force $HOME", PermissionMode::Trusted).is_some());
+        assert!(gate_command("Format-Volume -DriveLetter D", PermissionMode::Trusted).is_some());
+        assert!(gate_command("Remove-Item -Recurse .\\build", PermissionMode::Trusted).is_none());
+        assert!(gate_command("Get-ChildItem", PermissionMode::Safe).is_none());
+    }
     use serde_json::json;
     use std::fs;
 
@@ -1119,7 +1158,8 @@ mod tests {
         assert!(r1.contains("step1"), "r1: {r1}");
         // …and the next command should already be there.
         let r2 = run_persistent("pwd", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(r2.to_lowercase().contains("temp"), "cwd should persist to temp, got: {r2}");
+        let want = if cfg!(windows) { "temp" } else { "/tmp" };
+        assert!(r2.to_lowercase().contains(want), "cwd should persist to {want}, got: {r2}");
     }
 
     #[test]

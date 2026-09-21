@@ -14,6 +14,7 @@ use crate::receipt;
 use crate::structured;
 use anyhow::Result;
 use serde_json::{json, Value};
+#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
 pub fn run(args: &CancelArgs) -> Result<()> {
@@ -48,6 +49,13 @@ fn cancel(args: &CancelArgs) -> Value {
     }
 
     if receipt::pid_alive(r.pid) {
+        // Windows has no SIGTERM: the owner can only be killed outright, so it
+        // never records an outcome. Kill it and stop the conversation here.
+        #[cfg(windows)]
+        if let Some(failure) = kill_owner(r.pid) {
+            return failure;
+        }
+        #[cfg(not(windows))]
         return signal_owner(&path, r.pid);
     }
 
@@ -103,13 +111,21 @@ fn cancel(args: &CancelArgs) -> Value {
     envelope
 }
 
-/// Signal the live owner and wait for it to record how the cancel ended.
-fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
-    #[cfg(windows)]
-    let sent = std::process::Command::new("taskkill.exe")
+/// Force-kill the live owner (Windows). Returns a failure envelope if it
+/// could not be killed.
+#[cfg(windows)]
+fn kill_owner(pid: u32) -> Option<Value> {
+    let killed = std::process::Command::new("taskkill.exe")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .status().map(|s| s.success()).unwrap_or(false);
-    #[cfg(not(windows))]
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    (!killed).then(|| json!({"status": "unknown", "error": {"kind": "signal_failed", "message": format!("could not kill owner pid {pid}")}}))
+}
+
+/// Signal the live owner and wait for it to record how the cancel ended.
+#[cfg(not(windows))]
+fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
     let sent = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()

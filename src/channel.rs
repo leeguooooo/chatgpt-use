@@ -2813,6 +2813,13 @@ fn which_bin(name: &str) -> Option<PathBuf> {
         if p.is_file() {
             return Some(p);
         }
+        #[cfg(windows)]
+        {
+            let p = PathBuf::from(dir).join(format!("{name}.exe"));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
     }
     None
 }
