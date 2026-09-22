@@ -2517,7 +2517,7 @@ struct SurfaceLock {
 impl SurfaceLock {
     /// Block until this process owns the surface, best-effort.
     ///
-    /// If the lock file can't be created (no HOME, read-only home), run without
+    /// If the lock file can't be created (no home directory, read-only home), run without
     /// it and say so: refusing to work because we couldn't take an advisory lock
     /// would be worse than the race it guards.
     fn acquire(fail_fast: bool) -> Result<Self> {
@@ -2731,8 +2731,18 @@ fn holder_label(contents: &str) -> String {
 /// names mean no mutual exclusion at all — which is exactly the state that let
 /// two prompts land in one composer.
 fn lock_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-web.lock"))
+    // Keep an explicit HOME for compatibility with other tools sharing this
+    // lock, but also support native Windows shells where only USERPROFILE (or
+    // HOMEDRIVE/HOMEPATH) is set. Missing HOME must not silently disable locking.
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(crate::platform::home_dir)
+        .map(|home| home.join(".chatgpt-web.lock"))
 }
+
+#[cfg(test)]
+#[path = "channel/lock_tests.rs"]
+mod lock_tests;
 
 /// Decide whether the tab has drifted off the pinned conversation.
 ///
