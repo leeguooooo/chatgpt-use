@@ -59,7 +59,9 @@ fn skills_dir() -> Option<PathBuf> {
         Some(p) if p.as_os_str().is_empty() => None, // explicitly disabled
         Some(p) => Some(p.clone()),
         None => std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".claude").join("skills")),
+            .map(PathBuf::from)
+            .or_else(crate::platform::home_dir)
+            .map(|h| h.join(".claude").join("skills")),
     }
 }
 

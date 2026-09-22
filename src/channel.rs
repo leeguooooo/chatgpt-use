@@ -2661,7 +2661,9 @@ fn composer_fingerprint(text: &str) -> (u64, u32) {
 /// optimisation: any read or write failure just means we resolve the slow way.
 fn project_cache_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".chatgpt-use").join("projects.json"))
+        .map(PathBuf::from)
+        .or_else(crate::platform::home_dir)
+        .map(|h| h.join(".chatgpt-use").join("projects.json"))
 }
 
 fn read_project_cache() -> serde_json::Map<String, serde_json::Value> {
