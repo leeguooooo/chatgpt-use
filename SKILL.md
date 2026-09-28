@@ -52,3 +52,13 @@ One-time setup: `chatgpt-use init` (writes `~/.chatgpt-use/auth.json`). Shared f
   user's explicit request, never tunnel it, keep the token secret.
 - The web surface rate-limits; on a rate-limit dialog, back off rather than hammering.
 - `chatgpt-use --help` / `<subcommand> --help` for the full surface.
+
+## Upgrade
+
+When any `chatgpt-use` command prints `chatgpt-use X is available`, tell the user and offer to run
+`chatgpt-use upgrade` (it updates the CLI and this skill). Check without changing anything:
+`chatgpt-use upgrade --check` (or `--json`). The user may also just say "升级 chatgpt-use" / "upgrade chatgpt-use".
+
+If the skill came from somewhere `upgrade` can't refresh:
+- Claude Code plugin: `claude plugin update chatgpt-use@leeguooooo-plugins`
+- Whole family: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/plugins/main/upgrade-use-family.sh | sh`

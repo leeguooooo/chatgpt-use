@@ -18,12 +18,19 @@ mod receipt; // ask --request-id: durable per-request receipts
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
 mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
+mod update; // release check behind `upgrade` and the daily new-version notice
 
 use clap::Parser;
 use cli::{Cli, Command};
 
 fn main() {
+    // clap has already handled --help / --version (they exit inside parse).
     let cli = Cli::parse();
+    if let Command::Upgrade(args) = &cli.command {
+        std::process::exit(cmd::upgrade::run(args));
+    }
+    // Once a day: one "new version" line on stderr; stdout stays for results.
+    update::maybe_notify(&mut std::io::stderr());
     let result = match &cli.command {
         Command::Ask(args) => cmd::ask::run(args),
         Command::Run(args) => cmd::run::run(args),
@@ -36,6 +43,7 @@ fn main() {
         Command::Status(args) => cmd::status::run(args),
         Command::Resume(args) => cmd::resume::run(args),
         Command::Cancel(args) => cmd::cancel::run(args),
+        Command::Upgrade(_) => unreachable!("handled above"),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
