@@ -54,8 +54,14 @@ fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$tmp/$BIN" "$INSTALL_DIR/$BIN" 2>/dev/null || {
-  cp "$tmp/$BIN" "$INSTALL_DIR/$BIN" && chmod 0755 "$INSTALL_DIR/$BIN"; }
+# Stage next to the target, then rename over it: the swap is atomic, and a
+# running chatgpt-use (e.g. `chatgpt-use upgrade` itself) keeps its old inode
+# instead of being overwritten in place (ETXTBSY on Linux, a killed process
+# on macOS when a signed binary changes under it).
+stage="$INSTALL_DIR/.$BIN.new.$$"
+trap 'rm -rf "$tmp"; rm -f "$stage"' EXIT
+cp "$tmp/$BIN" "$stage" && chmod 0755 "$stage" || die "cannot write to $INSTALL_DIR"
+mv -f "$stage" "$INSTALL_DIR/$BIN" || die "cannot replace $INSTALL_DIR/$BIN"
 
 say "==> installed $INSTALL_DIR/$BIN"
 case ":$PATH:" in
