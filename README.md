@@ -432,6 +432,22 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.
 Then make sure you have a Chrome profile logged in to chatgpt.com (or connect your live Chrome via
 `chrome-use extension connect`).
 
+### Upgrade
+
+```bash
+chatgpt-use upgrade            # install the latest release, refresh the skill
+chatgpt-use upgrade --check    # only report: chatgpt-use 0.0.4 -> 0.0.5
+chatgpt-use upgrade --json     # the same as JSON
+```
+
+`upgrade` reinstalls through the route you used — `install.sh` (or `install.ps1` on Windows) into the
+directory the binary is in, or `cargo install --git … --tag vX.Y.Z` for a cargo install — then refreshes
+each copy of the skill it finds: the Claude Code plugin (`claude plugin update`), git clones under
+`~/.agents/skills`, `~/.claude/skills` or `~/.codex/skills` (`git pull --ff-only`), and copied folders
+(it prints `npx skills update chatgpt-use`). Every other command checks for a newer release at most
+once a day and prints one line to stderr when there is one; `CHATGPT_USE_NO_UPDATE_CHECK=1`, the
+family-wide `USE_NO_UPDATE_CHECK=1` or `CI` turns that off. Nothing installs until you run `upgrade`.
+
 ---
 
 ## Usage cheatsheet

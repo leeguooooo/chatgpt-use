@@ -11,4 +11,5 @@ pub mod resume; // wait for a lost ask --request-id reply without resending
 pub mod run; // Mode 2 — brain
 pub mod serve;
 pub mod status; // report an ask --request-id request from its receipt // Mode 3 — drop-in model
+pub mod upgrade; // install the latest release, refresh the skill
 pub mod work; // closed loop — ChatGPT does the work via its MCP connector

@@ -46,6 +46,19 @@ pub enum Command {
     /// Stop the generation behind an `ask --request-id` request; reports
     /// `cancelled` only when the conversation record confirms it.
     Cancel(CancelArgs),
+    /// Install the latest release (through the route chatgpt-use was installed
+    /// with) and refresh the installed skill. `--check` / `--json` change nothing.
+    Upgrade(UpgradeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UpgradeArgs {
+    /// Only report `current -> latest` and the skill installs; change nothing.
+    #[arg(long)]
+    pub check: bool,
+    /// Like --check, as JSON: {name, current, latest, update_available, skills}.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]
