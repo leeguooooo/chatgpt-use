@@ -99,10 +99,16 @@ pub fn run(args: &UpgradeArgs) -> i32 {
             println!("release notes: https://github.com/{REPO}/releases/tag/v{latest}");
         }
     }
+    // A refresh that ran and failed makes the whole upgrade exit non-zero.
+    let mut refresh_failed = false;
     for s in &skills {
-        refresh_skill(s);
+        refresh_failed |= !refresh_skill(s);
     }
-    rc
+    if rc == 0 && refresh_failed {
+        1
+    } else {
+        rc
+    }
 }
 
 pub fn status_line(current: &str, latest: &str) -> String {
@@ -225,8 +231,9 @@ fn run_installer(dir: &Path, _latest: &str) -> i32 {
     }
 }
 
-/// Step 2: refresh one installed copy of the skill.
-fn refresh_skill(s: &SkillInstall) {
+/// Step 2: refresh one installed copy of the skill. False when a refresh it
+/// ran failed; printing a command for the user is not a failure.
+fn refresh_skill(s: &SkillInstall) -> bool {
     let label = format!("skill [{}] {}:", s.channel, s.path);
     match s.channel.as_str() {
         "claude-plugin" => {
@@ -239,11 +246,14 @@ fn refresh_skill(s: &SkillInstall) {
                 .output()
             {
                 Ok(o) if o.status.success() => println!("{label} updated"),
-                Ok(o) => println!(
-                    "{label} `{}` failed: {}",
-                    s.update,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
+                Ok(o) => {
+                    println!(
+                        "{label} `{}` failed: {}",
+                        s.update,
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    return false;
+                }
                 Err(_) => println!("{label} run: {}", s.update),
             }
         }
@@ -252,14 +262,21 @@ fn refresh_skill(s: &SkillInstall) {
             .output()
         {
             Ok(o) if o.status.success() => println!("{label} pulled"),
-            Ok(o) => println!(
-                "{label} not updated (git pull --ff-only failed: {})",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => println!("{label} not updated (cannot run git: {e})"),
+            Ok(o) => {
+                println!(
+                    "{label} not updated (git pull --ff-only failed: {})",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return false;
+            }
+            Err(e) => {
+                println!("{label} not updated (cannot run git: {e})");
+                return false;
+            }
         },
         _ => println!("{label} run: {}", s.update),
     }
+    true
 }
 
 /// Plugin installs from `~/.claude/plugins/installed_plugins.json`: keys
@@ -505,6 +522,23 @@ mod tests {
         let found = find_skill_installs_with(&home, &move |_p: &Path| Some(h.clone()));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].channel, "copy");
+    }
+
+    #[test]
+    fn failed_git_refresh_is_a_failure_and_a_printed_command_is_not() {
+        let home = temp_home("refresh");
+        let not_a_repo = SkillInstall {
+            channel: "git".into(),
+            path: home.display().to_string(),
+            update: String::new(),
+        };
+        assert!(!refresh_skill(&not_a_repo));
+        let copy = SkillInstall {
+            channel: "copy".into(),
+            path: "/c".into(),
+            update: "npx skills update chatgpt-use".into(),
+        };
+        assert!(refresh_skill(&copy));
     }
 
     #[test]
