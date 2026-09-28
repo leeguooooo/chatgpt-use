@@ -156,8 +156,23 @@ pub fn write_cache(path: &Path, cache: &CheckCache) {
     // interleave writes into one temp file and rename a half-written cache.
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     if let Ok(body) = serde_json::to_string(cache) {
-        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        // create_new: never follow or reuse a file already sitting there.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(body.as_bytes()));
+        match written {
+            Ok(()) => {
+                if std::fs::rename(&tmp, path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            // AlreadyExists is someone else's file: leave it alone.
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Err(_) => {}
         }
     }
 }
