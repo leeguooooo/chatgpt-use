@@ -448,6 +448,8 @@ each copy of the skill it finds: the Claude Code plugin (`claude plugin update`)
 once a day and prints one line to stderr when there is one; `CHATGPT_USE_NO_UPDATE_CHECK=1`, the
 family-wide `USE_NO_UPDATE_CHECK=1` or `CI` turns that off. Nothing installs until you run `upgrade`.
 
+Maintainers release with `scripts/release.sh <version>` (`--dry-run` first): it tags, waits for the release binaries, then syncs the plugin marketplace.
+
 ---
 
 ## Usage cheatsheet
