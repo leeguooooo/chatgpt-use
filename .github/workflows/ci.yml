@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked   # offline; never calls chrome-use
+
+  # The Linux release binaries must start on older distros (#6). Build them the
+  # way release-binaries.yml does and check the glibc they ask for; the x86_64
+  # one is also run on CentOS 7 (glibc 2.17).
+  linux-glibc-floor:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: pip3 install --user --break-system-packages ziglang cargo-zigbuild
+      - run: cargo-zigbuild build --release --locked --target ${{ matrix.target }}.2.17
+      - run: scripts/check-glibc-floor.sh target/${{ matrix.target }}/release/chatgpt-use 2.17
+      - name: Run on CentOS 7 (glibc 2.17)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --version
+          docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --help
+      - name: TEMP repro - released v0.0.5 on ubuntu:22.04
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/old && curl -fsSL https://github.com/leeguooooo/chatgpt-use/releases/download/v0.0.5/chatgpt-use-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /tmp/old
+          docker run --rm -v /tmp/old:/b:ro ubuntu:22.04 /b/chatgpt-use --version

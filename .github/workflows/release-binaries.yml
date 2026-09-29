@@ -42,16 +42,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-linker (aarch64 linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+      # Linux builds link against glibc 2.17 through zig instead of the runner's
+      # own glibc (2.39 on ubuntu-latest), which made the binary refuse to start
+      # on Ubuntu 22.04, Debian 12, RHEL 9 and older (#6). The output directory
+      # is still target/<target>/release, so packaging is unchanged.
+      - name: Install zig + cargo-zigbuild (linux)
+        if: runner.os == 'Linux'
+        run: pip3 install --user --break-system-packages ziglang cargo-zigbuild
 
       - name: Build
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (linux, glibc 2.17)
+        if: runner.os == 'Linux'
+        run: |
+          cargo-zigbuild build --release --target ${{ matrix.target }}.2.17
+          scripts/check-glibc-floor.sh target/${{ matrix.target }}/release/chatgpt-use 2.17
 
       - name: Package
         id: package
