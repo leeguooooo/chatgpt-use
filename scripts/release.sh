@@ -5,6 +5,11 @@
 #   scripts/release.sh 0.0.6            # real release
 #   scripts/release.sh 0.0.6 --dry-run  # preflight + tests + bump diff, then revert
 set -eu
+run_ok() {  # run_ok <run-id> [-R owner/repo]: wait until the run completes (gh run watch can drop on a network error), then require success
+  _r=$1; shift
+  until [ "$(gh run view "$_r" "$@" --json status -q .status 2>/dev/null)" = completed ]; do gh run watch "$_r" "$@" >/dev/null 2>&1 || sleep 15; done
+  [ "$(gh run view "$_r" "$@" --json conclusion -q .conclusion)" = success ]
+}
 V=${1:?usage: scripts/release.sh <version> [--dry-run]}
 DRY=${2:-}
 REPO=leeguooooo/chatgpt-use
@@ -41,7 +46,7 @@ for _ in $(seq 30); do
   sleep 5
 done
 [ -n "$RUN" ] || { echo "error: no release-binaries run for v$V; main not pushed" >&2; exit 1; }
-gh run watch "$RUN" -R "$REPO" --exit-status >/dev/null || { echo "error: release-binaries run $RUN failed; main not pushed" >&2; exit 1; }
+run_ok "$RUN" -R "$REPO" || { echo "error: release-binaries run $RUN failed; main not pushed" >&2; exit 1; }
 gh release view "v$V" -R "$REPO" --json assets -q '.assets[].name'
 git push -q origin main
 
@@ -49,6 +54,6 @@ git push -q origin main
 gh workflow run auto-sync-versions.yml -R "$MARKETPLACE"
 sleep 5
 RUN=$(gh run list -R "$MARKETPLACE" -w auto-sync-versions.yml -e workflow_dispatch -L 1 --json databaseId -q '.[0].databaseId')
-gh run watch "$RUN" -R "$MARKETPLACE" --exit-status >/dev/null && echo "marketplace synced" || echo "warn: marketplace sync run $RUN failed; the hourly run will retry"
+run_ok "$RUN" -R "$MARKETPLACE" && echo "marketplace synced" || echo "warn: marketplace sync run $RUN failed; the hourly run will retry"
 echo "marketplace $NAME: $(gh api -H 'Accept: application/vnd.github.raw' "repos/$MARKETPLACE/contents/.claude-plugin/marketplace.json" \
   --jq ".plugins[] | select(.name==\"$NAME\").version")"
