@@ -35,9 +35,3 @@ jobs:
         run: |
           docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --version
           docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --help
-      - name: TEMP repro - released v0.0.5 on ubuntu:22.04
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        continue-on-error: true
-        run: |
-          mkdir -p /tmp/old && curl -fsSL https://github.com/leeguooooo/chatgpt-use/releases/download/v0.0.5/chatgpt-use-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /tmp/old
-          docker run --rm -v /tmp/old:/b:ro ubuntu:22.04 /b/chatgpt-use --version
