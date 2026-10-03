@@ -320,18 +320,34 @@ macro_rules! js_rate_limit_re {
 macro_rules! js_turn_helpers {
     () => {
         r#"
-  const __cguUsers = () => [...document.querySelectorAll(
-    '[data-message-author-role="user"]:not([data-turn-key] *), [data-turn-key]:has([data-user-message-bubble])')];
-  const __cguAssistants = () => [...document.querySelectorAll(
-    '[data-message-author-role="assistant"]:not([data-turn-key] *), [data-turn-key]:has([data-conversation-role="assistant"], [data-chatgpt-agent-turn-start])')];
-  const __cguText = (el) => {
-    if (!el) return '';
-    const parts = el.matches('[data-turn-key]')
-      ? [...el.querySelectorAll('[data-conversation-role="assistant"]')]
-          .filter(e => !e.parentElement.closest('[data-conversation-role="assistant"]'))
-      : [];
-    return (parts.length ? parts : [el])
-      .map(e => (e.innerText || e.textContent || '').trim()).filter(Boolean).join('\n\n');
+  const __cguOuter = (els) => els.filter(e => !els.some(o => o !== e && o.contains(e)));
+  const __cguUnits = (role, group) => __cguOuter([...document.querySelectorAll(
+    `[data-message-author-role="${role}"], [data-content-search-unit-key$=":${role}"], ` +
+    `[data-chatgpt-search-unit-key$=":${role}"], [data-turn-key]:has(${group}, ` +
+    `[data-content-search-unit-key$=":${role}"], [data-chatgpt-search-unit-key$=":${role}"])`)]);
+  const __cguUsers = () => __cguUnits('user', '[data-user-message-bubble]');
+  const __cguAssistants = () => __cguUnits('assistant',
+    '[data-conversation-role="assistant"], [data-chatgpt-agent-turn-start]');
+  const __cguParts = (el) => {
+    if (!el.matches('[data-turn-key]')) return [el];
+    const own = __cguOuter([...el.querySelectorAll('[data-conversation-role="assistant"], ' +
+      '[data-message-author-role="assistant"], [data-content-search-unit-key$=":assistant"], ' +
+      '[data-chatgpt-search-unit-key$=":assistant"]')]);
+    return own.length ? own : __cguOuter([...el.querySelectorAll('.markdown')]);
+  };
+  const __cguText = (el) => el ? __cguParts(el)
+    .map(e => (e.innerText || e.textContent || '').trim()).filter(Boolean).join('\n\n') : '';
+  const __cguReplyText = () => {
+    const a = __cguAssistants();
+    const last = a[a.length - 1];
+    if (!last) return '';
+    const turn = (e) => { const t = e.closest('[data-turn-id]'); return t && t.getAttribute('data-turn-id'); };
+    const id = turn(last);
+    const users = __cguUsers();
+    const lastUser = users[users.length - 1];
+    const tail = id ? a.filter(e => turn(e) === id &&
+      !(lastUser && (e.compareDocumentPosition(lastUser) & Node.DOCUMENT_POSITION_FOLLOWING))) : [last];
+    return tail.map(__cguText).filter(Boolean).join('\n\n');
   };
   const __cguUserIds = () => {
     const ids = [];
@@ -340,6 +356,8 @@ macro_rules! js_turn_helpers {
     for (const u of __cguUsers()) {
       const key = u.getAttribute('data-turn-key');
       if (key) { ids.push('group:' + key); continue; }
+      const unit = u.getAttribute('data-content-search-unit-key') || u.getAttribute('data-chatgpt-search-unit-key');
+      if (unit) { ids.push('unit:' + unit); continue; }
       const t = u.closest('[data-turn-id]');
       const id = t && t.getAttribute('data-turn-id');
       if (id) ids.push(id);
@@ -353,7 +371,8 @@ macro_rules! js_turn_helpers {
 
 // JS: press the stop button, if the page is generating.
 const JS_CLICK_STOP: &str = r#"(() => {
-  const b = document.querySelector('button[data-testid="stop-button"], form button[type="button"][aria-label="Stop"]');
+  const b = document.querySelector('button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
+    'form button[type="button"][aria-label="Stop"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"]');
   if (b) b.click();
   return JSON.stringify({clicked: !!b});
 })()"#;
@@ -396,10 +415,9 @@ const JS_STATE: &str = concat!(
     js_turn_helpers!(),
     r#"
   const stop = !!document.querySelector(
-    'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
+    'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], button[aria-label*="Stop" i]'
   );
   const a = __cguAssistants();
-  const lastA = a[a.length - 1];
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   // A connector turn is multi-step: ChatGPT shows "Calling tool" / "Searching" /
@@ -433,7 +451,7 @@ const JS_STATE: &str = concat!(
     limited: "#,
     js_rate_limit_re!(),
     r#".test(dlg),
-    atext: __cguText(lastA)
+    atext: __cguReplyText()
   });
 })()"#
 );
@@ -443,8 +461,7 @@ const JS_LAST_ASSISTANT: &str = concat!(
     "(() => {",
     js_turn_helpers!(),
     r#"
-  const a = __cguAssistants();
-  return JSON.stringify(__cguText(a[a.length - 1]));
+  return JSON.stringify(__cguReplyText());
 })()"#
 );
 
@@ -3370,22 +3387,43 @@ mod tests {
     #[test]
     fn js_probes_target_the_selectors_we_depend_on() {
         assert!(JS_CONVO_ID.contains(r"/\/c\/([0-9a-f-]{36})/i"));
-        assert!(JS_USER_TURNS.contains(r#"[data-message-author-role="user"]"#));
+        assert!(JS_USER_TURNS.contains(r#"[data-message-author-role="${role}"]"#));
     }
 
     #[test]
     fn turn_probes_read_both_renderers() {
         // The newer renderer groups both roles under [data-turn-key] and may carry
         // no author-role attribute at all; every probe must still see its turns.
-        for js in [JS_USER_TURNS, JS_STATE] {
+        // Behaviour is checked against DOM fixtures by scripts/check-dom.sh;
+        // this only pins that every probe carries the shared helpers.
+        for js in [JS_USER_TURNS, JS_STATE, JS_ASSISTANT_COUNT, JS_LAST_ASSISTANT] {
             assert!(js.contains("[data-user-message-bubble]"), "{js}");
-            assert!(js.contains(r#"[data-message-author-role="user"]:not([data-turn-key] *)"#));
-        }
-        for js in [JS_ASSISTANT_COUNT, JS_LAST_ASSISTANT, JS_STATE] {
             assert!(js.contains(r#"[data-conversation-role="assistant"]"#), "{js}");
-            assert!(js.contains(r#"[data-message-author-role="assistant"]:not([data-turn-key] *)"#));
+            assert!(js.contains(r#"[data-content-search-unit-key$=":${role}"]"#), "{js}");
         }
         assert!(JS_USER_TURNS.contains("data-turn-id-container"));
+        assert!(JS_CLICK_STOP.contains("composer-stop-button"));
+        assert!(JS_STATE.contains("composer-stop-button"));
+    }
+
+    /// Writes the page probes for scripts/check-dom.sh. Ignored: it is a
+    /// build step for that script, not a test.
+    #[test]
+    #[ignore]
+    fn dump_probe_js() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/probe-js");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, js) in [
+            ("state", JS_STATE),
+            ("user_turns", JS_USER_TURNS),
+            ("assistant_count", JS_ASSISTANT_COUNT),
+            ("last_assistant", JS_LAST_ASSISTANT),
+            ("composer", JS_COMPOSER),
+            ("dismiss_dialog", JS_DISMISS_DIALOG),
+            ("click_stop", JS_CLICK_STOP),
+        ] {
+            std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
+        }
     }
 
     #[test]
