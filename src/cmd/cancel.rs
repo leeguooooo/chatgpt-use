@@ -45,7 +45,14 @@ pub(crate) fn cancel(args: &CancelArgs) -> Value {
     };
     match route(&r, receipt::pid_alive) {
         Route::Settled => return settled(r.outcome.as_deref(), &r.submitted),
-        Route::Marker => return mark_owner(&path, id),
+        Route::Marker => match r.owner_token.as_deref() {
+            Some(token) => return mark_owner(&path, id, token),
+            None => {
+                return json!({"status": "unknown", "error": {"kind": "signal_failed",
+                    "message": format!("request {id:?} is held by an agent-mcp server that recorded \
+                                        no owner token; cannot address it")}})
+            }
+        },
         Route::Signal | Route::Attach => {}
     }
     if receipt::pid_alive(r.pid) {
@@ -168,8 +175,8 @@ fn route(r: &receipt::Receipt, alive: impl Fn(u32) -> bool) -> Route {
 
 /// Ask a live agent-mcp owner to cancel `id`, and wait for it to record how
 /// that ended.
-fn mark_owner(path: &std::path::Path, id: &str) -> Value {
-    let marker = receipt::cancel_marker(id);
+fn mark_owner(path: &std::path::Path, id: &str, token: &str) -> Value {
+    let marker = receipt::cancel_marker(id, token);
     if let Err(e) = std::fs::write(&marker, b"") {
         return json!({"status": "unknown", "error": {"kind": "signal_failed", "message": format!("could not write {}: {e}", marker.display())}});
     }
@@ -219,6 +226,7 @@ mod tests {
         let mut r = receipt::Receipt::accepted("r");
         r.state = "submitted".into();
         r.owner = Some(receipt::OWNER_MCP.into());
+        r.owner_token = Some("run-1".into());
         assert_eq!(route(&r, |_| true), Route::Marker);
         // A CLI owner takes the signal; a dead owner of either kind is attached to.
         r.owner = None;

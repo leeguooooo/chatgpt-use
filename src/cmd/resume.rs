@@ -4,7 +4,8 @@
 //! lost reply is looked up, not asked for twice.
 //!
 //! Prints one JSON envelope, like `ask --output-schema`: validated against
-//! `--output-schema` if given, else `{"status":"completed","text":…}`.
+//! `--output-schema` if given, else `{"status":"completed","result":{"text":…}}`
+//! (the CLI also repeats the text at the top level, as `text`, for older callers).
 
 use crate::channel::{Channel, ChannelOptions};
 use crate::cli::ResumeArgs;
@@ -15,6 +16,10 @@ use serde_json::{json, Value};
 
 pub fn run(args: &ResumeArgs) -> Result<()> {
     let mut envelope = resume(args, None, None);
+    // Older callers read the reply text at the top level; keep it there too.
+    if let Some(text) = envelope["result"]["text"].as_str().map(str::to_string) {
+        envelope["text"] = text.into();
+    }
     envelope["request_id"] = args.request_id.as_str().into();
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
     crate::ledger::record("resume", json!({"request_id": args.request_id, "status": status}));
@@ -28,11 +33,15 @@ pub fn run(args: &ResumeArgs) -> Result<()> {
     Ok(())
 }
 
-/// The resume core: one envelope, never prints or exits. `owner` is recorded
-/// in the receipt while this process runs the request (see `Receipt::owner`).
-/// `inline_schema` takes the place of `--output-schema` for callers holding
-/// the schema as a value.
-pub(crate) fn resume(args: &ResumeArgs, owner: Option<&str>, inline_schema: Option<Value>) -> Value {
+/// The resume core: one envelope, never prints or exits. `owner` (kind and
+/// token) is recorded in the receipt while this process runs the request
+/// (see `Receipt::owner`). `inline_schema` takes the place of
+/// `--output-schema` for callers holding the schema as a value.
+pub(crate) fn resume(
+    args: &ResumeArgs,
+    owner: Option<(&str, &str)>,
+    inline_schema: Option<Value>,
+) -> Value {
     let id = &args.request_id;
     if !receipt::valid_id(id) {
         return refusal("failed", "error", &format!("invalid request id {id:?}"), "no");
@@ -56,10 +65,14 @@ pub(crate) fn resume(args: &ResumeArgs, owner: Option<&str>, inline_schema: Opti
         Some(Err(why)) => return structured::schema_error(&why),
     };
 
-    // Take ownership, so `status` shows this process as the one running it.
+    // Take ownership and mark it running while we wait, so `status` and
+    // `cancel` treat it as live and reach THIS process, not a settled record.
+    let prior = r.clone();
     receipt::update(&path, |r| {
+        r.state = "submitted".into();
         r.pid = std::process::id();
-        r.owner = owner.map(str::to_string);
+        r.owner = owner.map(|(kind, _)| kind.to_string());
+        r.owner_token = owner.map(|(_, token)| token.to_string());
     });
     let opts = ChannelOptions {
         profile: args.channel.profile.clone(),
@@ -78,7 +91,7 @@ pub(crate) fn resume(args: &ResumeArgs, owner: Option<&str>, inline_schema: Opti
     });
     let mut envelope = match (reply, &schema) {
         (reply, Some(schema)) => structured::evaluate(reply, schema),
-        (Ok(text), None) => json!({"status": "completed", "text": text}),
+        (Ok(text), None) => json!({"status": "completed", "result": {"text": text}}),
         (Err(e), None) => structured::failure(&e),
     };
     envelope["conversation_id"] = convo.as_str().into();
@@ -87,8 +100,37 @@ pub(crate) fn resume(args: &ResumeArgs, owner: Option<&str>, inline_schema: Opti
     if envelope.get("error").is_some() {
         envelope["error"]["submitted"] = r.submitted.as_str().into();
     }
-    receipt::finish(&path, &envelope);
+    match after_resume(&prior, &envelope) {
+        Settle::Finish => receipt::finish(&path, &envelope),
+        Settle::Restore => receipt::update(&path, |r| {
+            r.state = prior.state.clone();
+            r.submitted = prior.submitted.clone();
+            r.outcome = prior.outcome.clone();
+            r.error = prior.error.clone();
+        }),
+    }
     envelope
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Settle {
+    /// Record this resume's outcome.
+    Finish,
+    /// Put the receipt back as it was: a re-read that failed (throttled,
+    /// cancelled, timed out) does not undo a request that had completed.
+    Restore,
+}
+
+fn after_resume(prior: &Receipt, envelope: &Value) -> Settle {
+    let replied = matches!(
+        envelope["status"].as_str(),
+        Some("completed" | "schema_violation" | "unparseable")
+    );
+    if !replied && prior.state == "completed" {
+        Settle::Restore
+    } else {
+        Settle::Finish
+    }
 }
 
 /// What a receipt allows: the conversation to attach to, or the envelope that
@@ -142,6 +184,18 @@ mod tests {
         r.submitted = submitted.into();
         r.conversation_id = convo.map(str::to_string);
         r
+    }
+
+    #[test]
+    fn a_failed_reread_never_undoes_a_completed_request() {
+        let done = receipt("completed", "yes", Some("c-1"));
+        assert_eq!(after_resume(&done, &json!({"status": "unavailable"})), Settle::Restore);
+        assert_eq!(after_resume(&done, &json!({"status": "cancelled"})), Settle::Restore);
+        assert_eq!(after_resume(&done, &json!({"status": "completed"})), Settle::Finish);
+        // An unfinished one takes whatever this attempt found out.
+        let lost = receipt("submitted", "yes", Some("c-1"));
+        assert_eq!(after_resume(&lost, &json!({"status": "incomplete"})), Settle::Finish);
+        assert_eq!(after_resume(&lost, &json!({"status": "completed"})), Settle::Finish);
     }
 
     #[test]

@@ -33,6 +33,11 @@ pub struct Receipt {
     /// it holds. Such a request is cancelled through [`cancel_marker`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Which run of an `"mcp"` owner holds the request. A cancel marker
+    /// carries it, so only that run honours or removes the marker: not a
+    /// server whose duplicate claim was refused, and not a later retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_token: Option<String>,
 }
 
 /// The owner value for a request held by a long-lived `agent-mcp` server.
@@ -52,6 +57,7 @@ impl Receipt {
             outcome: None,
             error: None,
             owner: None,
+            owner_token: None,
         }
     }
 }
@@ -68,10 +74,13 @@ pub fn path_for(id: &str) -> PathBuf {
     crate::ledger::ledger_dir().join("requests").join(format!("{id}.json"))
 }
 
-/// A file whose existence asks the owner of request `id` to cancel it. Used
-/// for owners that must not be signalled (see [`Receipt::owner`]).
-pub fn cancel_marker(id: &str) -> PathBuf {
-    crate::ledger::ledger_dir().join("requests").join(format!("{id}.cancel"))
+/// The file that asks one run of request `id` (the owner holding `token`, see
+/// [`Receipt::owner_token`]) to cancel it, for owners that must not be
+/// signalled (see [`Receipt::owner`]). The token is part of the NAME, so each
+/// run watches and removes only its own file: a refused duplicate, a stale
+/// marker from an earlier run, and a later retry can never act on each other's.
+pub fn cancel_marker(id: &str, token: &str) -> PathBuf {
+    crate::ledger::ledger_dir().join("requests").join(format!("{id}.{token}.cancel"))
 }
 
 pub fn load(path: &Path) -> Option<Receipt> {

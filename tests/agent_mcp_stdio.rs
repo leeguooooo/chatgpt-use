@@ -87,6 +87,7 @@ fn agent_mcp_speaks_jsonrpc_on_stdout_and_shares_the_ask_envelope() {
     )
     .unwrap();
     assert_eq!(receipt["owner"], "mcp");
+    assert!(receipt["owner_token"].as_str().is_some_and(|t| !t.is_empty()), "{receipt}");
 
     drop(stdin);
     let status = child.wait().unwrap();

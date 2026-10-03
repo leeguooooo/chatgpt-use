@@ -54,6 +54,8 @@ pub struct AskInput {
     pub request_id: Option<String>,
     /// Recorded in the receipt; see `receipt::Receipt::owner`.
     pub owner: Option<&'static str>,
+    /// Recorded in the receipt; see `receipt::Receipt::owner_token`.
+    pub owner_token: Option<String>,
 }
 
 pub enum SchemaSource {
@@ -111,6 +113,7 @@ pub fn run(args: &AskArgs) -> Result<()> {
                 schema: args.output_schema.clone().map(SchemaSource::Path),
                 request_id: args.request_id.clone(),
                 owner: None,
+                owner_token: None,
             };
             execute(&input, opts)
         }
@@ -156,7 +159,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         Ok(m) => m,
         Err(e) => return tag(structured::failure(&e), input),
     };
-    match claim_receipt(input.request_id.as_deref(), input.owner) {
+    match claim_receipt(input.request_id.as_deref(), input.owner, input.owner_token.as_deref()) {
         Ok(path) => opts.receipt = path,
         Err(e) => return tag(structured::failure(&e), input),
     }
@@ -389,7 +392,11 @@ fn read_capped<R: Read + Send + 'static>(mut r: R, cap: usize, wait: StdinWait) 
 /// Claim the receipt for `--request-id` before anything is sent. Refuses an
 /// id whose earlier request may have reached ChatGPT: the caller asked for a
 /// receipt precisely so that a lost reply is looked up, not sent twice.
-fn claim_receipt(request_id: Option<&str>, owner: Option<&str>) -> Result<Option<PathBuf>> {
+fn claim_receipt(
+    request_id: Option<&str>,
+    owner: Option<&str>,
+    owner_token: Option<&str>,
+) -> Result<Option<PathBuf>> {
     let Some(id) = request_id else { return Ok(None) };
     if !receipt::valid_id(id) {
         anyhow::bail!("invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)");
@@ -397,6 +404,7 @@ fn claim_receipt(request_id: Option<&str>, owner: Option<&str>) -> Result<Option
     let path = receipt::path_for(id);
     let mut fresh = receipt::Receipt::accepted(id);
     fresh.owner = owner.map(str::to_string);
+    fresh.owner_token = owner_token.map(str::to_string);
     if receipt::create(&path, &fresh)
         .with_context(|| format!("could not write receipt {}", path.display()))?
     {
@@ -561,6 +569,7 @@ mod tests {
             schema: None,
             request_id: None,
             owner: None,
+            owner_token: None,
         }
     }
 

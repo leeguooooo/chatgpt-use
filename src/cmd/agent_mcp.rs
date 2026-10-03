@@ -41,6 +41,10 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// How long a `cancel` call waits for the request it stopped to finish.
 const CANCEL_WAIT: Duration = Duration::from_secs(60);
+/// How often a running ask reports progress, when the client asked for it.
+/// Several clients (Pi among them) reset their per-call timeout on each
+/// progress notification, so a turn of many minutes outlives a 60s default.
+const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
 /// The ChatGPT side of each tool. The server owns protocol, concurrency and
 /// cancellation; a backend only runs one operation and returns its envelope.
@@ -48,7 +52,14 @@ pub trait Backend: Send + Sync + 'static {
     /// One ask. `cancel` is this request's own flag.
     fn ask(&self, input: AskInput, opts: ChannelOptions, cancel: Arc<AtomicBool>) -> Value;
     fn status(&self, request_id: &str) -> Value;
-    fn resume(&self, request_id: &str, schema: Option<Value>, channel: ChannelArgs, cancel: Arc<AtomicBool>) -> Value;
+    fn resume(
+        &self,
+        request_id: &str,
+        schema: Option<Value>,
+        channel: ChannelArgs,
+        owner_token: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Value;
     /// Cancel a request this server does not hold.
     fn cancel(&self, request_id: &str, channel: ChannelArgs) -> Value;
 }
@@ -63,10 +74,17 @@ impl Backend for Live {
     fn status(&self, request_id: &str) -> Value {
         crate::cmd::status::envelope(request_id)
     }
-    fn resume(&self, request_id: &str, schema: Option<Value>, channel: ChannelArgs, cancel: Arc<AtomicBool>) -> Value {
+    fn resume(
+        &self,
+        request_id: &str,
+        schema: Option<Value>,
+        channel: ChannelArgs,
+        owner_token: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Value {
         let args = ResumeArgs { request_id: request_id.into(), output_schema: None, channel };
         with_cancel_flag(cancel, || {
-            crate::cmd::resume::resume(&args, Some(receipt::OWNER_MCP), schema)
+            crate::cmd::resume::resume(&args, Some((receipt::OWNER_MCP, owner_token)), schema)
         })
     }
     fn cancel(&self, request_id: &str, channel: ChannelArgs) -> Value {
@@ -113,6 +131,10 @@ pub struct Server<B: Backend> {
     state: Arc<Mutex<State>>,
     defaults: ChannelArgs,
     seq: AtomicU64,
+    progress_every: Duration,
+    /// Where a run's cancel marker lives (request id, owner token); tests
+    /// point it elsewhere.
+    marker_path: fn(&str, &str) -> std::path::PathBuf,
 }
 
 impl<B: Backend> Server<B> {
@@ -123,6 +145,8 @@ impl<B: Backend> Server<B> {
             state: Arc::new(Mutex::new(State::default())),
             defaults,
             seq: AtomicU64::new(0),
+            progress_every: PROGRESS_EVERY,
+            marker_path: receipt::cancel_marker,
         })
     }
 
@@ -150,26 +174,20 @@ impl<B: Backend> Server<B> {
                 return None;
             }
         };
-        let id = msg.get("id").cloned();
-        let Some(method) = msg.get("method").and_then(Value::as_str) else {
-            // A response to us (we send no requests) or garbage: nothing to do,
-            // except to say so when it expects an answer.
-            if let Some(id) = id {
-                if msg.get("result").is_none() && msg.get("error").is_none() {
-                    self.error(&id, -32600, "invalid request: no method");
-                }
+        let (id, method, params) = match classify(&msg) {
+            Inbound::Request { id, method, params } => (id, method, params),
+            Inbound::Notification { method, params } => {
+                self.notification(&method, &params);
+                return None;
             }
-            return None;
+            // A response to a request of ours: we send none, so nothing to do.
+            Inbound::Response => return None,
+            Inbound::Invalid { id, why } => {
+                self.error(&id, -32600, format!("invalid request: {why}"));
+                return None;
+            }
         };
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-        let Some(id) = id else {
-            self.notification(method, &params);
-            return None;
-        };
-        if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            self.error(&id, -32600, "invalid request: jsonrpc must be \"2.0\"");
-            return None;
-        }
+        let method = method.as_str();
         match method {
             "initialize" => {
                 self.reply(&id, initialize_result(&params));
@@ -221,9 +239,17 @@ impl<B: Backend> Server<B> {
             self.error(&id, -32602, format!("invalid arguments for {name}: {why}"));
             return None;
         }
+        let progress = match params.pointer("/_meta/progressToken") {
+            None => None,
+            Some(t) if t.is_string() || t.is_number() => Some(t.clone()),
+            Some(_) => {
+                self.error(&id, -32602, "_meta.progressToken must be a string or a number");
+                return None;
+            }
+        };
         match name {
-            "ask" => self.ask(id, args),
-            "resume" => self.resume(id, args),
+            "ask" => self.ask(id, args, progress),
+            "resume" => self.resume(id, args, progress),
             "status" => {
                 self.status(id, &args);
                 None
@@ -266,7 +292,9 @@ impl<B: Backend> Server<B> {
     fn spawn_turn(
         self: &Arc<Self>,
         rpc_id: Value,
+        progress: Option<Value>,
         request_id: String,
+        owner_token: String,
         work: impl FnOnce(&B, Arc<AtomicBool>) -> Value + Send + 'static,
     ) -> Option<JoinHandle<()>> {
         let (flag, silent) = match self.claim(&request_id, &rpc_id) {
@@ -280,11 +308,33 @@ impl<B: Backend> Server<B> {
         let me = self.clone();
         Some(std::thread::spawn(move || {
             let done = Arc::new(AtomicBool::new(false));
-            let watcher = watch_marker(receipt::cancel_marker(&request_id), flag.clone(), done.clone());
-            let mut envelope = work(&me.backend, flag);
+            let marker = (me.marker_path)(&request_id, &owner_token);
+            let watcher = watch_marker(marker.clone(), flag.clone(), done.clone());
+            let ticker = progress.map(|token| me.report_progress(token, done.clone()));
+            // A panic in the work must still free the slot and answer the
+            // call; otherwise the server reads as busy for good.
+            let backend = me.backend.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&backend, flag)));
             done.store(true, Ordering::SeqCst);
             let _ = watcher.join();
-            let _ = std::fs::remove_file(receipt::cancel_marker(&request_id));
+            if let Some(t) = ticker {
+                let _ = t.join();
+            }
+            // Only this run's own file: nobody else's marker shares its name.
+            let _ = std::fs::remove_file(&marker);
+            let mut envelope = outcome.unwrap_or_else(|panic| {
+                let why = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                // Where it stopped is unknown, so whether the prompt went out is too.
+                let failed = json!({"status": "failed", "error": {"kind": "internal",
+                    "message": format!("internal error while handling the request: {why}"),
+                    "submitted": "unknown"}});
+                finish_if_ours(&request_id, &owner_token, &failed);
+                failed
+            });
             envelope["request_id"] = request_id.as_str().into();
             let status = envelope["status"].as_str().unwrap_or("failed").to_string();
             {
@@ -302,7 +352,29 @@ impl<B: Backend> Server<B> {
         }))
     }
 
-    fn ask(self: &Arc<Self>, id: Value, args: Map<String, Value>) -> Option<JoinHandle<()>> {
+    /// Send `notifications/progress` for `token` every `progress_every`
+    /// until `done`.
+    fn report_progress(self: &Arc<Self>, token: Value, done: Arc<AtomicBool>) -> JoinHandle<()> {
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut next = started + me.progress_every;
+            let mut n = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                if Instant::now() >= next {
+                    n += 1;
+                    next += me.progress_every;
+                    me.send(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+                        "progressToken": token, "progress": n,
+                        "message": format!("waiting for ChatGPT ({}s)", started.elapsed().as_secs()),
+                    }}));
+                }
+                std::thread::sleep(Duration::from_millis(20).min(me.progress_every));
+            }
+        })
+    }
+
+    fn ask(self: &Arc<Self>, id: Value, args: Map<String, Value>, progress: Option<Value>) -> Option<JoinHandle<()>> {
         let request_id = self.request_id(&id, &args)?;
         let mut channel = self.defaults.clone();
         if let Some(m) = args.get("model").and_then(Value::as_str) {
@@ -315,6 +387,7 @@ impl<B: Backend> Server<B> {
             channel.timeout = t;
         }
         let opts = channel_options(&channel);
+        let token = new_owner_token(self.seq.fetch_add(1, Ordering::SeqCst));
         let input = AskInput {
             prompt: args["prompt"].as_str().unwrap_or_default().to_string(),
             files: args
@@ -326,11 +399,12 @@ impl<B: Backend> Server<B> {
             schema: args.get("output_schema").cloned().map(SchemaSource::Inline),
             request_id: Some(request_id.clone()),
             owner: Some(receipt::OWNER_MCP),
+            owner_token: Some(token.clone()),
         };
-        self.spawn_turn(id, request_id, move |backend, flag| backend.ask(input, opts, flag))
+        self.spawn_turn(id, progress, request_id, token, move |backend, flag| backend.ask(input, opts, flag))
     }
 
-    fn resume(self: &Arc<Self>, id: Value, args: Map<String, Value>) -> Option<JoinHandle<()>> {
+    fn resume(self: &Arc<Self>, id: Value, args: Map<String, Value>, progress: Option<Value>) -> Option<JoinHandle<()>> {
         let request_id = args["request_id"].as_str().unwrap_or_default().to_string();
         if !receipt::valid_id(&request_id) {
             self.error(&id, -32602, format!("invalid request_id {request_id:?}"));
@@ -339,7 +413,11 @@ impl<B: Backend> Server<B> {
         let schema = args.get("output_schema").cloned();
         let channel = self.defaults.clone();
         let rid = request_id.clone();
-        self.spawn_turn(id, request_id, move |backend, flag| backend.resume(&rid, schema, channel, flag))
+        let token = new_owner_token(self.seq.fetch_add(1, Ordering::SeqCst));
+        let tok = token.clone();
+        self.spawn_turn(id, progress, request_id, token, move |backend, flag| {
+            backend.resume(&rid, schema, channel, &tok, flag)
+        })
     }
 
     fn status(&self, id: Value, args: &Map<String, Value>) {
@@ -420,18 +498,75 @@ impl<B: Backend> Server<B> {
     }
 }
 
-/// Raise `flag` when `marker` appears (a shell's `chatgpt-use cancel`),
-/// until `done`.
-fn watch_marker(marker: std::path::PathBuf, flag: Arc<AtomicBool>, done: Arc<AtomicBool>) -> JoinHandle<()> {
+/// One inbound JSON-RPC message, checked before anything acts on it.
+#[derive(Debug, PartialEq)]
+enum Inbound {
+    Request { id: Value, method: String, params: Value },
+    Notification { method: String, params: Value },
+    Response,
+    /// Answered with -32600, under `id` when it was usable, else null.
+    Invalid { id: Value, why: &'static str },
+}
+
+fn classify(msg: &Value) -> Inbound {
+    let invalid = |id: Value, why| Inbound::Invalid { id, why };
+    let Some(obj) = msg.as_object() else {
+        // Batches were removed from MCP in 2025-06-18; scalars were never valid.
+        return invalid(Value::Null, "a message must be one JSON object");
+    };
+    // The id must be a string or an integer to be echoed back at all. MCP
+    // forbids null, and an object or float id cannot identify a request.
+    let id = match obj.get("id") {
+        None => None,
+        Some(v) if v.is_string() || v.is_i64() || v.is_u64() => Some(v.clone()),
+        Some(_) => return invalid(Value::Null, "id must be a string or an integer"),
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return invalid(id.unwrap_or(Value::Null), "jsonrpc must be \"2.0\"");
+    }
+    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+    if !(params.is_null() || params.is_object()) {
+        return invalid(id.unwrap_or(Value::Null), "params must be an object");
+    }
+    match (obj.get("method"), id) {
+        (Some(Value::String(m)), Some(id)) => Inbound::Request { id, method: m.clone(), params },
+        (Some(Value::String(m)), None) => Inbound::Notification { method: m.clone(), params },
+        (Some(_), id) => invalid(id.unwrap_or(Value::Null), "method must be a string"),
+        (None, Some(_)) if obj.contains_key("result") || obj.contains_key("error") => Inbound::Response,
+        (None, id) => invalid(id.unwrap_or(Value::Null), "no method"),
+    }
+}
+
+/// Raise `flag` when this run's own marker appears (a shell's `chatgpt-use
+/// cancel` aimed at it), until `done`.
+fn watch_marker(path: std::path::PathBuf, flag: Arc<AtomicBool>, done: Arc<AtomicBool>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while !done.load(Ordering::SeqCst) {
-            if marker.exists() {
+            if path.exists() {
                 flag.store(true, Ordering::SeqCst);
                 return;
             }
             std::thread::sleep(Duration::from_millis(300));
         }
     })
+}
+
+/// After a panic, close `request_id`'s receipt with `envelope`, but only if
+/// this run owns it: a refused duplicate must not settle another's request.
+fn finish_if_ours(request_id: &str, owner_token: &str, envelope: &Value) {
+    let path = receipt::path_for(request_id);
+    if receipt::load(&path).is_some_and(|r| r.owner_token.as_deref() == Some(owner_token)) {
+        receipt::finish(&path, envelope);
+    }
+}
+
+/// A unique token for one run of one request on this server.
+fn new_owner_token(seq: u64) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{seq}", std::process::id())
 }
 
 fn channel_options(c: &ChannelArgs) -> ChannelOptions {
@@ -579,6 +714,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         asks: AtomicUsize,
+        /// The owner token of each ask, in order.
+        tokens: Mutex<Vec<String>>,
     }
 
     impl Backend for Fake {
@@ -586,6 +723,15 @@ mod tests {
             self.asks.fetch_add(1, Ordering::SeqCst);
             assert!(opts.busy_fail, "tool calls never queue behind another run");
             assert_eq!(input.owner, Some(receipt::OWNER_MCP));
+            self.tokens.lock().unwrap().push(input.owner_token.clone().expect("every run carries its own token"));
+            if input.prompt == "panic" {
+                panic!("boom");
+            }
+            if input.prompt == "dup" {
+                // What execute returns when another owner holds the id.
+                return json!({"status": "duplicate", "error": {"kind": "duplicate_request",
+                              "message": "already exists", "submitted": "unknown"}});
+            }
             if input.prompt == "long" {
                 let until = Instant::now() + Duration::from_secs(10);
                 while Instant::now() < until {
@@ -604,7 +750,8 @@ mod tests {
         fn status(&self, _: &str) -> Value {
             json!({"status": "failed", "error": {"kind": "unknown_request", "message": "no receipt", "submitted": "no"}})
         }
-        fn resume(&self, _: &str, _: Option<Value>, _: ChannelArgs, _: Arc<AtomicBool>) -> Value {
+        fn resume(&self, _: &str, _: Option<Value>, _: ChannelArgs, token: &str, _: Arc<AtomicBool>) -> Value {
+            assert!(!token.is_empty());
             json!({"status": "completed", "result": {"text": "resumed"}})
         }
         fn cancel(&self, _: &str, _: ChannelArgs) -> Value {
@@ -657,9 +804,20 @@ mod tests {
         }
     }
 
+    fn test_marker(id: &str, token: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cgu-agent-mcp-markers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{id}.{token}.cancel"))
+    }
+
     fn server() -> (Arc<Server<Fake>>, Buf) {
+        server_with(PROGRESS_EVERY)
+    }
+
+    fn server_with(progress_every: Duration) -> (Arc<Server<Fake>>, Buf) {
         let buf = Buf::default();
-        (Server::new(Fake::default(), Box::new(buf.clone()), defaults()), buf)
+        let base = Arc::into_inner(Server::new(Fake::default(), Box::new(buf.clone()), defaults())).unwrap();
+        (Arc::new(Server { progress_every, marker_path: test_marker, ..base }), buf)
     }
 
     fn call(id: i64, name: &str, args: Value) -> String {
@@ -829,21 +987,141 @@ mod tests {
     }
 
     #[test]
-    fn a_cancel_marker_raises_only_its_requests_flag() {
-        let dir = std::env::temp_dir().join(format!("cgu-marker-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (mine, other) = (dir.join("a.cancel"), dir.join("b.cancel"));
-        let (fa, fb) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let done = Arc::new(AtomicBool::new(false));
-        let wa = watch_marker(mine.clone(), fa.clone(), done.clone());
-        let wb = watch_marker(other, fb.clone(), done.clone());
+    fn a_long_ask_reports_progress_when_asked_and_stops_after() {
+        let (s, buf) = server_with(Duration::from_millis(40));
+        let msg = json!({"jsonrpc": "2.0", "id": 70, "method": "tools/call",
+                         "params": {"name": "ask", "arguments": {"prompt": "long", "request_id": "r-prog"},
+                                    "_meta": {"progressToken": "tok-1"}}});
+        let long = s.handle(&msg.to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        s.handle(&call(71, "cancel", json!({"request_id": "r-prog"}))).unwrap().join().unwrap();
+        long.join().unwrap();
+        let progress: Vec<Value> = buf.messages().into_iter()
+            .filter(|m| m["method"] == "notifications/progress").collect();
+        assert!(progress.len() >= 2, "{progress:?}");
+        assert!(progress.iter().all(|p| p["params"]["progressToken"] == "tok-1" && p.get("id").is_none()));
+        let counts: Vec<u64> = progress.iter().map(|p| p["params"]["progress"].as_u64().unwrap()).collect();
+        assert!(counts.windows(2).all(|w| w[0] < w[1]), "progress increases: {counts:?}");
+        // Nothing after the response.
+        let msgs = buf.messages();
+        let reply_at = msgs.iter().position(|m| m["id"] == 70).unwrap();
+        assert!(msgs[reply_at..].iter().all(|m| m["method"] != "notifications/progress"));
+
+        // Without a token, no progress at all.
+        let (quiet, out) = server();
+        quiet.handle(&call(72, "ask", json!({"prompt": "hi"}))).unwrap().join().unwrap();
+        assert!(out.messages().iter().all(|m| m["method"] != "notifications/progress"));
+    }
+
+    #[test]
+    fn malformed_messages_are_invalid_requests_before_anything_acts() {
+        for bad in [json!(null), json!([]), json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]),
+                    json!(1), json!("ping"), json!(true)] {
+            assert_eq!(classify(&bad), Inbound::Invalid { id: Value::Null, why: "a message must be one JSON object" }, "{bad}");
+        }
+        for id in [json!(null), json!({}), json!([]), json!(1.5), json!(true)] {
+            let msg = json!({"jsonrpc": "2.0", "id": id, "method": "ping"});
+            assert!(matches!(classify(&msg), Inbound::Invalid { id: Value::Null, .. }), "{msg}");
+        }
+        let wrong = json!({"jsonrpc": "1.0", "id": 5, "method": "ping"});
+        assert!(matches!(classify(&wrong), Inbound::Invalid { id, .. } if id == 5));
+        let note = json!({"jsonrpc": "1.0", "method": "notifications/cancelled", "params": {"requestId": 1}});
+        assert!(matches!(classify(&note), Inbound::Invalid { id: Value::Null, .. }), "notifications are checked too");
+        let params = json!({"jsonrpc": "2.0", "id": 6, "method": "ping", "params": [1]});
+        assert!(matches!(classify(&params), Inbound::Invalid { id, .. } if id == 6));
+        let method = json!({"jsonrpc": "2.0", "id": 7, "method": 3});
+        assert!(matches!(classify(&method), Inbound::Invalid { id, .. } if id == 7));
+        assert_eq!(classify(&json!({"jsonrpc": "2.0", "id": 8, "result": {}})), Inbound::Response);
+        assert!(matches!(classify(&json!({"jsonrpc": "2.0", "id": "a", "method": "ping"})), Inbound::Request { .. }));
+        assert!(matches!(classify(&json!({"jsonrpc": "2.0", "method": "x"})), Inbound::Notification { .. }));
+    }
+
+    #[test]
+    fn the_server_answers_malformed_messages_with_32600() {
+        let (s, out) = server();
+        s.handle("null");
+        s.handle("[]");
+        s.handle(r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#);
+        let msgs = out.messages();
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        for m in &msgs {
+            assert_eq!(m["error"]["code"], -32600, "{m}");
+            assert_eq!(m["id"], Value::Null, "{m}");
+            assert!(m.get("result").is_none());
+        }
+    }
+
+    #[test]
+    fn a_wrong_version_cancel_notification_cancels_nothing() {
+        let (s, out) = server();
+        let long = s.handle(&call(80, "ask", json!({"prompt": "long", "request_id": "r-ver"}))).unwrap();
+        s.handle(r#"{"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":80}}"#);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(out.response(80).is_none(), "still running");
+        s.handle(&call(81, "cancel", json!({"request_id": "r-ver"}))).unwrap().join().unwrap();
+        long.join().unwrap();
+        assert_eq!(envelope(&out.wait(80))["status"], "cancelled");
+    }
+
+    #[test]
+    fn a_progress_token_must_be_a_string_or_number() {
+        let (s, out) = server();
+        let msg = json!({"jsonrpc": "2.0", "id": 85, "method": "tools/call",
+                         "params": {"name": "ask", "arguments": {"prompt": "hi"}, "_meta": {"progressToken": {}}}});
+        assert!(s.handle(&msg.to_string()).is_none());
+        assert_eq!(out.wait(85)["error"]["code"], -32602);
+        assert_eq!(s.backend.asks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_panicking_worker_answers_frees_the_slot_and_claims_nothing_was_known() {
+        let (s, out) = server();
+        s.handle(&call(90, "ask", json!({"prompt": "panic", "request_id": "r-panic"}))).unwrap().join().unwrap();
+        let msg = out.wait(90);
+        let env = envelope(&msg);
+        assert_eq!(env["status"], "failed");
+        assert_eq!(env["error"]["kind"], "internal");
+        assert_eq!(env["error"]["submitted"], "unknown", "a panic proves nothing about sending");
+        assert_eq!(msg["result"]["isError"], true);
+        s.handle(&call(91, "ask", json!({"prompt": "after"}))).unwrap().join().unwrap();
+        assert_eq!(envelope(&out.wait(91))["result"]["text"], "echo:after", "not stuck busy");
+    }
+
+    #[test]
+    fn each_run_watches_and_clears_only_its_own_marker() {
+        // Two servers handle the same request id: A holds it, B is refused as
+        // a duplicate. A third, unrelated marker for the id also exists.
+        let (a, out_a) = server();
+        let (b, out_b) = server();
+        let stranger = test_marker("r-shared", "someone-else");
+        std::fs::write(&stranger, b"").unwrap();
+
+        let long = a.handle(&call(100, "ask", json!({"prompt": "long", "request_id": "r-shared"}))).unwrap();
+        b.handle(&call(101, "ask", json!({"prompt": "dup", "request_id": "r-shared"}))).unwrap().join().unwrap();
+        assert_eq!(envelope(&out_b.wait(101))["status"], "duplicate");
+        assert!(stranger.exists(), "B left a marker that is not its own");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(out_a.response(100).is_none(), "nothing aimed at A's run, so A still runs");
+
+        // The shell's cancel addresses A's run by its token: only A stops.
+        let token_a = a.backend.tokens.lock().unwrap()[0].clone();
+        let token_b = b.backend.tokens.lock().unwrap()[0].clone();
+        assert_ne!(token_a, token_b, "every run has its own token");
+        let mine = test_marker("r-shared", &token_a);
         std::fs::write(&mine, b"").unwrap();
-        wa.join().unwrap();
-        assert!(fa.load(Ordering::SeqCst));
-        done.store(true, Ordering::SeqCst);
-        wb.join().unwrap();
-        assert!(!fb.load(Ordering::SeqCst));
-        let _ = std::fs::remove_dir_all(&dir);
+        long.join().unwrap();
+        assert_eq!(envelope(&out_a.wait(100))["status"], "cancelled");
+        assert!(!mine.exists(), "A removes its own marker when done");
+        assert!(stranger.exists(), "and nobody else's");
+        let _ = std::fs::remove_file(&stranger);
+    }
+
+    #[test]
+    fn owner_tokens_tell_servers_and_retries_apart() {
+        let t: std::collections::HashSet<_> = (0..50).map(new_owner_token).collect();
+        assert_eq!(t.len(), 50);
+        assert!(t.iter().all(|t| t.starts_with(&format!("{}-", std::process::id()))));
+        assert!(t.iter().all(|t| t.bytes().all(|b| b.is_ascii_digit() || b == b'-')), "safe in a file name");
     }
 
     #[test]
