@@ -215,13 +215,20 @@ second returns `busy` at once, and `status`/`cancel` answer while an ask runs. C
 request stops only that request, never the server. While an ask runs it sends a progress
 notification every 15 s to clients that ask for them.
 
-A ChatGPT turn can take several minutes, so give the tool call room:
+A ChatGPT turn can take several minutes. Two limits apply, and both must allow it: the server's own
+`--timeout` per turn (default 300 s, or a tool call's `timeout_secs`), and the agent's timeout for
+a tool call. Raise the server's, then set the agent's a little higher, so the server always answers
+first with a proper `incomplete` envelope instead of the agent cutting the call off. For 15-minute
+turns:
 
-| Agent | Register | Long turns |
+| Agent | Register | Tool-call timeout |
 |---|---|---|
-| Claude Code | `claude mcp add chatgpt-use -- chatgpt-use agent-mcp` | if calls time out, raise `MCP_TOOL_TIMEOUT` (ms) |
-| Codex | `codex mcp add chatgpt-use -- chatgpt-use agent-mcp` | add `tool_timeout_sec = 900` under `[mcp_servers.chatgpt-use]` in `~/.codex/config.toml` (default 300 s) |
-| Pi ≥ 0.99 | `pi mcp add chatgpt-use -- chatgpt-use agent-mcp` | Pi's 60 s default is reset by the progress notifications; or set `"timeout"` in `~/.pi/agent/mcp.json` |
+| Claude Code | `claude mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | set `MCP_TOOL_TIMEOUT=960000` (ms) if calls are cut off |
+| Codex | `codex mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | `tool_timeout_sec = 960` under `[mcp_servers.chatgpt-use]` in `~/.codex/config.toml` (default 300 s) |
+| Pi ≥ 0.99 | `pi mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | the 60 s default is reset by the server's progress notifications; or set `"timeout": 960` in `~/.pi/agent/mcp.json` |
+
+With the default `--timeout 300`, raising only the agent's limit buys nothing: the turn still ends
+at 300 s.
 
 Pi gained built-in MCP in 0.99.0 ([docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/mcp.md));
 older Pi can use the CLI through the skill below. Defaults for every ask (`--model`, `--project`,
