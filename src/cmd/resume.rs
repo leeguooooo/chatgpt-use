@@ -102,11 +102,12 @@ pub(crate) fn resume(
     }
     match after_resume(&prior, &envelope) {
         Settle::Finish => receipt::finish(&path, &envelope),
+        // All of it, ownership included: a settled record that still named
+        // this run as its owner would mislead a later cancel or status.
         Settle::Restore => receipt::update(&path, |r| {
-            r.state = prior.state.clone();
-            r.submitted = prior.submitted.clone();
-            r.outcome = prior.outcome.clone();
-            r.error = prior.error.clone();
+            let updated_at = r.updated_at;
+            *r = prior.clone();
+            r.updated_at = updated_at;
         }),
     }
     envelope

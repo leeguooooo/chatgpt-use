@@ -524,10 +524,12 @@ fn classify(msg: &Value) -> Inbound {
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return invalid(id.unwrap_or(Value::Null), "jsonrpc must be \"2.0\"");
     }
-    let params = obj.get("params").cloned().unwrap_or(Value::Null);
-    if !(params.is_null() || params.is_object()) {
-        return invalid(id.unwrap_or(Value::Null), "params must be an object");
-    }
+    // Omitted is fine; present means an object (MCP), so an explicit null is not.
+    let params = match obj.get("params") {
+        None => Value::Null,
+        Some(p @ Value::Object(_)) => p.clone(),
+        Some(_) => return invalid(id.unwrap_or(Value::Null), "params must be an object"),
+    };
     match (obj.get("method"), id) {
         (Some(Value::String(m)), Some(id)) => Inbound::Request { id, method: m.clone(), params },
         (Some(Value::String(m)), None) => Inbound::Notification { method: m.clone(), params },
@@ -1029,6 +1031,9 @@ mod tests {
         assert!(matches!(classify(&note), Inbound::Invalid { id: Value::Null, .. }), "notifications are checked too");
         let params = json!({"jsonrpc": "2.0", "id": 6, "method": "ping", "params": [1]});
         assert!(matches!(classify(&params), Inbound::Invalid { id, .. } if id == 6));
+        let null_params = json!({"jsonrpc": "2.0", "id": 9, "method": "ping", "params": null});
+        assert!(matches!(classify(&null_params), Inbound::Invalid { id, .. } if id == 9), "present null is not omitted");
+        assert!(matches!(classify(&json!({"jsonrpc": "2.0", "id": 10, "method": "ping"})), Inbound::Request { .. }));
         let method = json!({"jsonrpc": "2.0", "id": 7, "method": 3});
         assert!(matches!(classify(&method), Inbound::Invalid { id, .. } if id == 7));
         assert_eq!(classify(&json!({"jsonrpc": "2.0", "id": 8, "result": {}})), Inbound::Response);
@@ -1056,6 +1061,8 @@ mod tests {
         let (s, out) = server();
         let long = s.handle(&call(80, "ask", json!({"prompt": "long", "request_id": "r-ver"}))).unwrap();
         s.handle(r#"{"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":80}}"#);
+        s.handle(r#"{"method":"notifications/cancelled","params":{"requestId":80}}"#);
+        s.handle(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":[80]}"#);
         std::thread::sleep(Duration::from_millis(150));
         assert!(out.response(80).is_none(), "still running");
         s.handle(&call(81, "cancel", json!({"request_id": "r-ver"}))).unwrap().join().unwrap();
