@@ -127,5 +127,6 @@ fn channel_opts_from_args(args: &RunArgs) -> ChannelOptions {
         model: args.channel.model.clone(),
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
+        ignore_cooldown: false,
     }
 }

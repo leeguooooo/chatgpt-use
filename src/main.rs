@@ -17,6 +17,7 @@ mod platform; // OS-specific paths and process conventions
 mod receipt; // ask --request-id: durable per-request receipts
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
 mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema
+mod throttle; // account-wide rate-limit cooldown and request-pace warnings
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
 mod update; // release check behind `upgrade` and the daily new-version notice
 

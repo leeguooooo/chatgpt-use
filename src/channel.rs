@@ -47,6 +47,24 @@ const RATE_LIMIT_MSG: &str =
     "chatgpt.com rate-limited this account ('Too many requests') — the page \
      surface needs a few minutes of quiet before it will serve again.";
 
+/// A rate-limit error, recorded so every process on this machine backs off
+/// (see `throttle`). Use it where the throttle is first seen, not for errors
+/// that only restate a hit already recorded.
+fn rate_limited(msg: impl Into<String>) -> anyhow::Error {
+    crate::throttle::note_rate_limited();
+    ChannelError::new(ErrorKind::RateLimited, msg).into()
+}
+
+/// Refuse while an account cooldown from an earlier hit is still running.
+fn check_cooldown() -> Result<()> {
+    match crate::throttle::cooldown_left() {
+        Some(left) => {
+            Err(ChannelError::new(ErrorKind::RateLimited, crate::throttle::refusal(left)).into())
+        }
+        None => Ok(()),
+    }
+}
+
 /// Why a channel operation failed, in the terms a caller has to act on.
 ///
 /// Most failures stay plain `anyhow` errors; only the ones that decide what a
@@ -217,6 +235,52 @@ fn cancel_requested() -> bool {
     CANCEL.get().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// The page's user turns at one moment: how many are rendered, and the stable
+/// identities it exposes (see `js_turn_helpers!`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UserTurns {
+    count: u64,
+    /// Identity of each rendered user turn.
+    ids: Vec<String>,
+    /// Every turn identity the page still holds, including virtualized turns
+    /// whose contents are not rendered.
+    known: Vec<String>,
+}
+
+impl UserTurns {
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let strs = |k: &str| -> Vec<String> {
+            v.get(k)
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
+        Some(UserTurns {
+            count: v.get("count")?.as_u64()?,
+            ids: strs("ids"),
+            known: strs("known"),
+        })
+    }
+}
+
+/// Did a user turn appear in `now` that was not on the page at `base`?
+///
+/// This is the submit receipt. When the page exposes turn identities the answer
+/// is "is some user turn's identity new", which a virtualized chat cannot fool:
+/// an old turn scrolling back into view keeps its identity, and one scrolling
+/// out does not hide a new one, whereas both move a plain count. If any
+/// rendered turn lacks an identity (an older page), it falls back to the count
+/// rising.
+fn user_turn_rose(base: &UserTurns, now: &UserTurns) -> bool {
+    let identified = |t: &UserTurns| t.ids.len() as u64 == t.count;
+    if !identified(base) || !identified(now) {
+        return now.count > base.count;
+    }
+    let seen: std::collections::HashSet<&str> =
+        base.ids.iter().chain(&base.known).map(String::as_str).collect();
+    now.ids.iter().any(|id| !seen.contains(id.as_str()))
+}
+
 /// Sleep that wakes early for a cancel.
 fn nap(d: Duration) {
     let end = Instant::now() + d;
@@ -229,9 +293,67 @@ fn nap(d: Duration) {
     }
 }
 
+/// JS regex literal for the "Too many requests" dialog, in each UI language
+/// ChatGPT has been seen to render it in. An English-only test read a throttled
+/// zh-CN page as healthy and kept polling into the throttle. Phrases taken from
+/// miuuyy/codex-chatgpt-web's dialog matcher.
+macro_rules! js_rate_limit_re {
+    () => {
+        r"/too many requests|requests too quickly|太多请求|太多要求|过于频繁|過於頻繁|リクエストが多すぎます|リクエストの頻度が高すぎます|요청이 너무 많습니다|너무 많은 요청|요청을 너무 빠르게/i"
+    };
+}
+
+/// JS helpers that read conversation turns in both of ChatGPT's renderers.
+///
+/// The older one puts `data-message-author-role` on each message. The newer one
+/// groups a user message and its reply under one `[data-turn-key]` element,
+/// marking the parts `[data-user-message-bubble]` and
+/// `[data-conversation-role="assistant"]`, and need not carry the author-role
+/// attribute at all. Counting author roles alone would read that page as having
+/// no turns, so no submit could ever be confirmed. Role elements inside a group
+/// are excluded so a page that has both markings counts each turn once.
+///
+/// `__cguUserIds` collects stable turn identities for [`user_turn_rose`]: the
+/// `data-turn-id` of each user turn, plus every `data-turn-id-container`. Long
+/// chats are virtualized; an off-screen turn loses its contents but keeps its
+/// container, so remounting it later must not look like a new turn.
+macro_rules! js_turn_helpers {
+    () => {
+        r#"
+  const __cguUsers = () => [...document.querySelectorAll(
+    '[data-message-author-role="user"]:not([data-turn-key] *), [data-turn-key]:has([data-user-message-bubble])')];
+  const __cguAssistants = () => [...document.querySelectorAll(
+    '[data-message-author-role="assistant"]:not([data-turn-key] *), [data-turn-key]:has([data-conversation-role="assistant"], [data-chatgpt-agent-turn-start])')];
+  const __cguText = (el) => {
+    if (!el) return '';
+    const parts = el.matches('[data-turn-key]')
+      ? [...el.querySelectorAll('[data-conversation-role="assistant"]')]
+          .filter(e => !e.parentElement.closest('[data-conversation-role="assistant"]'))
+      : [];
+    return (parts.length ? parts : [el])
+      .map(e => (e.innerText || e.textContent || '').trim()).filter(Boolean).join('\n\n');
+  };
+  const __cguUserIds = () => {
+    const ids = [];
+    const known = [...document.querySelectorAll('[data-turn-id-container]')]
+      .map(e => e.getAttribute('data-turn-id-container')).filter(Boolean);
+    for (const u of __cguUsers()) {
+      const key = u.getAttribute('data-turn-key');
+      if (key) { ids.push('group:' + key); continue; }
+      const t = u.closest('[data-turn-id]');
+      const id = t && t.getAttribute('data-turn-id');
+      if (id) ids.push(id);
+    }
+    for (const g of document.querySelectorAll('[data-turn-key]')) known.push('group:' + g.getAttribute('data-turn-key'));
+    return {ids, known};
+  };
+"#
+    };
+}
+
 // JS: press the stop button, if the page is generating.
 const JS_CLICK_STOP: &str = r#"(() => {
-  const b = document.querySelector('button[data-testid="stop-button"]');
+  const b = document.querySelector('button[data-testid="stop-button"], form button[type="button"][aria-label="Stop"]');
   if (b) b.click();
   return JSON.stringify({clicked: !!b});
 })()"#;
@@ -254,22 +376,29 @@ const JS_BLOCKING_DIALOG: &str = r#"(() => {
 })()"#;
 
 // JS: poll composer presence + rate-limit dialog (mirrors _JS_COMPOSER in chatgpt-imagegen).
-const JS_COMPOSER: &str = r#"(() => {
+const JS_COMPOSER: &str = concat!(
+    r#"(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   return JSON.stringify({
     composer: !!document.querySelector('#prompt-textarea'),
-    limited: /too many requests|requests too quickly/i.test(dlg),
+    limited: "#,
+    js_rate_limit_re!(),
+    r#".test(dlg),
   });
-})()"#;
+})()"#
+);
 
 // JS: poll generation/reply state: stop button present? newest assistant text?
 // rate-limited? Mirrors _JS_STATE in chatgpt-imagegen but without image scraping.
-const JS_STATE: &str = r#"(() => {
+const JS_STATE: &str = concat!(
+    "(() => {",
+    js_turn_helpers!(),
+    r#"
   const stop = !!document.querySelector(
     'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
   );
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const a = __cguAssistants();
   const lastA = a[a.length - 1];
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
@@ -289,7 +418,7 @@ const JS_STATE: &str = r#"(() => {
   // past-tense ("Ran"/"Searched"/"Thought for Xs"), which persist after the turn.
   const ACTIVE = /^(calling|searching|running|using|analyzing|analysing|executing|fetching|connecting|generating|working on)\b/i;
   const tool_active = [...document.querySelectorAll('button, [role="button"]')]
-    .filter(b => !b.closest('[data-message-author-role]')) // exclude in-message buttons
+    .filter(b => !b.closest('[data-message-author-role], [data-conversation-role]')) // exclude in-message buttons
     .some(b => {
       const t = (b.textContent || '').trim();
       return t.length > 0 && t.length <= 24 && ACTIVE.test(t);
@@ -299,20 +428,25 @@ const JS_STATE: &str = r#"(() => {
     stop,
     tool_active,
     convo: cm ? cm[1] : "",
-    user_count: document.querySelectorAll('[data-message-author-role="user"]').length,
+    user_count: __cguUsers().length,
     assistant_count: a.length,
-    limited: /too many requests|requests too quickly/i.test(dlg),
-    atext: lastA ? (lastA.innerText || lastA.textContent || '').trim() : ""
+    limited: "#,
+    js_rate_limit_re!(),
+    r#".test(dlg),
+    atext: __cguText(lastA)
   });
-})()"#;
+})()"#
+);
 
 // JS: scrape the full innerText of the last assistant message.
-const JS_LAST_ASSISTANT: &str = r#"(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
-  const lastA = a[a.length - 1];
-  if (!lastA) return JSON.stringify("");
-  return JSON.stringify((lastA.innerText || lastA.textContent || "").trim());
-})()"#;
+const JS_LAST_ASSISTANT: &str = concat!(
+    "(() => {",
+    js_turn_helpers!(),
+    r#"
+  const a = __cguAssistants();
+  return JSON.stringify(__cguText(a[a.length - 1]));
+})()"#
+);
 
 // JS: the conversation UUID this tab is currently showing, or "" on a
 // not-yet-persisted new chat (the id only materializes after the first turn).
@@ -326,15 +460,23 @@ const JS_CONVO_ID: &str = r#"(() => {
 // authoritative, idempotent evidence that THIS turn was submitted — unlike
 // "is the composer empty?", which races React's clear and misreads in both
 // directions.
-const JS_ASSISTANT_COUNT: &str = r#"(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
-  return JSON.stringify(a.length);
-})()"#;
+const JS_ASSISTANT_COUNT: &str = concat!(
+    "(() => {",
+    js_turn_helpers!(),
+    r#"
+  return JSON.stringify(__cguAssistants().length);
+})()"#
+);
 
-const JS_USER_COUNT: &str = r#"(() => {
-  const u = document.querySelectorAll('[data-message-author-role="user"]');
-  return JSON.stringify(u.length);
-})()"#;
+// JS: the user turns as a [`UserTurns`] snapshot — count plus identities.
+const JS_USER_TURNS: &str = concat!(
+    "(() => {",
+    js_turn_helpers!(),
+    r#"
+  const {ids, known} = __cguUserIds();
+  return JSON.stringify({count: __cguUsers().length, ids, known});
+})()"#
+);
 
 // JS: empty the composer, so a leftover fragment from an aborted turn can't be
 // prepended to the next message.
@@ -349,15 +491,19 @@ const JS_CLEAR_COMPOSER: &str = r#"(() => {
 
 // JS: dismiss a blocking dialog (the rate-limit notice has a "Got it" button).
 // Leaving it up keeps the composer unusable even after the throttle lifts.
-const JS_DISMISS_DIALOG: &str = r#"(() => {
+const JS_DISMISS_DIALOG: &str = concat!(
+    r#"(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
-    .find(d => /too many requests|requests too quickly/i.test(d.textContent || ''));
+    .find(d => "#,
+    js_rate_limit_re!(),
+    r#".test(d.textContent || ''));
   if (!dlg) return JSON.stringify({ok: false});
   const btn = [...dlg.querySelectorAll('button')]
-    .find(b => /got it|ok|dismiss|close/i.test((b.textContent || '').trim()));
+    .find(b => /^(got it|ok|dismiss|close|知道了|了解|关闭|關閉|확인|알겠습니다|閉じる)$/i.test((b.textContent || '').trim()));
   if (btn) { btn.click(); return JSON.stringify({ok: true}); }
   return JSON.stringify({ok: false});
-})()"#;
+})()"#
+);
 
 // JS: fingerprint the composer's contents — the non-whitespace character COUNT
 // and an order-sensitive HASH of those characters.
@@ -777,6 +923,8 @@ pub struct ChannelOptions {
     pub busy_fail: bool,
     /// Receipt to update as the turn progresses (`ask --request-id`).
     pub receipt: Option<PathBuf>,
+    /// Connect even during an account cooldown (see `throttle`).
+    pub ignore_cooldown: bool,
 }
 
 /// Tuning for how `send` decides a reply is COMPLETE. Multi-step connector turns
@@ -850,6 +998,12 @@ impl Channel {
     /// the project if set), and wait for the composer. Errors clearly if no
     /// logged-in browser is available or the account is rate-limited.
     pub fn connect(opts: &ChannelOptions) -> Result<Self> {
+        // An account still cooling down from a recent throttle gets no new
+        // page load: that is exactly the traffic that keeps it throttled.
+        if !opts.ignore_cooldown {
+            check_cooldown()?;
+        }
+
         // Take the surface BEFORE touching the browser: opening the tab and
         // entering a project already mutate the shared window.
         let surface = SurfaceLock::acquire(opts.busy_fail)?;
@@ -956,7 +1110,7 @@ impl Channel {
                     ab_close(&ab, &session);
                     let msg = e.to_string();
                     if msg.contains("rate-limited") || msg.contains("Too many") {
-                        return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
+                        return Err(rate_limited(RATE_LIMIT_MSG));
                     }
                     // A chrome-use session name can go temporarily unusable: a
                     // command that runs too long is judged unresponsive and its
@@ -1092,7 +1246,7 @@ impl Channel {
     fn fill_and_submit(
         &self,
         message: &str,
-        baseline_users: u64,
+        baseline_users: &UserTurns,
         budget: f64,
     ) -> std::result::Result<(), SubmitFailure> {
         self.fill_composer(message, budget)
@@ -1229,7 +1383,7 @@ impl Channel {
     }
 
     /// Press Enter and return only once a new user turn proves it landed.
-    fn submit(&self, baseline_users: u64, budget: f64) -> std::result::Result<(), SubmitFailure> {
+    fn submit(&self, baseline_users: &UserTurns, budget: f64) -> std::result::Result<(), SubmitFailure> {
         // From here on a retry could DUPLICATE the message, so every failure is
         // reported as ambiguous and the caller must not resend blindly.
         ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
@@ -1435,19 +1589,19 @@ impl Channel {
         Ok(())
     }
 
-    /// Number of rendered user turns, or `None` if the page couldn't be read.
-    fn user_turn_count(&self, budget: f64) -> Option<u64> {
-        ab_eval(&self.ab, JS_USER_COUNT, &self.session, budget)
+    /// The rendered user turns, or `None` if the page couldn't be read.
+    fn user_turns(&self, budget: f64) -> Option<UserTurns> {
+        ab_eval(&self.ab, JS_USER_TURNS, &self.session, budget)
             .ok()
-            .and_then(|v| v.as_u64())
+            .and_then(|v| UserTurns::from_json(&v))
     }
 
     /// Poll up to `within` for the user-turn count to exceed `baseline` — i.e.
     /// for positive evidence that our submit was accepted.
-    fn await_user_turn(&self, baseline: u64, within: Duration, budget: f64) -> bool {
+    fn await_user_turn(&self, baseline: &UserTurns, within: Duration, budget: f64) -> bool {
         let until = Instant::now() + within;
         loop {
-            if self.user_turn_count(budget).is_some_and(|n| n > baseline) {
+            if self.user_turns(budget).is_some_and(|now| user_turn_rose(baseline, &now)) {
                 return true;
             }
             if Instant::now() >= until {
@@ -1483,6 +1637,7 @@ impl Channel {
             model: None,
             busy_fail: opts.busy_fail,
             receipt: None,
+            ignore_cooldown: opts.ignore_cooldown,
         };
         let mut chan = Channel::connect(&plain)?;
         chan.convo_id = Some(convo_id.to_string());
@@ -1620,6 +1775,9 @@ impl Channel {
     }
 
     fn send_turn(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+        // `serve` holds one channel for hours: a throttle hit on one turn must
+        // also hold back the next, not only the next process.
+        check_cooldown()?;
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
 
         let remaining_secs = || {
@@ -1657,8 +1815,8 @@ impl Channel {
         }
 
         // Snapshot rendered user turns: a rise in this count is our submit
-        // receipt (see JS_USER_COUNT).
-        let mut baseline_users: u64 = self.user_turn_count(remaining_secs()).unwrap_or(0);
+        // receipt (see `user_turn_rose`).
+        let mut baseline_users = self.user_turns(remaining_secs()).unwrap_or_default();
 
         // Snapshot the current number of assistant messages so we can detect
         // when a NEW one arrives.
@@ -1678,7 +1836,11 @@ impl Channel {
             .into());
         }
 
-        if let Err(first) = self.fill_and_submit(message, baseline_users, remaining_secs()) {
+        crate::throttle::note_event(
+            crate::throttle::EVENT_SEND,
+            serde_json::json!({ "conversation_id": self.convo_id, "chars": message.chars().count() }),
+        );
+        if let Err(first) = self.fill_and_submit(message, &baseline_users, remaining_secs()) {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
                 return Err(first.into_error());
@@ -1697,11 +1859,11 @@ impl Channel {
 
             // Re-baseline against the reattached page, and skip the resend
             // entirely if the message turns out to be in flight already.
-            let users_now = self.user_turn_count(remaining_secs()).unwrap_or(0);
-            if self.convo_id.is_some() && users_now > baseline_users {
+            let users_now = self.user_turns(remaining_secs()).unwrap_or_default();
+            if self.convo_id.is_some() && user_turn_rose(&baseline_users, &users_now) {
                 eprintln!("the message had already been submitted; observing that turn");
             } else {
-                self.fill_and_submit(message, users_now, remaining_secs())
+                self.fill_and_submit(message, &users_now, remaining_secs())
                     .map_err(SubmitFailure::into_error)
                     .context("resubmitting after reconnect")?;
                 // The poll loop below uses this baseline to tell "our page" from
@@ -1826,24 +1988,20 @@ impl Channel {
             // Id-independent loss check, and the only one that works on turn one:
             // ChatGPT doesn't put /c/<id> in the URL until the FIRST turn is
             // persisted, so mid-turn-one there is no identity to compare. But we
-            // hold a submit receipt — the user-turn count rose — and that count
-            // can never legitimately go DOWN. If it does, we're looking at a
-            // different (blank) page.
+            // hold a submit receipt — the user-turn count rose — and on a short
+            // fresh chat that count never legitimately goes DOWN. If it does,
+            // we're looking at a different (blank) page.
+            //
+            // Only before pinning. Once pinned, the URL check below is the
+            // authority, and the count is not: a long chat is virtualized, so
+            // turns scrolling out of view lower it on a healthy page, and every
+            // false "lost" here costs a reattach against the throttle.
             let users_now = read
                 .as_ref()
                 .ok()
                 .and_then(|v| v.get("user_count"))
                 .and_then(|v| v.as_u64());
-            if users_now.is_some_and(|n| n <= baseline_users) {
-                if self.convo_id.is_some() {
-                    lost_polls += 1;
-                    if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
-                        self.reopen_pinned(remaining_secs())
-                            .context("lost the ChatGPT tab and could not reattach")?;
-                        lost_polls = 0;
-                    }
-                    continue;
-                }
+            if self.convo_id.is_none() && users_now.is_some_and(|n| n <= baseline_users.count) {
                 bail!(
                     "the ChatGPT page was replaced while the first turn was still \
                      running, and ChatGPT does not put a conversation id in the URL \
@@ -1892,6 +2050,10 @@ impl Channel {
                 // dialog. So wait it out inside our own deadline instead, and
                 // keep asking the server, which is the one source still answering.
                 limited_waits += 1;
+                if limited_waits == 1 {
+                    // This turn waits it out below; later runs must not pile on.
+                    crate::throttle::note_rate_limited();
+                }
                 let backoff = Duration::from_secs(match limited_waits {
                     1 => 20,
                     2 => 45,
@@ -2944,6 +3106,8 @@ fn ab_open(
         .as_secs_f64()
         .min(30.0)
         .max(5.0);
+    // A full navigation is the expensive request burst (about 45 for chatgpt.com).
+    crate::throttle::note_event(crate::throttle::EVENT_PAGE_LOAD, serde_json::json!({ "url": url }));
     ab_cmd_with_profile(ab, &["open", url], session, profile, remaining)?;
     Ok(())
 }
@@ -2999,7 +3163,7 @@ fn wait_composer(
         match ab_eval(ab, JS_COMPOSER, session, remaining) {
             Ok(st) if st.is_object() => {
                 if st.get("limited").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
+                    return Err(rate_limited(RATE_LIMIT_MSG));
                 }
                 if st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false) {
                     return Ok(true);
@@ -3206,7 +3370,82 @@ mod tests {
     #[test]
     fn js_probes_target_the_selectors_we_depend_on() {
         assert!(JS_CONVO_ID.contains(r"/\/c\/([0-9a-f-]{36})/i"));
-        assert!(JS_USER_COUNT.contains(r#"[data-message-author-role="user"]"#));
+        assert!(JS_USER_TURNS.contains(r#"[data-message-author-role="user"]"#));
+    }
+
+    #[test]
+    fn turn_probes_read_both_renderers() {
+        // The newer renderer groups both roles under [data-turn-key] and may carry
+        // no author-role attribute at all; every probe must still see its turns.
+        for js in [JS_USER_TURNS, JS_STATE] {
+            assert!(js.contains("[data-user-message-bubble]"), "{js}");
+            assert!(js.contains(r#"[data-message-author-role="user"]:not([data-turn-key] *)"#));
+        }
+        for js in [JS_ASSISTANT_COUNT, JS_LAST_ASSISTANT, JS_STATE] {
+            assert!(js.contains(r#"[data-conversation-role="assistant"]"#), "{js}");
+            assert!(js.contains(r#"[data-message-author-role="assistant"]:not([data-turn-key] *)"#));
+        }
+        assert!(JS_USER_TURNS.contains("data-turn-id-container"));
+    }
+
+    #[test]
+    fn rate_limit_probes_match_localized_dialogs() {
+        for js in [JS_COMPOSER, JS_STATE, JS_DISMISS_DIALOG] {
+            for phrase in ["too many requests", "太多请求", "リクエストが多すぎます", "요청이 너무 많습니다"] {
+                assert!(js.contains(phrase), "{phrase} missing from {js}");
+            }
+        }
+        // A bare unanchored "ok" would click any button whose label contains it.
+        assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    fn turns(count: u64, ids: &[&str], known: &[&str]) -> UserTurns {
+        UserTurns {
+            count,
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+            known: known.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn user_turn_rose_on_a_fresh_chat() {
+        assert!(user_turn_rose(&turns(0, &[], &[]), &turns(1, &["u1"], &["u1"])));
+        assert!(!user_turn_rose(&turns(0, &[], &[]), &turns(0, &[], &[])));
+    }
+
+    #[test]
+    fn user_turn_rose_by_identity_despite_virtualization() {
+        // Two old turns at baseline; one scrolls out as ours arrives: count flat.
+        let base = turns(2, &["u1", "u2"], &["u1", "u2"]);
+        assert!(user_turn_rose(&base, &turns(2, &["u2", "u3"], &["u1", "u2", "u3"])));
+    }
+
+    #[test]
+    fn remounting_an_old_turn_is_not_a_submit() {
+        // u1 was virtualized at baseline (container only); it remounts later.
+        let base = turns(1, &["u2"], &["u1", "u2"]);
+        assert!(!user_turn_rose(&base, &turns(2, &["u1", "u2"], &["u1", "u2"])));
+    }
+
+    #[test]
+    fn grouped_renderer_identities_work_too() {
+        let base = turns(1, &["group:a"], &["group:a"]);
+        assert!(user_turn_rose(&base, &turns(2, &["group:a", "group:b"], &["group:a", "group:b"])));
+    }
+
+    #[test]
+    fn user_turn_rose_falls_back_to_count_without_identities() {
+        assert!(user_turn_rose(&turns(2, &[], &[]), &turns(3, &[], &[])));
+        assert!(!user_turn_rose(&turns(2, &[], &[]), &turns(2, &[], &[])));
+        // One rendered turn has no identity: the id test could miss it, so count.
+        assert!(user_turn_rose(&turns(1, &["u1"], &["u1"]), &turns(2, &["u1"], &["u1"])));
+    }
+
+    #[test]
+    fn user_turns_parse_from_probe_json() {
+        let v = serde_json::json!({"count": 2, "ids": ["a", "b"], "known": ["a", "b", "c"]});
+        assert_eq!(UserTurns::from_json(&v), Some(turns(2, &["a", "b"], &["a", "b", "c"])));
+        assert_eq!(UserTurns::from_json(&serde_json::json!(3)), None);
     }
 
     #[test]
