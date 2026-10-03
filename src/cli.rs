@@ -179,9 +179,19 @@ pub struct AskArgs {
     /// Non-ask modes send a typed delegation packet and parse a structured reply.
     #[arg(long, value_enum, default_value_t = crate::delegation::Mode::Ask)]
     pub mode: crate::delegation::Mode,
-    /// For non-ask modes, emit the parsed delegation packet as JSON on stdout.
+    /// Print ONE JSON envelope on stdout instead of text, with an exit code
+    /// to match: {status, result: {text}, conversation_id, request_id, error}.
+    /// Same statuses and codes as --output-schema. For --mode plan|review|...
+    /// it prints the parsed delegation packet instead.
     #[arg(long)]
     pub json: bool,
+    /// Read stdin as context, waiting for it to close. By default stdin is read
+    /// only when it is not a terminal and data arrives within a few seconds.
+    #[arg(long, conflicts_with = "no_stdin")]
+    pub stdin: bool,
+    /// Never read stdin.
+    #[arg(long = "no-stdin")]
+    pub no_stdin: bool,
     /// Ask for one JSON value, validate it against this JSON Schema file and
     /// print ONE result envelope on stdout: status completed | schema_violation
     /// | unparseable | incomplete | unavailable | failed | schema_error, with a

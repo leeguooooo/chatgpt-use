@@ -53,6 +53,13 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
 ```
 
 - The **caller** decides what context to send — `chatgpt-use` just relays it and returns ChatGPT's text.
+- **stdin** is context when it is piped (it goes after any `--file`, before the prompt). By default
+  it is read only if data arrives within 5 seconds, so an agent harness that leaves an empty pipe
+  open cannot hang the run; `--stdin` waits for it to close, `--no-stdin` never reads it. Over
+  512 KiB fails before anything is sent.
+- `--json` prints one envelope instead of text — `{"status":"completed","result":{"text":…},
+  "conversation_id":…,"request_id":…}` or a failure with `error` — using the statuses and exit
+  codes below. Without `--json` the reply is plain text and any failure exits 1.
 - ChatGPT does **not** touch your machine in this mode.
 - Borrows the web-driving practices proven in
   [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen): profile auto-detection
@@ -82,6 +89,9 @@ chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.sche
 | `submission_unknown` | `resume`: no conversation on record to attach to; not resent | 10 |
 | `cancelled` | the request was cancelled, and that is confirmed | 11 |
 | `cancel_requested` | stop was pressed but not confirmed; it may still be generating | 12 |
+
+The same envelope comes from plain `ask --json`, with `result: {"text": …}` instead of a validated
+value; `schema_violation`, `unparseable` and `schema_error` only arise with a schema.
 
 A reply that was stopped or cut off at the length limit is `incomplete`, never `completed`. The
 conversation record marks such a turn as closed, just like a finished one, and only
