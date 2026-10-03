@@ -35,6 +35,7 @@ pub fn run(args: &RefreshArgs) -> Result<()> {
         model: None,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
+        ignore_cooldown: false,
     };
 
     let channel = Channel::connect(&opts)?;

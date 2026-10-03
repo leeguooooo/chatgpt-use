@@ -52,6 +52,7 @@ pub fn run(args: &WorkArgs) -> Result<()> {
         model,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
+        ignore_cooldown: false,
     };
 
     let sopts = SendOptions::work();

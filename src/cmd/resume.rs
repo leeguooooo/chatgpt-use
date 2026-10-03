@@ -59,6 +59,7 @@ fn resume(args: &ResumeArgs) -> Value {
         model: None,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
+        ignore_cooldown: false,
     };
     let reply = Channel::attach(&opts, &convo).and_then(|mut channel| {
         let reply = channel.await_record();

@@ -79,6 +79,9 @@ fn cancel(args: &CancelArgs) -> Value {
         model: None,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
+        // Stopping a reply that is still generating is worth one page load
+        // even mid-cooldown; it is the one action that ends traffic.
+        ignore_cooldown: true,
     };
     let result = Channel::attach(&opts, &convo).and_then(|mut channel| {
         let result = channel.cancel_pinned();

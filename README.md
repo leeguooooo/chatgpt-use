@@ -234,7 +234,7 @@ than an error message:
 | the page never reports the turn finished | ask the server; take the reply from the conversation record |
 | the page wedges mid-generation and the composer locks | reload the pinned conversation to free it |
 | the project page won't render | start in a plain chat, then file the conversation into the project through the API |
-| the account is throttled | back off inside the deadline (20s / 45s / 90s) and keep asking the server — a turn that finished during the throttle is returned, not lost |
+| the account is throttled | back off inside the deadline (20s / 45s / 90s) and keep asking the server — a turn that finished during the throttle is returned, not lost — then hold new runs back for a cooldown (see Request economy) |
 | the tab is closed or navigated away | reattach by conversation id; before the first turn has an id, start a fresh chat |
 
 The rule underneath all of them: **the record is authoritative, the page is a keyboard.** When the
@@ -260,6 +260,17 @@ So connecting reuses the open tab instead of reloading it, reattaching clicks th
 bearer token is fetched once per five minutes rather than per call, and a project's id is remembered
 in `~/.chatgpt-use/projects.json` rather than re-listing every project each run. Per-invocation cost
 went from roughly 90 requests to single digits.
+
+Once the throttle does trip, the cheapest request is the one not made:
+
+- **Account-wide cooldown.** A "Too many requests" hit writes `~/.chatgpt-use/throttle.json`, and
+  every run on the machine (`ask`, `run`, `serve`, a `serve` turn already connected) refuses with
+  `rate_limited` until it expires, without touching the browser. 5 min after the first hit, 15 and
+  then 30 min for repeats within the hour. `CHATGPT_USE_IGNORE_COOLDOWN=1` goes anyway.
+- **Pace warning.** Page loads and sent prompts are logged to the ledger. Past 15 page loads or 40
+  prompts in an hour, each new one prints a warning to stderr. It never blocks: ChatGPT publishes no
+  quota. Tune with `CHATGPT_USE_WARN_LOADS_PER_HOUR` / `CHATGPT_USE_WARN_SENDS_PER_HOUR` (`0` turns
+  a warning off).
 
 ---
 
