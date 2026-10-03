@@ -193,6 +193,51 @@ protocol re-dressed as an Anthropic API so an *existing* harness can wear ChatGP
 
 ---
 
+## Use it from any agent
+
+One contract for every harness: the CLI's `--json` envelope, and the same envelope from a
+caller-facing MCP server. Any agent that can run a shell command can use the first; any MCP client
+can use the second.
+
+**From a shell** (works everywhere):
+
+```bash
+chatgpt-use ask --json --request-id review-42 "Review this diff" < change.patch
+chatgpt-use status review-42      # never touches the browser
+chatgpt-use resume review-42      # lost the call? wait for its reply without resending
+chatgpt-use cancel review-42
+```
+
+**As an MCP server** — `chatgpt-use agent-mcp` speaks MCP over stdio and offers four tools, `ask`,
+`status`, `resume` and `cancel`, returning the same envelope as `structuredContent`. It exposes no
+file or shell tools (that is `chatgpt-use mcp`, which ChatGPT calls). One ask runs at a time; a
+second returns `busy` at once, and `status`/`cancel` answer while an ask runs. Cancelling one
+request stops only that request, never the server. While an ask runs it sends a progress
+notification every 15 s to clients that ask for them.
+
+A ChatGPT turn can take several minutes, so give the tool call room:
+
+| Agent | Register | Long turns |
+|---|---|---|
+| Claude Code | `claude mcp add chatgpt-use -- chatgpt-use agent-mcp` | if calls time out, raise `MCP_TOOL_TIMEOUT` (ms) |
+| Codex | `codex mcp add chatgpt-use -- chatgpt-use agent-mcp` | add `tool_timeout_sec = 900` under `[mcp_servers.chatgpt-use]` in `~/.codex/config.toml` (default 300 s) |
+| Pi ≥ 0.99 | `pi mcp add chatgpt-use -- chatgpt-use agent-mcp` | Pi's 60 s default is reset by the progress notifications; or set `"timeout"` in `~/.pi/agent/mcp.json` |
+
+Pi gained built-in MCP in 0.99.0 ([docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/mcp.md));
+older Pi can use the CLI through the skill below. Defaults for every ask (`--model`, `--project`,
+`--timeout`, `--profile`, `--session`) can be passed after `agent-mcp`; a tool call may override
+model, project and timeout.
+
+**The skill** — `SKILL.md` follows the [Agent Skills](https://agentskills.io/specification) format,
+so the same file serves Claude Code, Codex and Pi (which also reads `~/.agents/skills/`):
+`npx skills add leeguooooo/chatgpt-use`.
+
+What has been checked, offline and without asking ChatGPT anything: Claude Code (`claude mcp list` →
+Connected) and Pi 1.0.1 (`pi mcp list` → connected, 4 tools) both start the server and complete the
+MCP handshake; Codex 0.160 accepts the configuration, `tool_timeout_sec` included, but has no
+offline command that connects, so its handshake is unverified. A real ask through any of them has
+not been run here.
+
 ## How it works
 
 ```

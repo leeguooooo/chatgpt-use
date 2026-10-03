@@ -37,6 +37,12 @@ chatgpt-use work "<task>" [--loop] [--max-turns N]     # needs connector + mcp -
 chatgpt-use mcp --port 8788 --cwd <project>            # read-only by default, safe to tunnel
 #   --profile full --permission-mode trusted|dangerous  # write/bash — trusted/local only
 
+# Machine use — one JSON envelope + exit code; stdin is context when piped
+chatgpt-use ask --json [--request-id <id>] "<question>"   # then status|resume|cancel <id>
+
+# Any MCP client — ask / status / resume / cancel as tools, same envelope
+chatgpt-use agent-mcp      # e.g. claude mcp add chatgpt-use -- chatgpt-use agent-mcp
+
 # Experimental: local agent loop (run) / Anthropic-compatible endpoint (serve)
 chatgpt-use run "<task>" [--approve]
 chatgpt-use serve --port 8787    # then ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude

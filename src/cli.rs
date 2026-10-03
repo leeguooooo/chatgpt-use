@@ -68,7 +68,9 @@ pub struct UpgradeArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct AgentMcpArgs {
-    /// Defaults for every ask; a tool call may override model, project and timeout.
+    /// Defaults for every ask; a tool call may override model, project and
+    /// timeout. `--busy` has no effect here: a tool call never queues behind
+    /// another run, it returns status busy at once.
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
