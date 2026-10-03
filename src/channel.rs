@@ -342,11 +342,15 @@ macro_rules! js_turn_helpers {
     const last = a[a.length - 1];
     if (!last) return '';
     const turn = (e) => { const t = e.closest('[data-turn-id]'); return t && t.getAttribute('data-turn-id'); };
-    const id = turn(last);
     const users = __cguUsers();
     const lastUser = users[users.length - 1];
-    const tail = id ? a.filter(e => turn(e) === id &&
-      !(lastUser && (e.compareDocumentPosition(lastUser) & Node.DOCUMENT_POSITION_FOLLOWING))) : [last];
+    if (!lastUser) return __cguText(last);
+    // Only what follows the latest question is its reply. A grouped turn is
+    // both its user and its assistant unit, so it counts as following itself.
+    const after = a.filter(e => e === lastUser ||
+      !(e.compareDocumentPosition(lastUser) & Node.DOCUMENT_POSITION_FOLLOWING));
+    const id = turn(last);
+    const tail = id ? after.filter(e => turn(e) === id) : after;
     return tail.map(__cguText).filter(Boolean).join('\n\n');
   };
   const __cguUserIds = () => {

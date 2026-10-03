@@ -82,7 +82,7 @@ test("grouped renderer: a turn with only the question has no reply", () => {
     <div data-turn-key="k2"><div data-user-message-bubble>q2</div></div>`);
   assert.equal(run("user_turns").count, 2);
   assert.equal(run("assistant_count"), 1);
-  assert.equal(run("state").atext, "one");
+  assert.equal(run("state").atext, "", "the previous reply is not this question's");
 });
 
 test("search-unit renderer inside a turn-key, role only in the unit key", () => {
@@ -124,11 +124,32 @@ test("a grouped turn never reads the user's own words as the reply", () => {
 });
 
 test("the reply is cut at the last user turn even with no turn ids", () => {
-  const run = page(`
+  const grouped = page(`
     <div data-turn-key="k1"><div data-user-message-bubble>q1</div><div data-conversation-role="assistant">old</div></div>
     <div data-turn-key="k2"><div data-user-message-bubble>q2</div></div>`);
-  assert.equal(run("last_assistant"), "old", "no new reply yet: the previous one, never q2");
-  assert.equal(run("assistant_count"), 1);
+  assert.equal(grouped("last_assistant"), "", "no new reply yet: neither the old reply nor q2");
+  assert.equal(grouped("assistant_count"), 1);
+  const legacy = page(`
+    <div data-message-author-role="user">q1</div><div data-message-author-role="assistant">old</div>
+    <div data-message-author-role="user">q2</div>`);
+  assert.equal(legacy("last_assistant"), "");
+  assert.equal(legacy("state").atext, "");
+});
+
+test("raw search units with no turn ids: a stale reply is cut, a new one read whole", () => {
+  const stale = page(`
+    <div data-chatgpt-search-unit-key="a:user">q1</div>
+    <div data-chatgpt-search-unit-key="b:assistant">stale answer</div>
+    <div data-content-search-unit-key="c:user">q2</div>`);
+  assert.equal(stale("last_assistant"), "");
+  assert.equal(stale("state").atext, "");
+  const fresh = page(`
+    <div data-chatgpt-search-unit-key="a:user">q1</div>
+    <div data-chatgpt-search-unit-key="b:assistant">stale answer</div>
+    <div data-content-search-unit-key="c:user">q2</div>
+    <div data-content-search-unit-key="d:assistant">new part 1</div>
+    <div data-content-search-unit-key="e:assistant">new part 2</div>`);
+  assert.equal(fresh("last_assistant"), "new part 1\n\nnew part 2");
 });
 
 test("repeated wrappers around one reply keep all of its text", () => {
