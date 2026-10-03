@@ -41,6 +41,11 @@ pub enum Command {
     /// tools for any MCP-capable agent (Codex, Claude Code, …). Unlike `mcp`,
     /// which ChatGPT calls over a tunnel, this one is called BY your agent and
     /// exposes no file or shell tools.
+    #[command(after_help = "Notes:\n  \
+        --busy has no effect here: a tool call never queues behind another run; it returns \
+        status \"busy\" at once.\n  \
+        Long turns: raise --timeout (default 300 s) AND the agent's tool-call timeout, the \
+        agent's a little higher, e.g. --timeout 900 with a 960 s agent limit.")]
     AgentMcp(AgentMcpArgs),
     /// Report what happened to an `ask --request-id` request, from its receipt.
     /// Never touches the browser.
@@ -69,8 +74,7 @@ pub struct UpgradeArgs {
 #[derive(clap::Args, Debug)]
 pub struct AgentMcpArgs {
     /// Defaults for every ask; a tool call may override model, project and
-    /// timeout. `--busy` has no effect here: a tool call never queues behind
-    /// another run, it returns status busy at once.
+    /// timeout. (`--busy` is inert here; see the subcommand's after_help.)
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
