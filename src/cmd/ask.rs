@@ -26,7 +26,7 @@ use crate::receipt;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -39,6 +39,8 @@ pub const STDIN_LIMIT: usize = 512 * 1024;
 /// Some harnesses hand a child an open pipe they never write to or close; a
 /// plain read would hang there for good.
 const STDIN_FIRST_BYTE_WAIT: Duration = Duration::from_secs(5);
+/// How long default mode waits, in all, for a piped stdin to close.
+const STDIN_TOTAL_WAIT: Duration = Duration::from_secs(60);
 
 /// One ask, as every front end describes it.
 pub struct AskInput {
@@ -246,7 +248,7 @@ fn fenced(text: &str) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdinMode {
-    /// Read it if it is not a terminal and data (or EOF) arrives in time.
+    /// Read it if it is not a terminal, within [`AUTO_WAIT`].
     Auto,
     /// Read it to EOF, however long that takes.
     Wait,
@@ -259,24 +261,45 @@ enum StdinRead {
     Failed(anyhow::Error),
 }
 
+/// How long `ask` waits on stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StdinWait {
+    /// For the first byte (or EOF). `None` waits for good.
+    first: Option<Duration>,
+    /// For EOF, counted from the start. `None` waits for good.
+    total: Option<Duration>,
+}
+
+/// Default mode: an explicit deadline at each stage, so neither a pipe that
+/// never speaks nor one that never closes can hang the run.
+const AUTO_WAIT: StdinWait = StdinWait {
+    first: Some(STDIN_FIRST_BYTE_WAIT),
+    total: Some(STDIN_TOTAL_WAIT),
+};
+/// `--stdin`: the caller said the context is coming, so wait for it.
+const EXPLICIT_WAIT: StdinWait = StdinWait { first: None, total: None };
+
 fn read_stdin(mode: StdinMode) -> StdinRead {
     let wait = match mode {
         StdinMode::Skip => return StdinRead::None,
         StdinMode::Auto if std::io::stdin().is_terminal() => return StdinRead::None,
-        StdinMode::Auto => Some(STDIN_FIRST_BYTE_WAIT),
-        StdinMode::Wait => None,
+        StdinMode::Auto => AUTO_WAIT,
+        StdinMode::Wait => EXPLICIT_WAIT,
     };
     read_capped(std::io::stdin(), STDIN_LIMIT, wait)
 }
 
-/// Read `r` to EOF on a helper thread, up to `cap` bytes. With `first_wait`,
-/// give up (returning no context) when neither data nor EOF arrives in time;
-/// the abandoned thread stays parked on the read and ends with the process.
-fn read_capped<R: Read + Send + 'static>(
-    mut r: R,
-    cap: usize,
-    first_wait: Option<Duration>,
-) -> StdinRead {
+fn not_submitted(message: String) -> StdinRead {
+    StdinRead::Failed(ChannelError::new(ErrorKind::NotSubmitted, message).into())
+}
+
+/// Read `r` to EOF on a helper thread, up to `cap` bytes, within `wait`.
+///
+/// A deadline that passes FAILS the ask (`not_submitted`) rather than sending
+/// it without the context: a slow `git diff` is still a diff the caller meant
+/// to send, and answering without it would look like success. An abandoned
+/// reader thread stays parked on its read and ends with the process.
+fn read_capped<R: Read + Send + 'static>(mut r: R, cap: usize, wait: StdinWait) -> StdinRead {
     enum Ev {
         Started,
         Done(std::io::Result<Vec<u8>>),
@@ -313,48 +336,47 @@ fn read_capped<R: Read + Send + 'static>(
         }
     });
 
-    if let Some(wait) = first_wait {
-        match rx.recv_timeout(wait) {
-            Ok(Ev::Started) => {}
-            Ok(_) => unreachable!("the reader reports Started first"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!(
-                    "note: stdin is open but sent nothing in {}s; continuing without it \
-                     (--stdin waits for it, --no-stdin skips it)",
-                    wait.as_secs()
-                );
-                return StdinRead::None;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return StdinRead::None,
-        }
-    }
+    let begun = Instant::now();
+    let mut started = false;
     loop {
-        match rx.recv() {
-            Ok(Ev::Started) => continue,
+        // The next deadline: the first byte until one arrives, then EOF.
+        let limit = if started { wait.total } else { wait.first.or(wait.total) };
+        let ev = match limit {
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            Some(d) => rx.recv_timeout(d.saturating_sub(begun.elapsed())),
+        };
+        match ev {
+            Ok(Ev::Started) => started = true,
             Ok(Ev::Done(Ok(bytes))) => {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 return if text.trim().is_empty() { StdinRead::None } else { StdinRead::Text(text) };
             }
-            Ok(Ev::Done(Err(e))) => {
-                return StdinRead::Failed(
-                    ChannelError::new(ErrorKind::NotSubmitted, format!("could not read stdin: {e}"))
-                        .into(),
-                )
-            }
+            Ok(Ev::Done(Err(e))) => return not_submitted(format!("could not read stdin: {e}")),
             Ok(Ev::TooLarge) => {
-                return StdinRead::Failed(
-                    ChannelError::new(
-                        ErrorKind::NotSubmitted,
-                        format!(
-                            "stdin is larger than {} KiB; nothing was sent. Trim it, or pass the \
-                             relevant part with --file",
-                            cap / 1024
-                        ),
-                    )
-                    .into(),
-                )
+                return not_submitted(format!(
+                    "stdin is larger than {} KiB; nothing was sent. Trim it, or pass the \
+                     relevant part with --file",
+                    cap / 1024
+                ))
             }
-            Err(_) => return StdinRead::None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let secs = begun.elapsed().as_secs();
+                return not_submitted(if started {
+                    format!(
+                        "stdin was still open after {secs}s; nothing was sent. Pass --stdin to \
+                         wait for it to close, or --no-stdin to ignore it"
+                    )
+                } else {
+                    format!(
+                        "stdin is open but sent nothing in {secs}s; nothing was sent. Pass \
+                         --no-stdin if there is no context to pipe in, or --stdin to wait for it"
+                    )
+                });
+            }
+            // The reader always reports before it ends.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return not_submitted("stdin reader stopped unexpectedly".into())
+            }
         }
     }
 }
@@ -570,10 +592,58 @@ mod tests {
         assert!(fenced("plain").starts_with("```\n"));
     }
 
+    const QUICK: StdinWait = StdinWait {
+        first: Some(Duration::from_millis(300)),
+        total: Some(Duration::from_millis(900)),
+    };
+
+    fn failure_message(read: StdinRead) -> String {
+        match read {
+            StdinRead::Failed(e) => {
+                let env = structured::failure(&e);
+                assert_eq!(env["status"], "failed");
+                assert_eq!(env["error"]["kind"], "not_submitted");
+                assert_eq!(env["error"]["submitted"], "no");
+                env["error"]["message"].as_str().unwrap().to_string()
+            }
+            StdinRead::Text(t) => panic!("expected a failure, got text {t:?}"),
+            StdinRead::None => panic!("expected a failure, got no context"),
+        }
+    }
+
+    /// A scripted stdin: each step waits, then yields bytes, EOF or an error;
+    /// after the script it blocks for good, like a pipe nobody closes.
+    enum Step {
+        Wait(u64),
+        Bytes(&'static [u8]),
+        Eof,
+        Fail,
+    }
+    struct Script(std::collections::VecDeque<Step>);
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.0.pop_front() {
+                    Some(Step::Wait(ms)) => std::thread::sleep(Duration::from_millis(ms)),
+                    Some(Step::Bytes(b)) => {
+                        buf[..b.len()].copy_from_slice(b);
+                        return Ok(b.len());
+                    }
+                    Some(Step::Eof) => return Ok(0),
+                    Some(Step::Fail) => return Err(std::io::Error::other("broken pipe")),
+                    None => std::thread::sleep(Duration::from_secs(3600)),
+                }
+            }
+        }
+    }
+    fn script(steps: Vec<Step>) -> Script {
+        Script(steps.into())
+    }
+
     #[test]
     fn reads_piped_text_to_eof() {
         let r = std::io::Cursor::new(b"hello\nworld\n".to_vec());
-        match read_capped(r, 1024, Some(Duration::from_secs(5))) {
+        match read_capped(r, 1024, QUICK) {
             StdinRead::Text(t) => assert_eq!(t, "hello\nworld\n"),
             _ => panic!("expected text"),
         }
@@ -582,40 +652,62 @@ mod tests {
     #[test]
     fn empty_stdin_is_no_context() {
         let r = std::io::Cursor::new(Vec::new());
-        assert!(matches!(read_capped(r, 1024, Some(Duration::from_secs(5))), StdinRead::None));
+        assert!(matches!(read_capped(r, 1024, QUICK), StdinRead::None));
     }
 
     #[test]
     fn oversized_stdin_fails_before_sending() {
         let r = std::io::Cursor::new(vec![b'x'; 5000]);
-        match read_capped(r, 1024, None) {
-            StdinRead::Failed(e) => {
-                let env = structured::failure(&e);
-                assert_eq!(env["status"], "failed");
-                assert_eq!(env["error"]["kind"], "not_submitted");
-                assert_eq!(env["error"]["submitted"], "no");
-            }
-            _ => panic!("expected failure"),
-        }
+        assert!(failure_message(read_capped(r, 1024, EXPLICIT_WAIT)).contains("larger than"));
     }
 
-    /// A pipe a harness opened and never writes to or closes.
-    struct SilentPipe(mpsc::Receiver<()>);
-    impl Read for SilentPipe {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            let _ = self.0.recv(); // blocks for good: the sender is kept alive below
-            Ok(0)
+    #[test]
+    fn a_read_error_on_the_first_read_is_a_failure_not_a_panic() {
+        for wait in [QUICK, EXPLICIT_WAIT] {
+            let msg = failure_message(read_capped(script(vec![Step::Fail]), 1024, wait));
+            assert!(msg.contains("could not read stdin"), "{msg}");
         }
     }
 
     #[test]
-    fn a_silent_open_pipe_does_not_hang_auto_mode() {
-        let (keep, rx) = mpsc::channel::<()>();
-        let started = std::time::Instant::now();
-        let read = read_capped(SilentPipe(rx), 1024, Some(Duration::from_millis(200)));
-        assert!(matches!(read, StdinRead::None));
+    fn a_read_error_mid_stream_is_a_failure() {
+        let r = script(vec![Step::Bytes(b"part"), Step::Fail]);
+        assert!(failure_message(read_capped(r, 1024, QUICK)).contains("could not read stdin"));
+    }
+
+    #[test]
+    fn a_silent_open_pipe_fails_closed_in_auto_mode() {
+        let started = Instant::now();
+        let msg = failure_message(read_capped(script(vec![]), 1024, QUICK));
+        assert!(msg.contains("sent nothing") && msg.contains("--no-stdin"), "{msg}");
         assert!(started.elapsed() < Duration::from_secs(3));
-        drop(keep);
+    }
+
+    #[test]
+    fn a_late_first_byte_fails_rather_than_dropping_the_context() {
+        let r = script(vec![Step::Wait(600), Step::Bytes(b"slow diff"), Step::Eof]);
+        assert!(failure_message(read_capped(r, 1024, QUICK)).contains("sent nothing"));
+    }
+
+    #[test]
+    fn a_first_byte_in_time_then_a_prompt_close_is_read() {
+        let r = script(vec![Step::Wait(100), Step::Bytes(b"diff"), Step::Wait(100), Step::Eof]);
+        assert!(matches!(read_capped(r, 1024, QUICK), StdinRead::Text(t) if t == "diff"));
+    }
+
+    #[test]
+    fn a_pipe_that_never_closes_hits_the_total_deadline() {
+        let started = Instant::now();
+        let r = script(vec![Step::Bytes(b"some")]);
+        let msg = failure_message(read_capped(r, 1024, QUICK));
+        assert!(msg.contains("still open") && msg.contains("--stdin"), "{msg}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn explicit_stdin_waits_past_the_auto_deadlines() {
+        let r = script(vec![Step::Wait(1200), Step::Bytes(b"late"), Step::Wait(200), Step::Eof]);
+        assert!(matches!(read_capped(r, 1024, EXPLICIT_WAIT), StdinRead::Text(t) if t == "late"));
     }
 
     #[test]

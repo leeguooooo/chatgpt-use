@@ -54,9 +54,10 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
 
 - The **caller** decides what context to send — `chatgpt-use` just relays it and returns ChatGPT's text.
 - **stdin** is context when it is piped (it goes after any `--file`, before the prompt). By default
-  it is read only if data arrives within 5 seconds, so an agent harness that leaves an empty pipe
-  open cannot hang the run; `--stdin` waits for it to close, `--no-stdin` never reads it. Over
-  512 KiB fails before anything is sent.
+  the first byte (or EOF) must arrive within 5 seconds and EOF within 60, so an agent harness that
+  leaves a pipe open cannot hang the run; past either deadline the ask fails as `not_submitted`
+  instead of being sent without its context. `--stdin` waits for stdin however long it takes,
+  `--no-stdin` never reads it. Over 512 KiB also fails before anything is sent.
 - `--json` prints one envelope instead of text — `{"status":"completed","result":{"text":…},
   "conversation_id":…,"request_id":…}` or a failure with `error` — using the statuses and exit
   codes below. Without `--json` the reply is plain text and any failure exits 1.
