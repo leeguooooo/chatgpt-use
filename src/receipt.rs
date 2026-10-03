@@ -27,7 +27,16 @@ pub struct Receipt {
     /// The result envelope's status once the turn ended (completed, incomplete, …).
     pub outcome: Option<String>,
     pub error: Option<String>,
+    /// What kind of process `pid` is: absent for a CLI run, which takes a
+    /// SIGTERM as its cancel; `"mcp"` for a request served by `agent-mcp`,
+    /// where `pid` is the whole server and a signal would end every request
+    /// it holds. Such a request is cancelled through [`cancel_marker`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
+
+/// The owner value for a request held by a long-lived `agent-mcp` server.
+pub const OWNER_MCP: &str = "mcp";
 
 impl Receipt {
     pub fn accepted(id: &str) -> Self {
@@ -42,6 +51,7 @@ impl Receipt {
             updated_at: now,
             outcome: None,
             error: None,
+            owner: None,
         }
     }
 }
@@ -56,6 +66,12 @@ pub fn valid_id(id: &str) -> bool {
 
 pub fn path_for(id: &str) -> PathBuf {
     crate::ledger::ledger_dir().join("requests").join(format!("{id}.json"))
+}
+
+/// A file whose existence asks the owner of request `id` to cancel it. Used
+/// for owners that must not be signalled (see [`Receipt::owner`]).
+pub fn cancel_marker(id: &str) -> PathBuf {
+    crate::ledger::ledger_dir().join("requests").join(format!("{id}.cancel"))
 }
 
 pub fn load(path: &Path) -> Option<Receipt> {

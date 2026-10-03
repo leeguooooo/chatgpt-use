@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 pub fn run(args: &ResumeArgs) -> Result<()> {
-    let mut envelope = resume(args);
+    let mut envelope = resume(args, None, None);
     envelope["request_id"] = args.request_id.as_str().into();
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
     crate::ledger::record("resume", json!({"request_id": args.request_id, "status": status}));
@@ -28,7 +28,11 @@ pub fn run(args: &ResumeArgs) -> Result<()> {
     Ok(())
 }
 
-fn resume(args: &ResumeArgs) -> Value {
+/// The resume core: one envelope, never prints or exits. `owner` is recorded
+/// in the receipt while this process runs the request (see `Receipt::owner`).
+/// `inline_schema` takes the place of `--output-schema` for callers holding
+/// the schema as a value.
+pub(crate) fn resume(args: &ResumeArgs, owner: Option<&str>, inline_schema: Option<Value>) -> Value {
     let id = &args.request_id;
     if !receipt::valid_id(id) {
         return refusal("failed", "error", &format!("invalid request id {id:?}"), "no");
@@ -41,16 +45,22 @@ fn resume(args: &ResumeArgs) -> Value {
         Ok(convo) => convo,
         Err(envelope) => return envelope,
     };
-    let schema = match &args.output_schema {
+    let loaded = match (inline_schema, &args.output_schema) {
+        (Some(v), _) => Some(structured::Schema::from_value(v)),
+        (None, Some(p)) => Some(structured::Schema::load(p)),
+        (None, None) => None,
+    };
+    let schema = match loaded {
         None => None,
-        Some(p) => match structured::Schema::load(p) {
-            Ok(s) => Some(s),
-            Err(why) => return structured::schema_error(&why),
-        },
+        Some(Ok(s)) => Some(s),
+        Some(Err(why)) => return structured::schema_error(&why),
     };
 
     // Take ownership, so `status` shows this process as the one running it.
-    receipt::update(&path, |r| r.pid = std::process::id());
+    receipt::update(&path, |r| {
+        r.pid = std::process::id();
+        r.owner = owner.map(str::to_string);
+    });
     let opts = ChannelOptions {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),

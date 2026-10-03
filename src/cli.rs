@@ -37,6 +37,11 @@ pub enum Command {
     /// Refresh the chatgpt-use connector in ChatGPT settings (re-runs tools/list).
     /// Run this after restarting the `mcp` server so ChatGPT re-discovers the tools.
     Refresh(RefreshArgs),
+    /// Caller-facing MCP server on stdio: ask / status / resume / cancel as
+    /// tools for any MCP-capable agent (Codex, Claude Code, …). Unlike `mcp`,
+    /// which ChatGPT calls over a tunnel, this one is called BY your agent and
+    /// exposes no file or shell tools.
+    AgentMcp(AgentMcpArgs),
     /// Report what happened to an `ask --request-id` request, from its receipt.
     /// Never touches the browser.
     Status(StatusArgs),
@@ -59,6 +64,13 @@ pub struct UpgradeArgs {
     /// Like --check, as JSON: {name, current, latest, update_available, skills}.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct AgentMcpArgs {
+    /// Defaults for every ask; a tool call may override model, project and timeout.
+    #[command(flatten)]
+    pub channel: ChannelArgs,
 }
 
 #[derive(clap::Args, Debug)]

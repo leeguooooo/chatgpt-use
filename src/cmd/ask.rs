@@ -48,14 +48,17 @@ pub struct AskInput {
     /// Context file paths, read by [`execute`].
     pub files: Vec<String>,
     /// Context text already in hand (the CLI's stdin, an MCP argument).
-    pub stdin: Option<String>,
+    pub context: Option<String>,
     /// Ask for JSON matching this schema and validate it.
     pub schema: Option<SchemaSource>,
     pub request_id: Option<String>,
+    /// Recorded in the receipt; see `receipt::Receipt::owner`.
+    pub owner: Option<&'static str>,
 }
 
 pub enum SchemaSource {
     Path(String),
+    Inline(Value),
 }
 
 pub fn run(args: &AskArgs) -> Result<()> {
@@ -101,12 +104,13 @@ pub fn run(args: &AskArgs) -> Result<()> {
             let input = AskInput {
                 prompt: args.prompt.clone(),
                 files: args.files.clone(),
-                stdin: match read {
+                context: match read {
                     StdinRead::Text(t) => Some(t),
                     _ => None,
                 },
                 schema: args.output_schema.clone().map(SchemaSource::Path),
                 request_id: args.request_id.clone(),
+                owner: None,
             };
             execute(&input, opts)
         }
@@ -152,7 +156,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         Ok(m) => m,
         Err(e) => return tag(structured::failure(&e), input),
     };
-    match claim_receipt(input.request_id.as_deref()) {
+    match claim_receipt(input.request_id.as_deref(), input.owner) {
         Ok(path) => opts.receipt = path,
         Err(e) => return tag(structured::failure(&e), input),
     }
@@ -183,7 +187,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         serde_json::json!({
             "prompt_chars": input.prompt.len(),
             "files": input.files.len(),
-            "stdin_chars": input.stdin.as_ref().map(|s| s.len()),
+            "context_chars": input.context.as_ref().map(|s| s.len()),
             "model": opts.model,
             "status": envelope["status"],
         }),
@@ -202,6 +206,7 @@ fn tag(mut envelope: Value, input: &AskInput) -> Value {
 fn load_schema(source: &SchemaSource) -> Result<structured::Schema, String> {
     match source {
         SchemaSource::Path(p) => structured::Schema::load(p),
+        SchemaSource::Inline(v) => structured::Schema::from_value(v.clone()),
     }
 }
 
@@ -216,17 +221,17 @@ fn ask_message(input: &AskInput) -> Result<String> {
             .with_context(|| format!("failed to read context file: {path}"))?;
         files.push((path.clone(), contents));
     }
-    Ok(compose(&files, input.stdin.as_deref(), &input.prompt))
+    Ok(compose(&files, input.context.as_deref(), &input.prompt))
 }
 
 /// Pure assembly of the ask message.
-fn compose(files: &[(String, String)], stdin: Option<&str>, prompt: &str) -> String {
+fn compose(files: &[(String, String)], context: Option<&str>, prompt: &str) -> String {
     let mut message = String::new();
     for (path, contents) in files {
         message.push_str(&format!("Context file: {path}\n{}\n\n", fenced(contents)));
     }
-    if let Some(text) = stdin.filter(|t| !t.trim().is_empty()) {
-        message.push_str(&format!("Context from stdin:\n{}\n\n", fenced(text)));
+    if let Some(text) = context.filter(|t| !t.trim().is_empty()) {
+        message.push_str(&format!("Additional context:\n{}\n\n", fenced(text)));
     }
     message.push_str(prompt);
     message
@@ -384,13 +389,14 @@ fn read_capped<R: Read + Send + 'static>(mut r: R, cap: usize, wait: StdinWait) 
 /// Claim the receipt for `--request-id` before anything is sent. Refuses an
 /// id whose earlier request may have reached ChatGPT: the caller asked for a
 /// receipt precisely so that a lost reply is looked up, not sent twice.
-fn claim_receipt(request_id: Option<&str>) -> Result<Option<PathBuf>> {
+fn claim_receipt(request_id: Option<&str>, owner: Option<&str>) -> Result<Option<PathBuf>> {
     let Some(id) = request_id else { return Ok(None) };
     if !receipt::valid_id(id) {
         anyhow::bail!("invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)");
     }
     let path = receipt::path_for(id);
-    let fresh = receipt::Receipt::accepted(id);
+    let mut fresh = receipt::Receipt::accepted(id);
+    fresh.owner = owner.map(str::to_string);
     if receipt::create(&path, &fresh)
         .with_context(|| format!("could not write receipt {}", path.display()))?
     {
@@ -551,9 +557,10 @@ mod tests {
         AskInput {
             prompt: prompt.into(),
             files: vec![],
-            stdin: None,
+            context: None,
             schema: None,
             request_id: None,
+            owner: None,
         }
     }
 
@@ -575,7 +582,7 @@ mod tests {
         let m = compose(&[("a.rs".into(), "fn a() {}\n".into())], Some("diff --git x"), "review");
         let (a, s, p) = (m.find("a.rs").unwrap(), m.find("diff --git").unwrap(), m.rfind("review").unwrap());
         assert!(a < s && s < p, "{m}");
-        assert!(m.contains("Context from stdin:"), "{m}");
+        assert!(m.contains("Additional context:"), "{m}");
         assert!(m.ends_with("review"));
     }
 

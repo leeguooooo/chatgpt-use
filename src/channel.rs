@@ -231,8 +231,35 @@ pub fn install_cancel_handler() {
     }
 }
 
+thread_local! {
+    /// The cancel flag of the task running on this thread, if it has one.
+    static TASK_CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `flag` as this thread's cancel signal, beside the process-wide
+/// one. A long-lived server (`agent-mcp`) gives each request its own flag, so
+/// cancelling one stops only that request, and nothing carries over to the
+/// next: the flag is dropped from the thread when `f` returns or panics.
+pub fn with_cancel_flag<T>(
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TASK_CANCEL.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    TASK_CANCEL.with(|c| *c.borrow_mut() = Some(flag));
+    let _reset = Reset;
+    f()
+}
+
 fn cancel_requested() -> bool {
-    CANCEL.get().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    use std::sync::atomic::Ordering::SeqCst;
+    CANCEL.get().is_some_and(|f| f.load(SeqCst))
+        || TASK_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(SeqCst)))
 }
 
 /// The page's user turns at one moment: how many are rendered, and the stable
@@ -3439,6 +3466,23 @@ mod tests {
         }
         // A bare unanchored "ok" would click any button whose label contains it.
         assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    #[test]
+    fn a_task_cancel_flag_is_scoped_to_its_thread_and_call() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!cancel_requested());
+        with_cancel_flag(flag.clone(), || {
+            assert!(!cancel_requested());
+            flag.store(true, Ordering::SeqCst);
+            assert!(cancel_requested());
+            // Another thread, another task: not cancelled.
+            assert!(!std::thread::spawn(cancel_requested).join().unwrap());
+        });
+        // The next task on this thread starts clean.
+        assert!(!cancel_requested());
     }
 
     fn turns(count: u64, ids: &[&str], known: &[&str]) -> UserTurns {
