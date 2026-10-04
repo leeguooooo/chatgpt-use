@@ -291,6 +291,13 @@ fn check_fingerprint(got: Option<&serde_json::Value>, want_n: u64, want_h: u64) 
     Ok(())
 }
 
+/// Whether a chrome-use failure says the session's tab is gone (closed,
+/// navigated across processes, or lost by the relay) — recoverable by closing
+/// the session and opening a fresh tab.
+fn tab_gone(message: &str) -> bool {
+    message.contains("driving is gone")
+}
+
 /// Polls in a row the turn-one count must stay down before the page counts
 /// as replaced.
 const UNPINNED_DIPS_BEFORE_LOST: u32 = 3;
@@ -1346,6 +1353,14 @@ impl Channel {
                     opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
                 }
             }
+            if matches!(&opened_now, Err(e) if tab_gone(&format!("{e:#}"))) {
+                // The session is bound to a tab chrome-use has lost (seen after
+                // chrome-use updated itself mid-session). Closing the session
+                // drops the dead binding; the next open gets a fresh tab.
+                eprintln!("the chrome-use session lost its tab; closing it and opening a fresh one");
+                ab_close(&ab, &session);
+                opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+            }
             match opened_now {
                 Ok(true) => {
                     eprintln!("using {label}");
@@ -1914,7 +1929,10 @@ impl Channel {
             // tab this command was driving is gone") rather than retarget.
             // Closing the session drops that dead binding; the next open gets
             // a fresh tab on the same conversation, as `connect` does.
-            eprintln!("reopening conversation {id} failed ({first:#}); retrying in a fresh tab");
+            if !tab_gone(&format!("{first:#}")) {
+                return Err(first).context("reopening the pinned conversation");
+            }
+            eprintln!("the chrome-use session lost its tab; reopening conversation {id} in a fresh one");
             ab_close(&self.ab, &self.session);
             ab_open(&self.ab, &self.session, &url, None, deadline)
                 .context("reopening the pinned conversation in a fresh tab")?;
@@ -3789,6 +3807,12 @@ mod tests {
         }
         // A bare unanchored "ok" would click any button whose label contains it.
         assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    #[test]
+    fn a_lost_tab_is_recognised_by_chrome_uses_wording() {
+        assert!(tab_gone("chrome-use [\"open\"] failed (exit 1): ✗ the tab this command was driving is gone — it navigated"));
+        assert!(!tab_gone("chrome-use failed: Too many requests"));
     }
 
     #[test]
