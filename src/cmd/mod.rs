@@ -1,6 +1,7 @@
 //! Subcommand entry points. Each is owned by a different agent and only ever
 //! edits its own file; this module just declares them.
 
+pub mod agent_mcp; // stdio MCP for calling agents: ask / status / resume / cancel
 pub mod ask; // Mode 1 — sidekick / structured delegation
 pub mod cancel; // stop an ask --request-id generation, confirmed from the record
 pub mod handoff; // executor handoff — feed a packet to Codex / Claude Code

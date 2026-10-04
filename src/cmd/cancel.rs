@@ -14,8 +14,6 @@ use crate::receipt;
 use crate::structured;
 use anyhow::Result;
 use serde_json::{json, Value};
-#[cfg(not(windows))]
-use std::time::{Duration, Instant};
 
 pub fn run(args: &CancelArgs) -> Result<()> {
     let mut envelope = cancel(args);
@@ -35,7 +33,8 @@ pub fn run(args: &CancelArgs) -> Result<()> {
     Ok(())
 }
 
-fn cancel(args: &CancelArgs) -> Value {
+/// The cancel core: one envelope, never prints or exits.
+pub(crate) fn cancel(args: &CancelArgs) -> Value {
     let id = &args.request_id;
     if !receipt::valid_id(id) {
         return json!({"status": "failed", "error": {"kind": "error", "message": format!("invalid request id {id:?}")}});
@@ -44,10 +43,18 @@ fn cancel(args: &CancelArgs) -> Value {
     let Some(r) = receipt::load(&path) else {
         return json!({"status": "failed", "error": {"kind": "unknown_request", "message": format!("no receipt for request {id:?}")}});
     };
-    if matches!(r.state.as_str(), "completed" | "failed") {
-        return settled(r.outcome.as_deref(), &r.submitted);
+    match route(&r, receipt::pid_alive) {
+        Route::Settled => return settled(r.outcome.as_deref(), &r.submitted),
+        Route::Marker => match r.owner_token.as_deref() {
+            Some(token) => return mark_owner(&path, id, token),
+            None => {
+                return json!({"status": "unknown", "error": {"kind": "signal_failed",
+                    "message": format!("request {id:?} is held by an agent-mcp server that recorded \
+                                        no owner token; cannot address it")}})
+            }
+        },
+        Route::Signal | Route::Attach => {}
     }
-
     if receipt::pid_alive(r.pid) {
         // Windows has no SIGTERM: the owner can only be killed outright, so it
         // never records an outcome. Kill it and stop the conversation here.
@@ -137,18 +144,60 @@ fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
     if !sent {
         return json!({"status": "unknown", "error": {"kind": "signal_failed", "message": format!("could not signal owner pid {pid}")}});
     }
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline {
+    wait_settled(path, &format!("signalled owner pid {pid}"))
+}
+
+/// How a cancel reaches a request.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// It already ended.
+    Settled,
+    /// Its owner is a live agent-mcp server, holding other requests too: a
+    /// signal would end all of them, so ask through the marker it watches.
+    Marker,
+    /// Its owner is a live CLI run, which takes SIGTERM as its cancel.
+    Signal,
+    /// Its owner is gone: stop the conversation from here.
+    Attach,
+}
+
+fn route(r: &receipt::Receipt, alive: impl Fn(u32) -> bool) -> Route {
+    let live = alive(r.pid);
+    if matches!(r.state.as_str(), "completed" | "failed") || (!live && receipt::has_reply(r)) {
+        Route::Settled
+    } else if !live {
+        Route::Attach
+    } else if r.owner.as_deref() == Some(receipt::OWNER_MCP) {
+        Route::Marker
+    } else {
+        Route::Signal
+    }
+}
+
+/// Ask a live agent-mcp owner to cancel `id`, and wait for it to record how
+/// that ended.
+fn mark_owner(path: &std::path::Path, id: &str, token: &str) -> Value {
+    let marker = receipt::cancel_marker(id, token);
+    if let Err(e) = std::fs::write(&marker, b"") {
+        return json!({"status": "unknown", "error": {"kind": "signal_failed", "message": format!("could not write {}: {e}", marker.display())}});
+    }
+    wait_settled(path, "asked the agent-mcp server holding it to cancel")
+}
+
+/// Wait up to 45s for a cancelled request's owner to record its outcome.
+fn wait_settled(path: &std::path::Path, what: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
         if let Some(r) = receipt::load(path) {
             if matches!(r.state.as_str(), "completed" | "failed") {
                 return settled(r.outcome.as_deref(), &r.submitted);
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     json!({
         "status": "cancel_requested",
-        "message": format!("signalled owner pid {pid}; it has not recorded an outcome yet"),
+        "message": format!("{what}; it has not recorded an outcome yet"),
     })
 }
 
@@ -160,7 +209,7 @@ fn settled(outcome: Option<&str>, submitted: &str) -> Value {
 
 /// A receipt outcome, as a cancel status. Only a recorded `cancelled` is a
 /// confirmed cancel; a reply that exists means the request finished first.
-fn outcome_status(outcome: Option<&str>) -> &'static str {
+pub(crate) fn outcome_status(outcome: Option<&str>) -> &'static str {
     match outcome {
         Some("cancelled") => "cancelled",
         Some("cancel_requested") => "cancel_requested",
@@ -172,6 +221,41 @@ fn outcome_status(outcome: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_mcp_owner_is_never_signalled() {
+        let mut r = receipt::Receipt::accepted("r");
+        r.state = "submitted".into();
+        r.owner = Some(receipt::OWNER_MCP.into());
+        r.owner_token = Some("run-1".into());
+        assert_eq!(route(&r, |_| true), Route::Marker);
+        // A CLI owner takes the signal; a dead owner of either kind is attached to.
+        r.owner = None;
+        assert_eq!(route(&r, |_| true), Route::Signal);
+        assert_eq!(route(&r, |_| false), Route::Attach);
+        r.owner = Some(receipt::OWNER_MCP.into());
+        assert_eq!(route(&r, |_| false), Route::Attach);
+        r.state = "completed".into();
+        assert_eq!(route(&r, |_| true), Route::Settled);
+        // A resume killed mid-reread leaves state "submitted" over a recorded
+        // reply: with its owner dead, that is a finished request, not one to
+        // open the browser for.
+        r.state = "submitted".into();
+        r.outcome = Some("completed".into());
+        assert_eq!(route(&r, |_| false), Route::Settled);
+        assert_eq!(receipt::live_state(&r, |_| false), "completed");
+        assert_eq!(receipt::live_state(&r, |_| true), "running");
+    }
+
+    #[test]
+    fn a_receipt_without_an_owner_field_still_loads() {
+        // Receipts written before agent-mcp have no `owner`.
+        let old = r#"{"request_id":"r","state":"submitted","submitted":"yes","conversation_id":null,
+                      "pid":1,"created_at":0,"updated_at":0,"outcome":null,"error":null}"#;
+        let r: receipt::Receipt = serde_json::from_str(old).unwrap();
+        assert_eq!(r.owner, None);
+        assert!(!serde_json::to_string(&r).unwrap().contains("owner"));
+    }
 
     #[test]
     fn only_a_recorded_cancel_counts_as_cancelled() {

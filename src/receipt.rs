@@ -27,7 +27,21 @@ pub struct Receipt {
     /// The result envelope's status once the turn ended (completed, incomplete, …).
     pub outcome: Option<String>,
     pub error: Option<String>,
+    /// What kind of process `pid` is: absent for a CLI run, which takes a
+    /// SIGTERM as its cancel; `"mcp"` for a request served by `agent-mcp`,
+    /// where `pid` is the whole server and a signal would end every request
+    /// it holds. Such a request is cancelled through [`cancel_marker`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Which run of an `"mcp"` owner holds the request. A cancel marker
+    /// carries it, so only that run honours or removes the marker: not a
+    /// server whose duplicate claim was refused, and not a later retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_token: Option<String>,
 }
+
+/// The owner value for a request held by a long-lived `agent-mcp` server.
+pub const OWNER_MCP: &str = "mcp";
 
 impl Receipt {
     pub fn accepted(id: &str) -> Self {
@@ -42,6 +56,8 @@ impl Receipt {
             updated_at: now,
             outcome: None,
             error: None,
+            owner: None,
+            owner_token: None,
         }
     }
 }
@@ -56,6 +72,15 @@ pub fn valid_id(id: &str) -> bool {
 
 pub fn path_for(id: &str) -> PathBuf {
     crate::ledger::ledger_dir().join("requests").join(format!("{id}.json"))
+}
+
+/// The file that asks one run of request `id` (the owner holding `token`, see
+/// [`Receipt::owner_token`]) to cancel it, for owners that must not be
+/// signalled (see [`Receipt::owner`]). The token is part of the NAME, so each
+/// run watches and removes only its own file: a refused duplicate, a stale
+/// marker from an earlier run, and a later retry can never act on each other's.
+pub fn cancel_marker(id: &str, token: &str) -> PathBuf {
+    crate::ledger::ledger_dir().join("requests").join(format!("{id}.{token}.cancel"))
 }
 
 pub fn load(path: &Path) -> Option<Receipt> {
@@ -148,10 +173,19 @@ pub fn may_send(existing: Option<&Receipt>) -> bool {
 pub fn live_state(r: &Receipt, alive: impl Fn(u32) -> bool) -> String {
     match r.state.as_str() {
         "accepted" | "submitted" if alive(r.pid) => "running".into(),
+        // A reply was recorded before an owner (a `resume` re-reading it) died
+        // mid-update: the request did complete.
+        "accepted" | "submitted" if has_reply(r) => "completed".into(),
         "accepted" => "submission_unknown".into(),
         "submitted" => "detached".into(),
         other => other.into(),
     }
+}
+
+/// Whether the receipt records a reply: the request completed at some point,
+/// whatever its state field says now.
+pub fn has_reply(r: &Receipt) -> bool {
+    matches!(r.outcome.as_deref(), Some("completed" | "schema_violation" | "unparseable"))
 }
 
 /// Whether `pid` is still a chatgpt-use process. Pids are reused, and `cancel`

@@ -44,6 +44,7 @@ fn main() {
         Command::Status(args) => cmd::status::run(args),
         Command::Resume(args) => cmd::resume::run(args),
         Command::Cancel(args) => cmd::cancel::run(args),
+        Command::AgentMcp(args) => cmd::agent_mcp::run(args),
         Command::Upgrade(_) => unreachable!("handled above"),
     };
     if let Err(e) = result {
