@@ -291,6 +291,27 @@ fn check_fingerprint(got: Option<&serde_json::Value>, want_n: u64, want_h: u64) 
     Ok(())
 }
 
+/// Polls in a row the turn-one count must stay down before the page counts
+/// as replaced.
+const UNPINNED_DIPS_BEFORE_LOST: u32 = 3;
+
+/// Turn one, before ChatGPT has put a conversation id in the URL, has only one
+/// sign that the tab now shows a different page: the user-turn count, which
+/// rose when we submitted, falling back to the baseline. A single such read is
+/// not enough — seen live, the poll that lands while a new chat moves from `/`
+/// to `/c/<id>` re-renders the thread and reads low once, and treating that as
+/// fatal threw away a turn that was completing normally. Only a dip that
+/// persists for [`UNPINNED_DIPS_BEFORE_LOST`] polls counts; any other read
+/// resets the count.
+fn unpinned_page_lost(pinned: bool, users_now: Option<u64>, baseline: u64, dips: &mut u32) -> bool {
+    if !pinned && users_now.is_some_and(|n| n <= baseline) {
+        *dips += 1;
+    } else {
+        *dips = 0;
+    }
+    *dips >= UNPINNED_DIPS_BEFORE_LOST
+}
+
 /// The page's user turns at one moment: how many are rendered, and the stable
 /// identities it exposes (see `js_turn_helpers!`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2226,6 +2247,9 @@ impl Channel {
         // navigation hiccup and reads as "the tab is gone".
         const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
         let mut lost_polls = 0u32;
+        // Consecutive unpinned polls whose user-turn count fell back (see
+        // `unpinned_page_lost`).
+        let mut unpinned_dips = 0u32;
 
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
@@ -2317,15 +2341,6 @@ impl Channel {
                 .ok()
                 .and_then(|v| v.get("user_count"))
                 .and_then(|v| v.as_u64());
-            if self.convo_id.is_none() && users_now.is_some_and(|n| n <= baseline_users.count) {
-                bail!(
-                    "the ChatGPT page was replaced while the first turn was still \
-                     running, and ChatGPT does not put a conversation id in the URL \
-                     until that turn finishes — so there is no conversation to \
-                     reattach to. The reply may still have completed in your \
-                     browser; rerun the command."
-                );
-            }
 
             match (&self.convo_id, &seen_convo) {
                 // Latch as soon as the id exists — the server assigns it right
@@ -2351,6 +2366,22 @@ impl Channel {
                     continue;
                 }
                 (None, None) => {}
+            }
+
+            // Checked only now, after a conversation id in the URL had its
+            // chance to pin us: a pinned turn is recoverable and the URL check
+            // above is its authority.
+            if unpinned_page_lost(self.convo_id.is_some(), users_now, baseline_users.count, &mut unpinned_dips) {
+                bail!(
+                    "the ChatGPT page was replaced while the first turn was still \
+                     running, and ChatGPT does not put a conversation id in the URL \
+                     until that turn finishes — so there is no conversation to \
+                     reattach to. The reply may still have completed in your \
+                     browser; rerun the command."
+                );
+            }
+            if unpinned_dips > 0 {
+                continue;
             }
 
             let st = match read {
@@ -3750,6 +3781,24 @@ mod tests {
         }
         // A bare unanchored "ok" would click any button whose label contains it.
         assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    #[test]
+    fn one_low_read_during_turn_one_is_not_a_lost_page() {
+        let mut dips = 0;
+        // The re-render blip: one low read, then the turn is back.
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(!unpinned_page_lost(false, Some(1), 0, &mut dips));
+        assert_eq!(dips, 0);
+        // A page that stays blank is lost on the third poll.
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(unpinned_page_lost(false, Some(0), 0, &mut dips));
+        // Once pinned, or with an unreadable count, the count never decides.
+        let mut d = 2;
+        assert!(!unpinned_page_lost(true, Some(0), 0, &mut d));
+        assert_eq!(d, 0);
+        assert!(!unpinned_page_lost(false, None, 0, &mut d));
     }
 
     #[test]
