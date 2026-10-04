@@ -1510,7 +1510,7 @@ impl Channel {
                      default instead. ChatGPT relabelled the composer picker from \
                      Intelligence levels (instant/high/pro) to model names \
                      (e.g. \"5.6 SolLight\"), so the selector needs updating; rerun \
-                     without --model to accept whatever the account is set to"
+                     with --model current to accept whatever the account is set to"
                 )
             })?;
         }

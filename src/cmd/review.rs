@@ -23,7 +23,12 @@ use std::process::Command;
 
 pub fn run(args: &ReviewArgs) -> Result<()> {
     let here = std::env::current_dir()?;
-    let dir = std::env::temp_dir().join(format!("chatgpt-use-review-{}", std::process::id()));
+    // Unique per run: a pid alone can repeat after a crash left its worktree.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("chatgpt-use-review-{}-{nanos}", std::process::id()));
     let ws = Workspace::prepare(&here, &args.base, &dir)?;
     eprintln!(
         "reviewing {} change(s) since {} ({}) in {}",
@@ -142,6 +147,9 @@ impl Workspace {
             .trim()
             .to_string();
         let _ = std::fs::remove_dir_all(dir);
+        // Drop registrations of worktrees whose directories are gone (a run
+        // that crashed before cleaning up), so `add` is never refused for them.
+        let _ = git(&repo, &["worktree", "prune"]);
         git(&repo, &["worktree", "add", "--detach", &dir.to_string_lossy(), "HEAD"])?;
         let ws = Workspace { repo: repo.clone(), dir: dir.to_path_buf(), merge_base, changed_files: 0 };
 
@@ -175,7 +183,13 @@ impl Workspace {
             ws.remove();
             return Err(e.context("copying the working tree's changes into the review worktree"));
         }
-        let changed = git(dir, &["diff", &ws.merge_base, "--name-only"])?;
+        let changed = match git(dir, &["diff", &ws.merge_base, "--name-only"]) {
+            Ok(c) => c,
+            Err(e) => {
+                ws.remove();
+                return Err(e.context("listing the change in the review worktree"));
+            }
+        };
         Ok(Workspace { changed_files: changed.lines().count(), ..ws })
     }
 
@@ -233,6 +247,26 @@ mod tests {
         ws.remove();
         assert!(!dir.exists());
         assert!(!git(&repo, &["worktree", "list"]).unwrap().contains("wt"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_registration_at_the_path_does_not_block_a_new_review() {
+        let root = std::env::temp_dir().join(format!("cgu-review-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a"), "1\n").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-q", "-m", "x"]);
+        // A crashed run: its worktree registered, its directory deleted.
+        let dir = root.join("wt");
+        sh(&repo, &["worktree", "add", "--detach", &dir.to_string_lossy(), "HEAD"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ws = Workspace::prepare(&repo, "main", &dir).unwrap();
+        assert!(dir.join("a").exists());
+        ws.remove();
         let _ = std::fs::remove_dir_all(&root);
     }
 
