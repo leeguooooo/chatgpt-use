@@ -262,6 +262,35 @@ fn cancel_requested() -> bool {
         || TASK_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(SeqCst)))
 }
 
+/// Compare the composer's fingerprint with the message's. Fails closed: a
+/// probe that errored or came back without a count and hash is not a pass,
+/// or the one check that catches a truncated, polluted or scrambled prompt
+/// would be skipped exactly when the page has changed under us.
+fn check_fingerprint(got: Option<&serde_json::Value>, want_n: u64, want_h: u64) -> Result<()> {
+    let n = got.and_then(|v| v.get("n")).and_then(|v| v.as_u64());
+    let h = got.and_then(|v| v.get("h")).and_then(|v| v.as_u64());
+    let (Some(n), Some(h)) = (n, h) else {
+        bail!(
+            "could not read the composer back to check it ({}) — refusing to submit a \
+             prompt that was not verified",
+            got.map_or("no reply".to_string(), |v| v.to_string())
+        );
+    };
+    if n != want_n {
+        bail!(
+            "composer content doesn't match the message to send ({n} non-whitespace chars \
+             present, {want_n} expected) — refusing to submit a truncated or polluted prompt"
+        );
+    }
+    if h != want_h {
+        bail!(
+            "composer holds the right number of characters ({n}) but not in the right order \
+             (fingerprint {h:#x}, expected {want_h:#x}) — refusing to submit a scrambled prompt"
+        );
+    }
+    Ok(())
+}
+
 /// The page's user turns at one moment: how many are rendered, and the stable
 /// identities it exposes (see `js_turn_helpers!`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1653,27 +1682,7 @@ impl Channel {
         // leeguooooo/chrome-use#301 does to chunked inserts.
         let (want_n, want_h) = composer_fingerprint(message);
         let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
-        let got_n = got.as_ref().and_then(|v| v.get("n")).and_then(|v| v.as_u64());
-        let got_h = got.as_ref().and_then(|v| v.get("h")).and_then(|v| v.as_u64());
-        if let (Some(n), Some(h)) = (got_n, got_h) {
-            if n != want_n {
-                bail!(
-                    "composer content doesn't match the message to send \
-                     ({n} non-whitespace chars present, {want_n} expected) — \
-                     refusing to submit a truncated or polluted prompt"
-                );
-            }
-            if h != want_h as u64 {
-                bail!(
-                    "composer holds the right number of characters ({n}) but not in \
-                     the right order (fingerprint {h:#x}, expected {:#x}) — refusing \
-                     to submit a scrambled prompt",
-                    want_h
-                );
-            }
-        }
-
-        Ok(())
+        check_fingerprint(got.as_ref(), want_n, want_h as u64)
     }
 
     /// Press Enter and return only once a new user turn proves it landed.
@@ -3737,6 +3746,20 @@ mod tests {
         }
         // A bare unanchored "ok" would click any button whose label contains it.
         assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    #[test]
+    fn the_fingerprint_check_fails_closed() {
+        let ok = serde_json::json!({"n": 3, "h": 7});
+        assert!(check_fingerprint(Some(&ok), 3, 7).is_ok());
+        assert!(check_fingerprint(Some(&ok), 4, 7).unwrap_err().to_string().contains("truncated"));
+        assert!(check_fingerprint(Some(&ok), 3, 8).unwrap_err().to_string().contains("scrambled"));
+        // A probe that failed or answered in another shape is not a pass.
+        for bad in [None, Some(serde_json::json!({})), Some(serde_json::json!({"n": 3})),
+                    Some(serde_json::json!("error"))] {
+            let e = check_fingerprint(bad.as_ref(), 3, 7).unwrap_err().to_string();
+            assert!(e.contains("not verified"), "{e}");
+        }
     }
 
     #[test]
