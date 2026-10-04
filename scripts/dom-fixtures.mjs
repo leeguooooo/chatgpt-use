@@ -18,7 +18,13 @@ function page(html) {
   dom.window.eval(
     "Object.defineProperty(HTMLElement.prototype,'innerText',{get(){return this.textContent}})",
   );
-  return (name) => JSON.parse(dom.window.eval(probe(name)));
+  // jsdom has no execCommand: record what the probe asked for, against which node.
+  dom.window.eval(`document.execCommand = (cmd, ui, value) => {
+    (window.__exec = window.__exec || []).push([cmd, value === undefined ? null : value]); return true; };`);
+  const run = (name) => JSON.parse(dom.window.eval(probe(name)));
+  run.doc = dom.window.document;
+  run.window = dom.window;
+  return run;
 }
 
 const cases = [];
@@ -211,6 +217,76 @@ test("rate-limit dialog in each language is detected and dismissed", () => {
   const quiet = page(`<div role="dialog">Okay, here is the answer<button>Look</button></div>`);
   assert.equal(quiet("state").limited, false);
   assert.equal(quiet("dismiss_dialog").ok, false);
+});
+
+const stamped = (run) => [...run.doc.querySelectorAll("[data-cgu-composer]")];
+
+test("composer: the ProseMirror box with #prompt-textarea", () => {
+  const run = page(`<form><div id="prompt-textarea" contenteditable="true">draft</div></form>`);
+  assert.equal(run("composer").composer, true);
+  assert.deepEqual(stamped(run).map(n => n.id), ["prompt-textarea"]);
+});
+
+test("composer: the Lexical editor with no #prompt-textarea at all", () => {
+  const run = page(`<form data-chatgpt-composer>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox">a b</div></form>`);
+  assert.equal(run("composer").composer, true);
+  assert.equal(stamped(run).length, 1);
+  assert.equal(run("composer_fingerprint").n, 2, "reads the Lexical editor's text");
+  const ins = run("insert_hello");
+  assert.equal(ins.ok, true, JSON.stringify(ins));
+  assert.deepEqual(JSON.parse(JSON.stringify(run.window.__exec.at(-1))), ["insertText", "hello"]);
+  assert.equal(run("clear_composer").ok, true);
+});
+
+test("composer: a hidden kept page's stale editor is never chosen", () => {
+  const run = page(`
+    <div data-app-shell-page-surface style="display:none"><form><div id="prompt-textarea" contenteditable="true">old</div></form></div>
+    <div data-app-shell-page-surface><form data-chatgpt-composer>
+      <div contenteditable="true" data-lexical-editor="true" role="textbox" id="live">new</div></form></div>`);
+  assert.equal(run("composer").composer, true);
+  assert.deepEqual(stamped(run).map(n => n.id), ["live"]);
+  assert.equal(run("composer_fingerprint").n, 3, "the visible one's text, not the stale one's");
+});
+
+test("composer: a wrapper and its inner editor resolve to the inner one", () => {
+  const run = page(`<form><div id="prompt-textarea"><div contenteditable="true" data-lexical-editor="true" id="inner"></div></div></form>`);
+  assert.equal(run("composer").composer, true);
+  assert.deepEqual(stamped(run).map(n => n.id), ["inner"]);
+});
+
+test("composer: two visible editors are ambiguous and read as none", () => {
+  const run = page(`
+    <form><div id="prompt-textarea" contenteditable="true"></div></form>
+    <form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox"></div></form>`);
+  assert.equal(run("composer").composer, false);
+  assert.equal(stamped(run).length, 0);
+  assert.equal(run("insert_hello").error, "composer not found");
+  assert.equal(run.window.__exec, undefined, "nothing typed anywhere");
+});
+
+test("composer: an edit box inside a conversation turn is not the composer", () => {
+  const run = page(`
+    <div data-turn-key="k"><div data-user-message-bubble><form data-chatgpt-composer>
+      <div contenteditable="true" role="textbox" data-lexical-editor="true">editing q</div></form></div></div>
+    <form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox" id="main"></div></form>`);
+  assert.deepEqual(stamped(run).length ? [stamped(run)[0].id] : [], []);
+  assert.equal(run("composer").composer, true);
+  assert.deepEqual(stamped(run).map(n => n.id), ["main"]);
+});
+
+test("composer: the stamp follows the composer and never lingers", () => {
+  const run = page(`<form><div id="prompt-textarea" contenteditable="true"></div></form>`);
+  run("composer");
+  run.doc.querySelector("#prompt-textarea").closest("form").style.display = "none";
+  run.doc.querySelector("form").setAttribute("hidden", "");
+  assert.equal(run("composer").composer, false);
+  assert.equal(stamped(run).length, 0, "the hidden node lost its stamp");
+});
+
+test("composer: no editor at all (a page still loading)", () => {
+  const run = page(`<main>loading</main>`);
+  assert.deepEqual(run("composer"), { composer: false, limited: false });
 });
 
 let failed = 0;

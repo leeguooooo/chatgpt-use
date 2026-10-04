@@ -5,7 +5,7 @@
 //!   - locate the `chrome-use` binary; pick the browser (relay first, then a
 //!     logged-in profile; honor `profile = auto|relay|"Profile N"`)
 //!   - open chatgpt.com (optionally inside a ChatGPT Project), wait for the
-//!     #prompt-textarea composer
+//!     composer (`js_composer_helper!`: ProseMirror or the Lexical editor)
 //!   - submit a message; poll page state until the stop/streaming control
 //!     disappears (reply complete); detect the "Too many requests" dialog
 //!   - read the newest assistant message text/markdown back out
@@ -400,6 +400,53 @@ macro_rules! js_turn_helpers {
     };
 }
 
+/// JS helper `__cguComposer()`: the one composer the user would type into, or
+/// null.
+///
+/// ChatGPT's editor has two forms in the wild: the ProseMirror box with id
+/// `#prompt-textarea`, and the newer Lexical rich editor, which need not carry
+/// that id at all (selectors as recorded by miuuyy/codex-chatgpt-web
+/// `chatgpt-session.ts` and totec448-spec/chat-on-steroids `chatgpt-dom.js`,
+/// both early October 2026). Looking only for the id read a page with the new
+/// editor as having no composer, and every run failed before sending.
+///
+/// The app also keeps earlier pages mounted but hidden
+/// (`[data-app-shell-page-surface]` with `display: none`), each with its own
+/// editor, so the visible one is chosen, never the first match. Nested matches
+/// resolve to the innermost editable node. More than one visible candidate is
+/// ambiguous and reads as none: typing into the wrong box is worse than failing.
+///
+/// The chosen node is stamped `data-cgu-composer`, so a real-input click can
+/// target it by selector (`[data-cgu-composer]`).
+macro_rules! js_composer_helper {
+    () => {
+        r#"
+  const __cguComposer = () => {
+    const hidden = (n) => {
+      for (let p = n.closest('[data-app-shell-page-surface]'); p;
+           p = p.parentElement && p.parentElement.closest('[data-app-shell-page-surface]')) {
+        if (getComputedStyle(p).display === 'none') return true;
+      }
+      return !!n.closest('[hidden], [aria-hidden="true"], [inert]');
+    };
+    const all = [...document.querySelectorAll(
+      '#prompt-textarea, [data-testid="prompt-textarea"], ' +
+      '[contenteditable="true"][data-lexical-editor="true"], ' +
+      'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"], ' +
+      'form [data-composer-markdown][contenteditable="true"][role="textbox"]')]
+      .filter(n => !hidden(n) && !n.closest('[data-turn-key], [data-message-author-role], .markdown'));
+    const live = all.filter(n => !all.some(o => o !== n && n.contains(o)));
+    for (const n of document.querySelectorAll('[data-cgu-composer]')) {
+      if (!(live.length === 1 && live[0] === n)) n.removeAttribute('data-cgu-composer');
+    }
+    if (live.length !== 1) return null;
+    live[0].setAttribute('data-cgu-composer', '1');
+    return live[0];
+  };
+"#
+    };
+}
+
 // JS: press the stop button, if the page is generating.
 const JS_CLICK_STOP: &str = r#"(() => {
   const b = document.querySelector('button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
@@ -427,11 +474,13 @@ const JS_BLOCKING_DIALOG: &str = r#"(() => {
 
 // JS: poll composer presence + rate-limit dialog (mirrors _JS_COMPOSER in chatgpt-imagegen).
 const JS_COMPOSER: &str = concat!(
-    r#"(() => {
+    "(() => {",
+    js_composer_helper!(),
+    r#"
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   return JSON.stringify({
-    composer: !!document.querySelector('#prompt-textarea'),
+    composer: !!__cguComposer(),
     limited: "#,
     js_rate_limit_re!(),
     r#".test(dlg),
@@ -528,14 +577,18 @@ const JS_USER_TURNS: &str = concat!(
 
 // JS: empty the composer, so a leftover fragment from an aborted turn can't be
 // prepended to the next message.
-const JS_CLEAR_COMPOSER: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea');
+const JS_CLEAR_COMPOSER: &str = concat!(
+    "(() => {",
+    js_composer_helper!(),
+    r#"
+  const c = __cguComposer();
   if (!c) return JSON.stringify({ok: false});
   c.focus();
   document.execCommand('selectAll');
   document.execCommand('delete');
   return JSON.stringify({ok: true});
-})()"#;
+})()"#
+);
 
 // JS: dismiss a blocking dialog (the rate-limit notice has a "Got it" button).
 // Leaving it up keeps the composer unusable even after the throttle lifts.
@@ -570,8 +623,11 @@ const JS_DISMISS_DIALOG: &str = concat!(
 // reproduced against this very composer). A payload can therefore arrive
 // complete, correctly sized, and scrambled. FNV-1a over UTF-16 code units, which
 // both sides can compute identically.
-const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea');
+const JS_COMPOSER_FINGERPRINT: &str = concat!(
+    "(() => {",
+    js_composer_helper!(),
+    r#"
+  const c = __cguComposer();
   const t = c ? (c.innerText || c.textContent || '') : '';
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
@@ -589,7 +645,8 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return JSON.stringify({n: n, h: h});
-})()"#;
+})()"#
+);
 
 /// JS: insert `text` at the caret via `execCommand('insertText')`.
 ///
@@ -605,13 +662,14 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
 fn js_insert_text(text: &str) -> String {
     let t = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        r#"(() => {{
-  const c = document.querySelector('#prompt-textarea');
+        r#"(() => {{{helper}
+  const c = __cguComposer();
   if (!c) return JSON.stringify({{ok: false, error: 'composer not found'}});
   c.focus();
   const ok = document.execCommand('insertText', false, {t});
   return JSON.stringify({{ok}});
-}})()"#
+}})()"#,
+        helper = js_composer_helper!()
     )
 }
 
@@ -1149,7 +1207,9 @@ impl Channel {
                         saw_login = true;
                     } else {
                         last_failure = Some(format!(
-                            "{label}: the ChatGPT page never showed its composer ({what})"
+                            "{label}: the ChatGPT page loaded ({what}) but showed no composer we \
+                             recognise — ChatGPT may have changed its editor; chatgpt-use needs \
+                             an update for it"
                         ));
                     }
                     ab_close(&ab, &session);
@@ -1350,9 +1410,18 @@ impl Channel {
             wait_idle(self, 10);
         }
 
-        // Focus and empty the composer, then insert the message as TEXT.
-        ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
-            .context("clicking #prompt-textarea")?;
+        // Focus and empty the composer, then insert the message as TEXT. The
+        // probe stamps the composer it finds (`js_composer_helper!`), and the
+        // real-input click targets that stamp.
+        let found = ab_eval(&self.ab, JS_COMPOSER, &self.session, budget)
+            .ok()
+            .and_then(|v| v.get("composer").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        if !found {
+            bail!("no single visible ChatGPT composer to type into");
+        }
+        ab_cmd(&self.ab, &["click", "[data-cgu-composer]"], &self.session, budget)
+            .context("clicking the composer")?;
         // Clear, then CONFIRM the composer is actually empty. One `delete` is not
         // enough after a reattach: the page may still be hydrating, and ChatGPT
         // restores a saved draft into the composer once it is — which silently
@@ -1451,7 +1520,7 @@ impl Channel {
             // button and this selector matches nothing.
             let _ = ab_cmd(
                 &self.ab,
-                &["click", r#"button[data-testid="send-button"]"#],
+                &["click", r#"button[data-testid="send-button"], form[data-chatgpt-composer] button[type="submit"]"#],
                 &self.session,
                 budget,
             );
@@ -2420,14 +2489,15 @@ impl Channel {
         // project composer. (The project URL is /g/<gizmo_id>/project and stays on
         // that gizmo path until submit, so a substring check is reliable.)
         let js_project_ready = format!(
-            r#"(() => {{
+            r#"(() => {{{helper}
   const gid = {gid};
   return JSON.stringify({{
-    composer: !!document.querySelector('#prompt-textarea'),
+    composer: !!__cguComposer(),
     in_project: (location.href || '').includes(gid),
   }});
 }})()"#,
             gid = serde_json::to_string(gizmo_id).unwrap_or_else(|_| "\"\"".to_string()),
+            helper = js_composer_helper!(),
         );
         let mut ready = false;
         for _ in 0..30 {
@@ -3200,7 +3270,7 @@ fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
     }
 }
 
-/// Poll until `#prompt-textarea` is on the page (mirrors `_wait_composer`).
+/// Poll until a composer is on the page (see `js_composer_helper!`).
 /// Returns `Ok(true)` when the composer is ready, `Ok(false)` on timeout.
 /// Bails with an error if the rate-limit dialog is detected.
 fn wait_composer(
@@ -3461,6 +3531,9 @@ mod tests {
             ("composer", JS_COMPOSER),
             ("dismiss_dialog", JS_DISMISS_DIALOG),
             ("click_stop", JS_CLICK_STOP),
+            ("clear_composer", JS_CLEAR_COMPOSER),
+            ("composer_fingerprint", JS_COMPOSER_FINGERPRINT),
+            ("insert_hello", &js_insert_text("hello")),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }
