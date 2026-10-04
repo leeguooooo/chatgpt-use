@@ -78,13 +78,24 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file".to_string(),
-            description: "Read the full contents of a file. Returns the file text.".to_string(),
+            description: "Read a file. Small files come back whole; a large one comes back in \
+                a window of lines, ending with a note of which lines were shown and the offset \
+                to read next. Use grep -n to find the lines you need, then read around them."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Path to the file (relative to the working directory or absolute)."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "First line to read, 1-based (default 1)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many lines to read (default 600, at most 2000)."
                     }
                 },
                 "required": ["path"]
@@ -275,7 +286,7 @@ pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: Permission
         Ok(content) => ToolResult {
             id: call.id.clone(),
             ok: true,
-            content,
+            content: cap_result(content),
         },
         Err(msg) => ToolResult {
             id: call.id.clone(),
@@ -287,11 +298,84 @@ pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: Permission
 
 // ---- Individual tools -------------------------------------------------------
 
+/// Lines `read_file` returns when the caller names no `limit`.
+const READ_WINDOW_LINES: usize = 600;
+/// Most lines one `read_file` call may ask for.
+const READ_MAX_LINES: usize = 2000;
+/// Most characters one `read_file` call returns, whatever the line count.
+const READ_MAX_CHARS: usize = 30_000;
+/// Most characters any other tool result carries.
+///
+/// Every result goes back to ChatGPT as message text — in `run`, typed into
+/// the web composer. An uncapped one (a whole 150 KB source file, a noisy
+/// command) made a single message so large the page stopped responding
+/// mid-insert, and it may exceed ChatGPT's message limit besides. A model
+/// that needs more can ask for it in narrower pieces.
+const RESULT_MAX_CHARS: usize = 20_000;
+
 fn tool_read_file(input: &Value, cwd: &Path) -> Result<String, String> {
     let path_str = require_string(input, "path")?;
     let path = resolve_path(cwd, &path_str)?;
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("read_file: {}: {e}", path.display()))
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read_file: {}: {e}", path.display()))?;
+    let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(READ_WINDOW_LINES, |l| (l as usize).clamp(1, READ_MAX_LINES));
+    read_window(&text, offset, limit, READ_MAX_CHARS)
+}
+
+/// The window of `text` starting at 1-based line `offset`: up to `limit`
+/// lines and `max_chars` characters, ending on a whole line. A file that fits
+/// in one window from line 1 comes back unchanged; otherwise a footer says
+/// which lines were shown and where to continue.
+fn read_window(text: &str, offset: usize, limit: usize, max_chars: usize) -> Result<String, String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = lines.len();
+    if offset > total.max(1) {
+        return Err(format!("read_file: offset {offset} is past the end of the file ({total} lines)"));
+    }
+    let mut out = String::new();
+    let mut chars = 0;
+    let mut last = offset - 1; // the last line included, 1-based
+    for line in lines.iter().skip(offset - 1).take(limit) {
+        let n = line.chars().count();
+        // Always include at least one line, even an oversized one.
+        if chars + n > max_chars && last >= offset {
+            break;
+        }
+        out.push_str(line);
+        chars += n;
+        last += 1;
+    }
+    if offset == 1 && last >= total {
+        return Ok(out);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("[read_file: lines {offset}-{last} of {total}"));
+    if last < total {
+        out.push_str(&format!("; read on with offset={}", last + 1));
+    }
+    out.push(']');
+    Ok(out)
+}
+
+/// Cap a tool result at [`RESULT_MAX_CHARS`], on a character boundary, saying
+/// how to get the rest.
+fn cap_result(content: String) -> String {
+    let total = content.chars().count();
+    if total <= RESULT_MAX_CHARS {
+        return content;
+    }
+    let mut cut: String = content.chars().take(RESULT_MAX_CHARS).collect();
+    cut.push_str(&format!(
+        "\n…[output truncated: {total} characters, showing the first {RESULT_MAX_CHARS}. \
+         Narrow it: grep -n a pattern, head / tail, sed -n 'a,bp', or read_file with offset/limit.]"
+    ));
+    cut
 }
 
 fn tool_write_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<String, String> {
@@ -1042,6 +1126,56 @@ mod tests {
 
         assert!(result.ok, "read_file should succeed: {:?}", result.content);
         assert!(result.content.contains("hello, world"));
+    }
+
+    #[test]
+    fn a_small_file_comes_back_whole_and_unchanged() {
+        assert_eq!(read_window("a\nb\n", 1, 600, 30_000).unwrap(), "a\nb\n");
+        assert_eq!(read_window("no newline", 1, 600, 30_000).unwrap(), "no newline");
+    }
+
+    #[test]
+    fn a_long_file_comes_back_in_windows_that_say_where_to_go_on() {
+        let text: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        let first = read_window(&text, 1, 4, 30_000).unwrap();
+        assert!(first.starts_with("line1\nline2\nline3\nline4\n"), "{first}");
+        assert!(first.ends_with("[read_file: lines 1-4 of 10; read on with offset=5]"), "{first}");
+        let last = read_window(&text, 9, 4, 30_000).unwrap();
+        assert!(last.starts_with("line9\nline10\n"));
+        assert!(last.ends_with("[read_file: lines 9-10 of 10]"), "no 'read on' at the end: {last}");
+        assert!(read_window(&text, 11, 4, 30_000).unwrap_err().contains("past the end"));
+    }
+
+    #[test]
+    fn the_character_cap_ends_a_window_on_a_whole_line() {
+        let text = "aaaa\nbbbb\ncccc\n";
+        let w = read_window(text, 1, 600, 11).unwrap();
+        assert!(w.starts_with("aaaa\nbbbb\n") && !w.contains("cccc"), "{w}");
+        assert!(w.contains("offset=3"), "{w}");
+        // One line larger than the cap still comes back, alone.
+        let huge = read_window("xxxxxxxxxxxxxxxxxxxx\ny\n", 1, 600, 5).unwrap();
+        assert!(huge.starts_with("xxxxxxxxxxxxxxxxxxxx\n") && huge.contains("offset=2"));
+    }
+
+    #[test]
+    fn read_file_takes_offset_and_limit() {
+        let dir = tmpdir();
+        let body: String = (1..=1000).map(|i| format!("{i}\n")).collect();
+        fs::write(dir.join("big.txt"), &body).unwrap();
+        let default = execute(&make_call("c1", "read_file", json!({"path": "big.txt"})), &dir, true, PermissionMode::Safe);
+        assert!(default.content.contains("[read_file: lines 1-600 of 1000; read on with offset=601]"), "{}", &default.content[default.content.len() - 80..]);
+        let more = execute(&make_call("c2", "read_file", json!({"path": "big.txt", "offset": 601, "limit": 5})), &dir, true, PermissionMode::Safe);
+        assert!(more.content.starts_with("601\n602\n603\n604\n605\n"), "{}", more.content);
+    }
+
+    #[test]
+    fn every_other_tool_result_is_capped_with_a_way_to_narrow_it() {
+        let small = "ok".to_string();
+        assert_eq!(cap_result(small.clone()), small);
+        let big = "é".repeat(RESULT_MAX_CHARS + 5);
+        let cut = cap_result(big);
+        assert!(cut.starts_with(&"é".repeat(RESULT_MAX_CHARS)));
+        assert!(cut.contains(&format!("output truncated: {} characters", RESULT_MAX_CHARS + 5)), "{}", &cut[cut.len() - 200..]);
     }
 
     #[test]
