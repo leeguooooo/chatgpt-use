@@ -88,9 +88,15 @@ fn review_task(base: &str, merge_base: &str, focus: Option<&str>) -> String {
          the change builds — and choose for yourself what to read. Large files come in windows: \
          use `grep -n` to find the lines you need and read_file with offset/limit around them. \
          Look for real bugs: wrong logic, edge cases that break, error paths that leave state \
-         wrong, races, resource leaks, security problems. Do not modify any file. Report only \
-         issues you verified by reading the code, each with file:line, a concrete failure \
-         scenario and a suggested fix, most severe first; if you found none, say so plainly."
+         wrong, races, resource leaks, security problems. Do not modify any file, and do not run \
+         builds or test suites: passing tests are not a review, and the point is to find what \
+         they miss by reading the code. Before you answer, read the changed code itself, not \
+         only the diff.\n\n\
+         Answer in exactly this shape:\n\
+         FINDINGS — each verified issue, most severe first: file:line, what goes wrong, a \
+         concrete failure scenario, a suggested fix. Write \"none\" if you found none.\n\
+         EXAMINED — the files and functions you actually read to reach that verdict.\n\
+         NOT CHECKED — parts of the change you did not get to."
     );
     if let Some(f) = focus.filter(|f| !f.trim().is_empty()) {
         task.push_str(&format!("\n\nFocus: {f}"));
@@ -245,6 +251,10 @@ mod tests {
         let t = review_task("main", "abc123", Some("the cancel path"));
         assert!(t.contains("git diff abc123") && !t.contains("$("), "safe mode refuses $(…)");
         assert!(t.contains("Do not modify any file"));
+        assert!(t.contains("do not run builds or test suites"), "tests passing is not a review");
+        for section in ["FINDINGS", "EXAMINED", "NOT CHECKED"] {
+            assert!(t.contains(section), "{section}");
+        }
         assert!(t.ends_with("Focus: the cancel path"));
         assert!(!review_task("main", "abc", None).contains("Focus:"));
     }
