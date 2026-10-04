@@ -818,6 +818,13 @@ fn js_file_into_project(convo_id: &str, gizmo_id: &str) -> String {
 /// the page (`aria-valuenow`); the names here are only what a caller types.
 const LEVEL_ORDER: &[&str] = &["instant", "medium", "high", "extra high", "pro"];
 
+/// `--model current` (or `default`): use whatever the account is set to and
+/// leave the picker alone. An escape hatch for when the picker has changed
+/// again and a run does not need a particular model.
+pub fn keeps_current_model(model: &str) -> bool {
+    matches!(model.trim().to_lowercase().as_str(), "current" | "default")
+}
+
 /// Map a `--model` value to a slider index, or `None` if it names a model
 /// family rather than an effort level.
 fn level_index(want: &str) -> Option<usize> {
@@ -909,7 +916,27 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
 // "6Pro" on one account inside three weeks, so any word list goes stale. What is
 // stable is where it sits: the composer toolbar row, identified by the plus
 // button's testid, holding exactly one other `aria-haspopup="menu"` button.
+// JS: find the composer's model / effort picker button. ChatGPT names it in
+// several ways across rollouts (selectors as recorded by
+// miuuyy/codex-chatgpt-web `chatgpt-session.ts`, Oct 2026); the first group
+// with exactly ONE visible match wins. The old structural rule — the one menu
+// button on the composer row beside `composer-plus-btn` — is the fallback.
+// Never matched on its label, which changes with the model line-up.
 const JS_FIND_PICKER: &str = r#"(() => {
+  const visible = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const at = (b, via) => {
+    const r = b.getBoundingClientRect();
+    return JSON.stringify({ok: true, via, label: (b.textContent || '').trim(),
+                           x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)});
+  };
+  for (const [via, sel] of [
+    ['testid', 'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]'],
+    ['trigger', 'button[data-codex-intelligence-trigger="true"][aria-haspopup="menu"]'],
+    ['tone', 'button[aria-haspopup="menu"][data-tone="neutral"]'],
+  ]) {
+    const hits = [...document.querySelectorAll(sel)].filter(visible);
+    if (hits.length === 1) return at(hits[0], via);
+  }
   const plus = document.querySelector('[data-testid="composer-plus-btn"]');
   if (!plus) return JSON.stringify({ok: false, error: 'composer toolbar not found'});
   const rowTop = plus.getBoundingClientRect().top;
@@ -922,18 +949,28 @@ const JS_FIND_PICKER: &str = r#"(() => {
     return JSON.stringify({ok: false,
       error: 'expected one model picker on the composer row, found ' + hits.length});
   }
-  const r = hits[0].getBoundingClientRect();
-  return JSON.stringify({ok: true, label: (hits[0].textContent || '').trim(),
-                         x: Math.round(r.left + r.width / 2),
-                         y: Math.round(r.top + r.height / 2)});
+  return at(hits[0], 'row');
 })()"#;
 
 // JS: read the opened picker — the effort slider (index + thumb position) and
 // the model-family radios. `level` is the name the page currently shows for the
-// slider position; it is for logging only, never for matching.
+// slider position; it is for logging only, never for matching. The picker's
+// content need not be a [role="menu"] any more: it can be a plain container
+// with data-testid="composer-intelligence-picker-content", or a [role="group"].
 const JS_PICKER_MENU: &str = r#"(() => {
-  const menu = document.querySelector('[role="menu"]');
-  const sl = document.querySelector('[role="slider"]');
+  const SLIDER = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
+  let menu = null;
+  for (const sel of [
+    '[data-testid="composer-intelligence-picker-content"]',
+    '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
+    '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
+    '[role="menu"]',
+  ]) {
+    menu = document.querySelector(sel);
+    if (menu) break;
+  }
+  const sl = (menu && (menu.querySelector(SLIDER) || menu.querySelector('[role="slider"]')))
+    || document.querySelector(SLIDER) || document.querySelector('[role="slider"]');
   let slider = null;
   if (sl) {
     const r = sl.getBoundingClientRect();
@@ -1334,7 +1371,7 @@ impl Channel {
         // looks like a model that "won't use its tools". Only ever set when the
         // caller named a model, so erring here refuses exactly the request we
         // cannot honour.
-        if let Some(ref model) = opts.model {
+        if let Some(ref model) = opts.model.as_ref().filter(|m| !keeps_current_model(m)) {
             let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
             chan.select_model(model, model_deadline).with_context(|| {
                 format!(
@@ -2584,7 +2621,11 @@ impl Channel {
 
         let st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
         if !st.get("open").and_then(|v| v.as_bool()).unwrap_or(false) {
-            bail!("clicked the model picker but its menu did not open");
+            let via = pick.get("via").and_then(|v| v.as_str()).unwrap_or("?");
+            bail!(
+                "clicked the model picker (found by {via}) but its menu did not open; pass \
+                 --model current to use the account's current model"
+            );
         }
 
         let outcome = match want_level {
@@ -3471,6 +3512,10 @@ mod tests {
         // The whole point: never key off the button label, which drifts.
         assert!(JS_FIND_PICKER.contains("composer-plus-btn"));
         assert!(JS_FIND_PICKER.contains(r#"button[aria-haspopup="menu"]"#));
+        assert!(JS_FIND_PICKER.contains("model-switcher-dropdown-button"));
+        assert!(JS_PICKER_MENU.contains("composer-intelligence-picker-content"));
+        assert!(keeps_current_model("current") && keeps_current_model(" Default "));
+        assert!(!keeps_current_model("instant") && !keeps_current_model("pro"));
         assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
         assert!(JS_PICKER_MENU.contains(r#"[role="slider"]"#));
         assert!(JS_PICKER_MENU.contains("aria-valuenow"));
@@ -3535,6 +3580,8 @@ mod tests {
             ("clear_composer", JS_CLEAR_COMPOSER),
             ("composer_fingerprint", JS_COMPOSER_FINGERPRINT),
             ("insert_hello", &js_insert_text("hello")),
+            ("find_picker", JS_FIND_PICKER),
+            ("picker_menu", JS_PICKER_MENU),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }

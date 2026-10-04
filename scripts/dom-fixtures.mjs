@@ -289,6 +289,69 @@ test("composer: no editor at all (a page still loading)", () => {
   assert.deepEqual(run("composer"), { composer: false, limited: false });
 });
 
+/// jsdom has no layout: give every element a 10x10 box at the top-left,
+/// except anything inside [hidden], which gets an empty one.
+function withLayout(run) {
+  run.window.eval(`HTMLElement.prototype.getBoundingClientRect = function () {
+    const hidden = !!this.closest('[hidden]');
+    return {top: 0, left: 0, width: hidden ? 0 : 10, height: hidden ? 0 : 10};
+  };`);
+  return run;
+}
+
+test("picker: found by its test id, before any structural guess", () => {
+  const run = withLayout(page(`<form data-chatgpt-composer>
+    <button data-testid="composer-plus-btn" aria-haspopup="menu">+</button>
+    <button aria-haspopup="menu">Tools</button>
+    <button data-testid="model-switcher-dropdown-button" aria-haspopup="menu">5.6 Sol</button></form>`));
+  const p = run("find_picker");
+  assert.equal(p.ok, true, JSON.stringify(p));
+  assert.equal(p.via, "testid");
+  assert.equal(p.label, "5.6 Sol");
+});
+
+test("picker: the old composer-row rule still works as a fallback", () => {
+  const run = withLayout(page(`<form>
+    <button data-testid="composer-plus-btn" aria-haspopup="menu">+</button>
+    <button aria-haspopup="menu">Instant</button></form>`));
+  const p = run("find_picker");
+  assert.equal(p.ok, true, JSON.stringify(p));
+  assert.equal(p.via, "row");
+});
+
+test("picker: two visible candidates of a kind are not guessed between", () => {
+  const run = withLayout(page(`
+    <button data-testid="model-switcher-dropdown-button" aria-haspopup="menu">a</button>
+    <button data-testid="model-switcher-dropdown-button" aria-haspopup="menu">b</button>`));
+  assert.equal(run("find_picker").ok, false);
+});
+
+test("picker menu: open when the content is a plain test-id container, not role=menu", () => {
+  const run = withLayout(page(`<div data-testid="composer-intelligence-picker-content">
+    <div data-model-reasoning-effort-slider><div role="slider" aria-valuenow="2" aria-valuemin="0" aria-valuemax="4"></div></div>
+    <div role="menuitemradio" aria-checked="true">Latest</div></div>`));
+  const m = run("picker_menu");
+  assert.equal(m.open, true);
+  assert.equal(m.slider.now, 2);
+  assert.equal(m.slider.max, 4);
+  assert.deepEqual(JSON.parse(JSON.stringify(m.radios)), [{ text: "Latest", checked: true }]);
+});
+
+test("picker menu: the slider inside the picker wins over any other slider", () => {
+  const run = withLayout(page(`
+    <div role="slider" aria-valuenow="9" aria-valuemin="0" aria-valuemax="9"></div>
+    <div role="group"><div data-model-picker-power-slider>
+      <div role="slider" aria-valuenow="1" aria-valuemin="0" aria-valuemax="4"></div></div></div>`));
+  const m = run("picker_menu");
+  assert.equal(m.open, true);
+  assert.equal(m.slider.now, 1);
+});
+
+test("picker menu: closed when nothing is open", () => {
+  const run = withLayout(page(`<form><button aria-haspopup="menu">Instant</button></form>`));
+  assert.equal(run("picker_menu").open, false);
+});
+
 let failed = 0;
 for (const [name, fn] of cases) {
   try {

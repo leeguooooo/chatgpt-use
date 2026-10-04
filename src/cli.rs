@@ -177,7 +177,9 @@ pub struct ChannelArgs {
     pub timeout: u64,
     /// Select the composer "Intelligence" level: instant | medium | high |
     /// "extra high" | pro (or a raw menu label). GPT-5.5 Pro can only be reached
-    /// here (it has no Apps/MCP). Default: the account's current level.
+    /// here (it has no Apps/MCP). `current` leaves the picker alone and uses
+    /// the account's current model. Default: the account's current level
+    /// (`work` defaults to instant).
     #[arg(long)]
     pub model: Option<String>,
     /// When another run is using the ChatGPT window: wait for it, or fail at
