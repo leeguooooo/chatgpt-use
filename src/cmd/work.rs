@@ -57,6 +57,8 @@ pub fn run(args: &WorkArgs) -> Result<()> {
 
     let sopts = SendOptions::work();
     let mut channel = Channel::connect(&opts)?;
+    // A custom app's tools are only offered to a message that mentions it.
+    channel.use_connector(&args.connector);
 
     // Run the dispatch (+ thin-report retries), then optionally keep the loop
     // going across turns. close() no matter how it ends.

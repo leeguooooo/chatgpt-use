@@ -129,6 +129,10 @@ pub struct WorkArgs {
     /// Hard cap on turns when --loop is set (each turn is one model reply).
     #[arg(long, default_value_t = 8)]
     pub max_turns: u32,
+    /// The ChatGPT app (MCP connector) to @-mention into each message so the
+    /// turn can call its tools. Empty: mention none.
+    #[arg(long, default_value = "chatgpt-use")]
+    pub connector: String,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }

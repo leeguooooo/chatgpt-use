@@ -352,6 +352,55 @@ test("picker menu: closed when nothing is open", () => {
   assert.equal(run("picker_menu").open, false);
 });
 
+test("mention menu: exactly one row titled as the app, badge allowed, highlight read", () => {
+  const run = page(`<div data-mention-list-scroll-area>
+    <button data-list-navigation-item="true">chatgpt-use-old\nlegacy</button>
+    <button data-list-navigation-item="true" data-highlighted>Gmail\nmail</button>
+    <button data-list-navigation-item="true">chatgpt-use DEV\nLocal project tools</button></div>`);
+  const m = run("mention_menu");
+  assert.equal(m.count, 1, JSON.stringify(m));
+  assert.equal(m.highlighted, false, "Gmail is highlighted, not ours");
+  run.doc.querySelectorAll("button")[1].removeAttribute("data-highlighted");
+  run.doc.querySelectorAll("button")[2].setAttribute("aria-current", "true");
+  assert.equal(run("mention_menu").highlighted, true);
+});
+
+test("mention menu: the other row markup, and no match / two matches", () => {
+  const one = page(`<div class="__menu-item" tabindex="0">chatgpt-use</div>`);
+  assert.equal(one("mention_menu").count, 1);
+  const none = page(`<div class="__menu-item" tabindex="0">chatgpt-user</div><div class="__menu-item" tabindex="0">Drive</div>`);
+  const m = none("mention_menu");
+  assert.equal(m.count, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(m.titles)), ["chatgpt-user", "Drive"]);
+  const two = page(`<div class="__menu-item" tabindex="0">chatgpt-use</div><div class="__menu-item" tabindex="0">chatgpt-use DEV</div>`);
+  assert.equal(two("mention_menu").count, 2, "ambiguous: not chosen");
+  const hidden = page(`<div hidden><div class="__menu-item" tabindex="0">chatgpt-use</div></div>`);
+  assert.equal(hidden("mention_menu").count, 0);
+});
+
+test("connector pill: found in the composer by either markup", () => {
+  for (const pill of [
+    `<span data-id="plugin:asdk_app_1" data-keyword="chatgpt-use">chatgpt-use</span>`,
+    `<span app-mention-path="app://x" app-mention-display-name="chatgpt-use" contenteditable="false">chatgpt-use</span>`,
+  ]) {
+    const run = page(`<form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox">${pill} </div></form>`);
+    assert.equal(run("connector_pill").ok, true, pill);
+  }
+  const other = page(`<form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox">
+    <span data-id="plugin:x" data-keyword="Gmail">Gmail</span></div></form>`);
+  const r = other("connector_pill");
+  assert.equal(r.ok, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(r.pills)), ["Gmail"]);
+});
+
+test("fingerprint: a connector pill is not message text", () => {
+  const run = page(`<form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox">
+    <span data-id="plugin:a" data-keyword="chatgpt-use" contenteditable="false">chatgpt-use</span> ab</div></form>`);
+  assert.equal(run("composer_fingerprint").n, 2, "only 'ab' counts");
+  const bare = page(`<form data-chatgpt-composer><div contenteditable="true" data-lexical-editor="true" role="textbox">ab</div></form>`);
+  assert.equal(run("composer_fingerprint").h, bare("composer_fingerprint").h, "same hash as the text alone");
+});
+
 let failed = 0;
 for (const [name, fn] of cases) {
   try {

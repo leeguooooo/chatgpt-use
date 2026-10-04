@@ -447,6 +447,55 @@ macro_rules! js_composer_helper {
     };
 }
 
+/// JS string literal: the nodes ChatGPT puts in the composer for an
+/// @-mentioned app (as recorded by miuuyy/codex-chatgpt-web, Oct 2026).
+macro_rules! js_pill_selector {
+    () => {
+        r#"'[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]'"#
+    };
+}
+
+/// JS: the @-mention menu's rows and whether exactly one is the app `name`.
+/// A row's title is its first line; a trailing "DEV" badge (a developer-mode
+/// app) is allowed. Returns {titles, count, highlighted}.
+fn js_mention_menu(name: &str) -> String {
+    let n = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const name = {n};
+  const shown = (r) => !r.closest('[hidden], [aria-hidden="true"]') && getComputedStyle(r).display !== 'none';
+  const rows = [...document.querySelectorAll(
+    '.__menu-item[tabindex="0"], [data-mention-list-scroll-area] button[data-list-navigation-item="true"]')]
+    .filter(shown);
+  const titles = rows.map(r => ((r.innerText || r.textContent || '').split('\n')[0] || '')
+    .replace(/\s+/g, ' ').trim());
+  const isName = (t) => t === name || (t.startsWith(name) && /^\s*DEV$/.test(t.slice(name.length)));
+  const hits = rows.filter((r, i) => isName(titles[i]));
+  const h = hits.length === 1 ? hits[0] : null;
+  return JSON.stringify({{titles, count: hits.length,
+    highlighted: !!h && (h.hasAttribute('data-highlighted') || h.getAttribute('aria-current') === 'true')}});
+}})()"#
+    )
+}
+
+/// JS: is the app `name` mentioned (a pill) in the composer? {ok, pills}.
+fn js_connector_pill(name: &str) -> String {
+    let n = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{{helper}
+  const name = {n};
+  const c = __cguComposer();
+  if (!c) return JSON.stringify({{ok: false, pills: []}});
+  const scope = c.closest('form') || c;
+  const pills = [...scope.querySelectorAll({pills})]
+    .map(p => p.getAttribute('data-keyword') || p.getAttribute('app-mention-display-name') || '');
+  return JSON.stringify({{ok: pills.includes(name), pills}});
+}})()"#,
+        helper = js_composer_helper!(),
+        pills = js_pill_selector!(),
+    )
+}
+
 // JS: press the stop button, if the page is generating.
 const JS_CLICK_STOP: &str = r#"(() => {
   const b = document.querySelector('button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
@@ -626,9 +675,18 @@ const JS_DISMISS_DIALOG: &str = concat!(
 const JS_COMPOSER_FINGERPRINT: &str = concat!(
     "(() => {",
     js_composer_helper!(),
+    "\n  const PILLS = ",
+    js_pill_selector!(),
+    ";",
     r#"
   const c = __cguComposer();
-  const t = c ? (c.innerText || c.textContent || '') : '';
+  // Connector pills (an @-mentioned app) are not message text.
+  let t = '';
+  if (c) {
+    const k = c.cloneNode(true);
+    k.querySelectorAll(PILLS).forEach(n => n.remove());
+    t = k.innerText || k.textContent || '';
+  }
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
     u === 0x1680 || (u >= 0x2000 && u <= 0x200a) || u === 0x2028 ||
@@ -1131,6 +1189,9 @@ pub struct Channel {
     submitted: bool,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
+    /// A ChatGPT app (connector) to @-mention into every message, so its tools
+    /// are available in that turn (see `attach_connector`).
+    connector: Option<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1323,6 +1384,7 @@ impl Channel {
             pending_project: None,
             submitted: false,
             receipt: opts.receipt.clone(),
+            connector: None,
             _surface: surface,
         };
 
@@ -1402,6 +1464,80 @@ impl Channel {
 
     /// Put `message` in the composer and verify it landed intact. Nothing here
     /// can have submitted anything, so any error is safe to retry.
+    /// @-mention the ChatGPT app `name` into every message from now on, so the
+    /// turn can call its tools. A custom MCP app is not available in a chat
+    /// by default; mentioning it is how a message opts in.
+    pub fn use_connector(&mut self, name: &str) {
+        self.connector = Some(name.to_string()).filter(|n| !n.trim().is_empty());
+    }
+
+    /// Put the app `name` into the (empty, focused) composer as a mention
+    /// pill: type `@name` with real keystrokes, require exactly one matching
+    /// row in the mention menu, highlight it with the arrow keys, press Enter,
+    /// then confirm the pill. Fails closed: a message that needed the app's
+    /// tools is not sent without them.
+    fn attach_connector(&self, name: &str, budget: f64) -> Result<()> {
+        let menu = |ch: &Self| {
+            ab_eval(&ch.ab, &js_mention_menu(name), &ch.session, budget)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_default()
+        };
+        let count = |v: &serde_json::Value| v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+        let mut seen = serde_json::Value::Null;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            }
+            ab_cmd(&self.ab, &["click", "[data-cgu-composer]"], &self.session, budget)
+                .context("focusing the composer for the app mention")?;
+            ab_cmd(&self.ab, &["keyboard", "type", &format!("@{name}")], &self.session, budget)
+                .context("typing the app mention")?;
+            let until = Instant::now() + Duration::from_millis(2500);
+            loop {
+                seen = menu(self);
+                if count(&seen) == 1 || Instant::now() >= until {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if count(&seen) == 1 {
+                break;
+            }
+        }
+        if count(&seen) != 1 {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            let titles = seen.get("titles").cloned().unwrap_or_default();
+            bail!(
+                "the ChatGPT app {name:?} is not available to this chat (mention menu showed \
+                 {titles}). In ChatGPT, check Settings → Apps that {name:?} is connected and \
+                 enabled, and that its server and tunnel are up; then `chatgpt-use refresh`."
+            );
+        }
+        let rows = seen.get("titles").and_then(|t| t.as_array()).map_or(1, |a| a.len());
+        for _ in 0..rows {
+            if seen.get("highlighted").and_then(|h| h.as_bool()).unwrap_or(false) {
+                break;
+            }
+            let _ = ab_cmd(&self.ab, &["press", "ArrowDown"], &self.session, budget);
+            seen = menu(self);
+        }
+        if !seen.get("highlighted").and_then(|h| h.as_bool()).unwrap_or(false) {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            bail!("could not highlight the {name:?} row in the mention menu");
+        }
+        ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
+            .context("choosing the app in the mention menu")?;
+        std::thread::sleep(Duration::from_millis(300));
+        let pill = ab_eval(&self.ab, &js_connector_pill(name), &self.session, budget).unwrap_or_default();
+        if !pill.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            bail!("chose {name:?} in the mention menu but no pill for it appeared ({pill})");
+        }
+        eprintln!("attached the ChatGPT app {name:?} to this message");
+        Ok(())
+    }
+
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
         // Never type while the PAGE still believes it is generating. ChatGPT
         // disables submission then, so Enter is silently swallowed and the turn
@@ -1484,6 +1620,9 @@ impl Channel {
                 "could not empty the ChatGPT composer — leftover text would be \
                  prepended to the message"
             );
+        }
+        if let Some(name) = self.connector.clone() {
+            self.attach_connector(&name, budget)?;
         }
 
         // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
@@ -3581,6 +3720,8 @@ mod tests {
             ("composer_fingerprint", JS_COMPOSER_FINGERPRINT),
             ("insert_hello", &js_insert_text("hello")),
             ("find_picker", JS_FIND_PICKER),
+            ("mention_menu", &js_mention_menu("chatgpt-use")),
+            ("connector_pill", &js_connector_pill("chatgpt-use")),
             ("picker_menu", JS_PICKER_MENU),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
