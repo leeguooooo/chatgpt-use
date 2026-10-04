@@ -20,6 +20,10 @@ pub enum Command {
     Ask(AskArgs),
     /// Mode 2 · brain — ChatGPT drives local tools in an agent loop until done.
     Run(RunArgs),
+    /// Code review by ChatGPT that explores the repository itself: starting
+    /// from the change against --base, it reads whatever code it needs
+    /// (read-only tools, in a throwaway worktree) and reports verified bugs.
+    Review(ReviewArgs),
     /// Mode 3 · drop-in — Anthropic-compatible /v1/messages shim for Claude Code.
     Serve(ServeArgs),
     /// MCP channel — local MCP server exposing project tools to a regular GPT-5.5
@@ -228,6 +232,25 @@ pub struct AskArgs {
     /// An id whose request may have reached ChatGPT is never sent again.
     #[arg(long = "request-id", value_name = "ID")]
     pub request_id: Option<String>,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewArgs {
+    /// Review the change since this ref's merge-base with HEAD. Uncommitted
+    /// and untracked work is included.
+    #[arg(long, default_value = "main")]
+    pub base: String,
+    /// Extra direction for the reviewer (what to focus on).
+    #[arg(long)]
+    pub focus: Option<String>,
+    /// Hard cap on tool rounds (each is one ChatGPT message).
+    #[arg(long, default_value_t = 20)]
+    pub max_steps: u32,
+    /// Leave the review worktree in place afterwards (its path is printed).
+    #[arg(long)]
+    pub keep: bool,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }

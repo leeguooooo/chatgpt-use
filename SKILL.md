@@ -30,7 +30,13 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
 chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro] --no-stdin
 chatgpt-use handoff plan.json --to codex|claude-code [--execute]   # dry-run without --execute
 
-# Closed loop — ChatGPT DOES the task on the project via its MCP connector and reports back
+# Code review — ChatGPT explores the repo itself from the change vs --base (read-only, throwaway worktree)
+chatgpt-use review [--base main] [--focus "<area>"] [--max-steps 20]
+
+# Local tool loop — ChatGPT reads files / runs commands here; works on a Free plan
+chatgpt-use run --cwd <project> [--permission-mode safe|trusted] "<task>"
+
+# Closed loop (paid ChatGPT plan: custom MCP app) — ChatGPT DOES the task via its connector
 chatgpt-use work "<task>" [--loop] [--max-turns N]     # needs connector + mcp --profile full running
 
 # MCP channel — give ChatGPT native tools on this machine

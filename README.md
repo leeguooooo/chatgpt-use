@@ -163,7 +163,28 @@ chatgpt-use run "Add a --json flag to the status command and update the tests"
 
 **This is why goal "let ChatGPT read my files" needs no tunnel and no exposed file server.** File
 access *is* the `read_file` / `grep` tools: the local harness reads the bytes and hands them into the
-conversation. ChatGPT never reaches back to your machine — it just asks, and the hands obey.
+conversation. ChatGPT never reaches back to your machine — it just asks, and the hands obey. It also
+works on a **Free** ChatGPT plan, unlike `work`, whose custom MCP app needs a paid one.
+
+Every tool result becomes message text, so results are bounded: `read_file` returns a large file in
+windows of 600 lines (≤ 30 000 characters) with the offset to read on, and any other result is cut
+at 20 000 characters with a note on how to narrow it.
+
+#### Code review — `chatgpt-use review`
+
+A diff alone cannot show a bug; confirming one means reading the callers, definitions and tests
+around it. `review` hands ChatGPT the change since `--base` as a starting point and lets it choose
+what else to read:
+
+```bash
+chatgpt-use review                       # the branch + uncommitted work, against main
+chatgpt-use review --base origin/main --focus "the cancel path" --max-steps 30
+```
+
+It runs in a throwaway `git worktree` of HEAD with your uncommitted and untracked files copied in,
+with read-only tools plus `bash` in `safe` mode, so it cannot change your checkout. The report lists
+verified issues with file:line, a failure scenario and a fix. Each tool round is one ChatGPT
+message; `--max-steps` (default 20) caps the cost. `--keep` leaves the worktree for a look.
 
 ### Mode 3 · 替身 / Drop-in model — `chatgpt-use serve`
 
@@ -535,6 +556,9 @@ Maintainers release with `scripts/release.sh <version>` (`--dry-run` first): it 
 # Closed loop — dispatch a task; ChatGPT DOES it on the project via its MCP
 # connector (read/build/test/logs) and reports back. Needs the connector
 # connected + an `mcp --profile full` server running; uses a non-Pro model.
+# Custom MCP apps need a PAID ChatGPT plan; on Free, use `run` / `review`.
+# Each message @-mentions the app (--connector, default chatgpt-use) so its
+# tools are offered; --model current skips the model picker.
 chatgpt-use work "<task>"
 #   --retries N    re-nudge if the report is thin / hedging (no real tool output). default 1
 #   --loop         multi-turn: ChatGPT ends each report STATUS: DONE|CONTINUE; we auto-

@@ -27,22 +27,38 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let mut channel = Channel::connect(&opts)?;
 
     // Run the agent loop; the inner fn owns `channel` and always closes it.
-    let result = agent_loop(&mut channel, &tool_specs, args, &cwd);
+    // auto_approve = !args.approve  (approve flag requests interactive confirmation)
+    let result = agent_loop(
+        &mut channel,
+        &tool_specs,
+        &args.task,
+        args.max_steps,
+        !args.approve,
+        args.permission_mode,
+        &cwd,
+    );
 
     channel.close();
-    result
+    // ChatGPT declared the task done — print the final answer to stdout.
+    println!("{}", result?);
+    Ok(())
 }
 
 /// Core agent loop. Seeded with the system prompt, then drives tool calls until
-/// ChatGPT returns a plain-text final answer or max_steps is exhausted.
-fn agent_loop(
+/// ChatGPT returns a plain-text final answer (returned) or max_steps is
+/// exhausted. Only tools in `tool_specs` run: a call to any other is answered
+/// with an error, so a caller that offers a subset (`review`) gets just that.
+pub(crate) fn agent_loop(
     channel: &mut Channel,
     tool_specs: &[crate::protocol::ToolSpec],
-    args: &RunArgs,
-    cwd: &PathBuf,
-) -> Result<()> {
+    task: &str,
+    max_steps: u32,
+    auto_approve: bool,
+    permission_mode: crate::cli::PermissionMode,
+    cwd: &std::path::Path,
+) -> Result<String> {
     // Seed the conversation: the system prompt teaches ChatGPT the tool protocol.
-    let seed = protocol::system_prompt(tool_specs, &args.task);
+    let seed = protocol::system_prompt(tool_specs, task);
     let mut reply_text = channel.send(&seed)?;
 
     // Fallback priming. This used to fire on essentially every run, and the
@@ -76,23 +92,15 @@ fn agent_loop(
 
     loop {
         match protocol::parse_reply(&reply_text) {
-            Reply::Text(answer) => {
-                // ChatGPT declared the task done — print the final answer to stdout.
-                println!("{answer}");
-                return Ok(());
-            }
+            Reply::Text(answer) => return Ok(answer),
             Reply::Tools(calls) => {
                 step += 1;
 
-                if step > args.max_steps {
+                if step > max_steps {
                     eprintln!(
-                        "[step {step}] max-steps limit ({}) reached without a final answer; stopping.",
-                        args.max_steps
+                        "[step {step}] max-steps limit ({max_steps}) reached without a final answer; stopping."
                     );
-                    return Err(anyhow!(
-                        "max-steps limit ({}) reached without a final answer",
-                        args.max_steps
-                    ));
+                    return Err(anyhow!("max-steps limit ({max_steps}) reached without a final answer"));
                 }
 
                 // Print concise progress to stderr; keep stdout for the final answer only.
@@ -100,11 +108,19 @@ fn agent_loop(
                     eprintln!("[step {step}] tool: {}", call.name);
                 }
 
-                // auto_approve = !args.approve  (approve flag requests interactive confirmation)
-                let auto_approve = !args.approve;
                 let results: Vec<_> = calls
                     .iter()
-                    .map(|call| tools::execute(call, cwd, auto_approve, args.permission_mode))
+                    .map(|call| {
+                        if tool_specs.iter().any(|t| t.name == call.name) {
+                            tools::execute(call, cwd, auto_approve, permission_mode)
+                        } else {
+                            crate::protocol::ToolResult {
+                                id: call.id.clone(),
+                                ok: false,
+                                content: format!("tool '{}' is not available here", call.name),
+                            }
+                        }
+                    })
                     .collect();
 
                 // Feed observations back to ChatGPT and get the next reply.

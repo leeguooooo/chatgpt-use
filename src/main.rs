@@ -35,6 +35,7 @@ fn main() {
     let result = match &cli.command {
         Command::Ask(args) => cmd::ask::run(args),
         Command::Run(args) => cmd::run::run(args),
+        Command::Review(args) => cmd::review::run(args),
         Command::Serve(args) => cmd::serve::run(args),
         Command::Mcp(args) => cmd::mcp::run(args),
         Command::Handoff(args) => cmd::handoff::run(args),

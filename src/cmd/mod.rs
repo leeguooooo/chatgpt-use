@@ -9,6 +9,7 @@ pub mod init; // one-time setup — generate ~/.chatgpt-use/auth.json
 pub mod mcp; // MCP channel — expose project tools to a regular GPT-5.5
 pub mod refresh; // refresh the connector in ChatGPT settings (re-run tools/list)
 pub mod resume; // wait for a lost ask --request-id reply without resending
+pub mod review; // ChatGPT reviews a change, exploring the repo with read-only tools
 pub mod run; // Mode 2 — brain
 pub mod serve;
 pub mod status; // report an ask --request-id request from its receipt // Mode 3 — drop-in model
