@@ -262,6 +262,63 @@ fn cancel_requested() -> bool {
         || TASK_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(SeqCst)))
 }
 
+/// Compare the composer's fingerprint with the message's. Fails closed: a
+/// probe that errored or came back without a count and hash is not a pass,
+/// or the one check that catches a truncated, polluted or scrambled prompt
+/// would be skipped exactly when the page has changed under us.
+fn check_fingerprint(got: Option<&serde_json::Value>, want_n: u64, want_h: u64) -> Result<()> {
+    let n = got.and_then(|v| v.get("n")).and_then(|v| v.as_u64());
+    let h = got.and_then(|v| v.get("h")).and_then(|v| v.as_u64());
+    let (Some(n), Some(h)) = (n, h) else {
+        bail!(
+            "could not read the composer back to check it ({}) — refusing to submit a \
+             prompt that was not verified",
+            got.map_or("no reply".to_string(), |v| v.to_string())
+        );
+    };
+    if n != want_n {
+        bail!(
+            "composer content doesn't match the message to send ({n} non-whitespace chars \
+             present, {want_n} expected) — refusing to submit a truncated or polluted prompt"
+        );
+    }
+    if h != want_h {
+        bail!(
+            "composer holds the right number of characters ({n}) but not in the right order \
+             (fingerprint {h:#x}, expected {want_h:#x}) — refusing to submit a scrambled prompt"
+        );
+    }
+    Ok(())
+}
+
+/// Whether a chrome-use failure says the session's tab is gone (closed,
+/// navigated across processes, or lost by the relay) — recoverable by closing
+/// the session and opening a fresh tab.
+fn tab_gone(message: &str) -> bool {
+    message.contains("driving is gone")
+}
+
+/// Polls in a row the turn-one count must stay down before the page counts
+/// as replaced.
+const UNPINNED_DIPS_BEFORE_LOST: u32 = 3;
+
+/// Turn one, before ChatGPT has put a conversation id in the URL, has only one
+/// sign that the tab now shows a different page: the user-turn count, which
+/// rose when we submitted, falling back to the baseline. A single such read is
+/// not enough — seen live, the poll that lands while a new chat moves from `/`
+/// to `/c/<id>` re-renders the thread and reads low once, and treating that as
+/// fatal threw away a turn that was completing normally. Only a dip that
+/// persists for [`UNPINNED_DIPS_BEFORE_LOST`] polls counts; any other read
+/// resets the count.
+fn unpinned_page_lost(pinned: bool, users_now: Option<u64>, baseline: u64, dips: &mut u32) -> bool {
+    if !pinned && users_now.is_some_and(|n| n <= baseline) {
+        *dips += 1;
+    } else {
+        *dips = 0;
+    }
+    *dips >= UNPINNED_DIPS_BEFORE_LOST
+}
+
 /// The page's user turns at one moment: how many are rendered, and the stable
 /// identities it exposes (see `js_turn_helpers!`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -447,6 +504,59 @@ macro_rules! js_composer_helper {
     };
 }
 
+/// JS string literal: the nodes ChatGPT puts in the composer for an
+/// @-mentioned app (as recorded by miuuyy/codex-chatgpt-web, Oct 2026).
+macro_rules! js_pill_selector {
+    () => {
+        r#"'[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]'"#
+    };
+}
+
+/// JS: the @-mention menu's rows and whether exactly one is the app `name`.
+/// A row's title is its first line; a trailing "DEV" badge (a developer-mode
+/// app) is allowed. Returns {titles, count, highlighted}.
+fn js_mention_menu(name: &str) -> String {
+    let n = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const name = {n};
+  const shown = (r) => !r.closest('[hidden], [aria-hidden="true"]') && getComputedStyle(r).display !== 'none';
+  // `.__menu-item` is also the sidebar's class ("New chat", "Search", the
+  // chat history — seen live), so a row only counts inside an open popup,
+  // never inside navigation.
+  const POPUP = '[data-mention-list-scroll-area], [role="listbox"], [role="menu"], [data-radix-popper-content-wrapper]';
+  const rows = [...document.querySelectorAll(
+    '.__menu-item[tabindex="0"], [data-mention-list-scroll-area] button[data-list-navigation-item="true"]')]
+    .filter(r => shown(r) && r.closest(POPUP) && !r.closest('nav, aside, [data-testid*="sidebar"], #stage-slideover-sidebar'));
+  const titles = rows.map(r => ((r.innerText || r.textContent || '').split('\n')[0] || '')
+    .replace(/\s+/g, ' ').trim());
+  const isName = (t) => t === name || (t.startsWith(name) && /^\s*DEV$/.test(t.slice(name.length)));
+  const hits = rows.filter((r, i) => isName(titles[i]));
+  const h = hits.length === 1 ? hits[0] : null;
+  return JSON.stringify({{titles, count: hits.length,
+    highlighted: !!h && (h.hasAttribute('data-highlighted') || h.getAttribute('aria-current') === 'true')}});
+}})()"#
+    )
+}
+
+/// JS: is the app `name` mentioned (a pill) in the composer? {ok, pills}.
+fn js_connector_pill(name: &str) -> String {
+    let n = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{{helper}
+  const name = {n};
+  const c = __cguComposer();
+  if (!c) return JSON.stringify({{ok: false, pills: []}});
+  const scope = c.closest('form') || c;
+  const pills = [...scope.querySelectorAll({pills})]
+    .map(p => p.getAttribute('data-keyword') || p.getAttribute('app-mention-display-name') || '');
+  return JSON.stringify({{ok: pills.includes(name), pills}});
+}})()"#,
+        helper = js_composer_helper!(),
+        pills = js_pill_selector!(),
+    )
+}
+
 // JS: press the stop button, if the page is generating.
 const JS_CLICK_STOP: &str = r#"(() => {
   const b = document.querySelector('button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
@@ -626,9 +736,18 @@ const JS_DISMISS_DIALOG: &str = concat!(
 const JS_COMPOSER_FINGERPRINT: &str = concat!(
     "(() => {",
     js_composer_helper!(),
+    "\n  const PILLS = ",
+    js_pill_selector!(),
+    ";",
     r#"
   const c = __cguComposer();
-  const t = c ? (c.innerText || c.textContent || '') : '';
+  // Connector pills (an @-mentioned app) are not message text.
+  let t = '';
+  if (c) {
+    const k = c.cloneNode(true);
+    k.querySelectorAll(PILLS).forEach(n => n.remove());
+    t = k.innerText || k.textContent || '';
+  }
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
     u === 0x1680 || (u >= 0x2000 && u <= 0x200a) || u === 0x2028 ||
@@ -818,6 +937,13 @@ fn js_file_into_project(convo_id: &str, gizmo_id: &str) -> String {
 /// the page (`aria-valuenow`); the names here are only what a caller types.
 const LEVEL_ORDER: &[&str] = &["instant", "medium", "high", "extra high", "pro"];
 
+/// `--model current` (or `default`): use whatever the account is set to and
+/// leave the picker alone. An escape hatch for when the picker has changed
+/// again and a run does not need a particular model.
+pub fn keeps_current_model(model: &str) -> bool {
+    matches!(model.trim().to_lowercase().as_str(), "current" | "default")
+}
+
 /// Map a `--model` value to a slider index, or `None` if it names a model
 /// family rather than an effort level.
 fn level_index(want: &str) -> Option<usize> {
@@ -909,7 +1035,27 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
 // "6Pro" on one account inside three weeks, so any word list goes stale. What is
 // stable is where it sits: the composer toolbar row, identified by the plus
 // button's testid, holding exactly one other `aria-haspopup="menu"` button.
+// JS: find the composer's model / effort picker button. ChatGPT names it in
+// several ways across rollouts (selectors as recorded by
+// miuuyy/codex-chatgpt-web `chatgpt-session.ts`, Oct 2026); the first group
+// with exactly ONE visible match wins. The old structural rule — the one menu
+// button on the composer row beside `composer-plus-btn` — is the fallback.
+// Never matched on its label, which changes with the model line-up.
 const JS_FIND_PICKER: &str = r#"(() => {
+  const visible = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const at = (b, via) => {
+    const r = b.getBoundingClientRect();
+    return JSON.stringify({ok: true, via, label: (b.textContent || '').trim(),
+                           x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)});
+  };
+  for (const [via, sel] of [
+    ['testid', 'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]'],
+    ['trigger', 'button[data-codex-intelligence-trigger="true"][aria-haspopup="menu"]'],
+    ['tone', 'button[aria-haspopup="menu"][data-tone="neutral"]'],
+  ]) {
+    const hits = [...document.querySelectorAll(sel)].filter(visible);
+    if (hits.length === 1) return at(hits[0], via);
+  }
   const plus = document.querySelector('[data-testid="composer-plus-btn"]');
   if (!plus) return JSON.stringify({ok: false, error: 'composer toolbar not found'});
   const rowTop = plus.getBoundingClientRect().top;
@@ -922,18 +1068,28 @@ const JS_FIND_PICKER: &str = r#"(() => {
     return JSON.stringify({ok: false,
       error: 'expected one model picker on the composer row, found ' + hits.length});
   }
-  const r = hits[0].getBoundingClientRect();
-  return JSON.stringify({ok: true, label: (hits[0].textContent || '').trim(),
-                         x: Math.round(r.left + r.width / 2),
-                         y: Math.round(r.top + r.height / 2)});
+  return at(hits[0], 'row');
 })()"#;
 
 // JS: read the opened picker — the effort slider (index + thumb position) and
 // the model-family radios. `level` is the name the page currently shows for the
-// slider position; it is for logging only, never for matching.
+// slider position; it is for logging only, never for matching. The picker's
+// content need not be a [role="menu"] any more: it can be a plain container
+// with data-testid="composer-intelligence-picker-content", or a [role="group"].
 const JS_PICKER_MENU: &str = r#"(() => {
-  const menu = document.querySelector('[role="menu"]');
-  const sl = document.querySelector('[role="slider"]');
+  const SLIDER = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
+  let menu = null;
+  for (const sel of [
+    '[data-testid="composer-intelligence-picker-content"]',
+    '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
+    '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
+    '[role="menu"]',
+  ]) {
+    menu = document.querySelector(sel);
+    if (menu) break;
+  }
+  const sl = (menu && (menu.querySelector(SLIDER) || menu.querySelector('[role="slider"]')))
+    || document.querySelector(SLIDER) || document.querySelector('[role="slider"]');
   let slider = null;
   if (sl) {
     const r = sl.getBoundingClientRect();
@@ -1094,6 +1250,9 @@ pub struct Channel {
     submitted: bool,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
+    /// A ChatGPT app (connector) to @-mention into every message, so its tools
+    /// are available in that turn (see `attach_connector`).
+    connector: Option<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1194,6 +1353,14 @@ impl Channel {
                     opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
                 }
             }
+            if matches!(&opened_now, Err(e) if tab_gone(&format!("{e:#}"))) {
+                // The session is bound to a tab chrome-use has lost (seen after
+                // chrome-use updated itself mid-session). Closing the session
+                // drops the dead binding; the next open gets a fresh tab.
+                eprintln!("the chrome-use session lost its tab; closing it and opening a fresh one");
+                ab_close(&ab, &session);
+                opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+            }
             match opened_now {
                 Ok(true) => {
                     eprintln!("using {label}");
@@ -1286,6 +1453,7 @@ impl Channel {
             pending_project: None,
             submitted: false,
             receipt: opts.receipt.clone(),
+            connector: None,
             _surface: surface,
         };
 
@@ -1334,7 +1502,7 @@ impl Channel {
         // looks like a model that "won't use its tools". Only ever set when the
         // caller named a model, so erring here refuses exactly the request we
         // cannot honour.
-        if let Some(ref model) = opts.model {
+        if let Some(ref model) = opts.model.as_ref().filter(|m| !keeps_current_model(m)) {
             let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
             chan.select_model(model, model_deadline).with_context(|| {
                 format!(
@@ -1342,7 +1510,7 @@ impl Channel {
                      default instead. ChatGPT relabelled the composer picker from \
                      Intelligence levels (instant/high/pro) to model names \
                      (e.g. \"5.6 SolLight\"), so the selector needs updating; rerun \
-                     without --model to accept whatever the account is set to"
+                     with --model current to accept whatever the account is set to"
                 )
             })?;
         }
@@ -1365,6 +1533,80 @@ impl Channel {
 
     /// Put `message` in the composer and verify it landed intact. Nothing here
     /// can have submitted anything, so any error is safe to retry.
+    /// @-mention the ChatGPT app `name` into every message from now on, so the
+    /// turn can call its tools. A custom MCP app is not available in a chat
+    /// by default; mentioning it is how a message opts in.
+    pub fn use_connector(&mut self, name: &str) {
+        self.connector = Some(name.to_string()).filter(|n| !n.trim().is_empty());
+    }
+
+    /// Put the app `name` into the (empty, focused) composer as a mention
+    /// pill: type `@name` with real keystrokes, require exactly one matching
+    /// row in the mention menu, highlight it with the arrow keys, press Enter,
+    /// then confirm the pill. Fails closed: a message that needed the app's
+    /// tools is not sent without them.
+    fn attach_connector(&self, name: &str, budget: f64) -> Result<()> {
+        let menu = |ch: &Self| {
+            ab_eval(&ch.ab, &js_mention_menu(name), &ch.session, budget)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_default()
+        };
+        let count = |v: &serde_json::Value| v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+        let mut seen = serde_json::Value::Null;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            }
+            ab_cmd(&self.ab, &["click", "[data-cgu-composer]"], &self.session, budget)
+                .context("focusing the composer for the app mention")?;
+            ab_cmd(&self.ab, &["keyboard", "type", &format!("@{name}")], &self.session, budget)
+                .context("typing the app mention")?;
+            let until = Instant::now() + Duration::from_millis(2500);
+            loop {
+                seen = menu(self);
+                if count(&seen) == 1 || Instant::now() >= until {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if count(&seen) == 1 {
+                break;
+            }
+        }
+        if count(&seen) != 1 {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            let titles = seen.get("titles").cloned().unwrap_or_default();
+            bail!(
+                "the ChatGPT app {name:?} is not available to this chat (mention menu showed \
+                 {titles}). In ChatGPT, check Settings → Apps that {name:?} is connected and \
+                 enabled, and that its server and tunnel are up; then `chatgpt-use refresh`."
+            );
+        }
+        let rows = seen.get("titles").and_then(|t| t.as_array()).map_or(1, |a| a.len());
+        for _ in 0..rows {
+            if seen.get("highlighted").and_then(|h| h.as_bool()).unwrap_or(false) {
+                break;
+            }
+            let _ = ab_cmd(&self.ab, &["press", "ArrowDown"], &self.session, budget);
+            seen = menu(self);
+        }
+        if !seen.get("highlighted").and_then(|h| h.as_bool()).unwrap_or(false) {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            bail!("could not highlight the {name:?} row in the mention menu");
+        }
+        ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
+            .context("choosing the app in the mention menu")?;
+        std::thread::sleep(Duration::from_millis(300));
+        let pill = ab_eval(&self.ab, &js_connector_pill(name), &self.session, budget).unwrap_or_default();
+        if !pill.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            bail!("chose {name:?} in the mention menu but no pill for it appeared ({pill})");
+        }
+        eprintln!("attached the ChatGPT app {name:?} to this message");
+        Ok(())
+    }
+
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
         // Never type while the PAGE still believes it is generating. ChatGPT
         // disables submission then, so Enter is silently swallowed and the turn
@@ -1448,6 +1690,9 @@ impl Channel {
                  prepended to the message"
             );
         }
+        if let Some(name) = self.connector.clone() {
+            self.attach_connector(&name, budget)?;
+        }
 
         // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
         // fails with EAGAIN ("Resource temporarily unavailable"). Each chunk
@@ -1477,27 +1722,7 @@ impl Channel {
         // leeguooooo/chrome-use#301 does to chunked inserts.
         let (want_n, want_h) = composer_fingerprint(message);
         let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
-        let got_n = got.as_ref().and_then(|v| v.get("n")).and_then(|v| v.as_u64());
-        let got_h = got.as_ref().and_then(|v| v.get("h")).and_then(|v| v.as_u64());
-        if let (Some(n), Some(h)) = (got_n, got_h) {
-            if n != want_n {
-                bail!(
-                    "composer content doesn't match the message to send \
-                     ({n} non-whitespace chars present, {want_n} expected) — \
-                     refusing to submit a truncated or polluted prompt"
-                );
-            }
-            if h != want_h as u64 {
-                bail!(
-                    "composer holds the right number of characters ({n}) but not in \
-                     the right order (fingerprint {h:#x}, expected {:#x}) — refusing \
-                     to submit a scrambled prompt",
-                    want_h
-                );
-            }
-        }
-
-        Ok(())
+        check_fingerprint(got.as_ref(), want_n, want_h as u64)
     }
 
     /// Press Enter and return only once a new user turn proves it landed.
@@ -1699,8 +1924,19 @@ impl Channel {
         }
 
         let url = format!("{WEB_CONVO_URL_TPL}{id}");
-        ab_open(&self.ab, &self.session, &url, None, deadline)
-            .context("reopening the pinned conversation")?;
+        if let Err(first) = ab_open(&self.ab, &self.session, &url, None, deadline) {
+            // Seen live: chrome-use refuses to drive a tab it has lost ("the
+            // tab this command was driving is gone") rather than retarget.
+            // Closing the session drops that dead binding; the next open gets
+            // a fresh tab on the same conversation, as `connect` does.
+            if !tab_gone(&format!("{first:#}")) {
+                return Err(first).context("reopening the pinned conversation");
+            }
+            eprintln!("the chrome-use session lost its tab; reopening conversation {id} in a fresh one");
+            ab_close(&self.ab, &self.session);
+            ab_open(&self.ab, &self.session, &url, None, deadline)
+                .context("reopening the pinned conversation in a fresh tab")?;
+        }
         if !wait_composer(&self.ab, &self.session, deadline, 30)? {
             bail!("reopened conversation {id} but the composer never appeared");
         }
@@ -2037,6 +2273,9 @@ impl Channel {
         // navigation hiccup and reads as "the tab is gone".
         const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
         let mut lost_polls = 0u32;
+        // Consecutive unpinned polls whose user-turn count fell back (see
+        // `unpinned_page_lost`).
+        let mut unpinned_dips = 0u32;
 
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
@@ -2128,15 +2367,6 @@ impl Channel {
                 .ok()
                 .and_then(|v| v.get("user_count"))
                 .and_then(|v| v.as_u64());
-            if self.convo_id.is_none() && users_now.is_some_and(|n| n <= baseline_users.count) {
-                bail!(
-                    "the ChatGPT page was replaced while the first turn was still \
-                     running, and ChatGPT does not put a conversation id in the URL \
-                     until that turn finishes — so there is no conversation to \
-                     reattach to. The reply may still have completed in your \
-                     browser; rerun the command."
-                );
-            }
 
             match (&self.convo_id, &seen_convo) {
                 // Latch as soon as the id exists — the server assigns it right
@@ -2162,6 +2392,22 @@ impl Channel {
                     continue;
                 }
                 (None, None) => {}
+            }
+
+            // Checked only now, after a conversation id in the URL had its
+            // chance to pin us: a pinned turn is recoverable and the URL check
+            // above is its authority.
+            if unpinned_page_lost(self.convo_id.is_some(), users_now, baseline_users.count, &mut unpinned_dips) {
+                bail!(
+                    "the ChatGPT page was replaced while the first turn was still \
+                     running, and ChatGPT does not put a conversation id in the URL \
+                     until that turn finishes — so there is no conversation to \
+                     reattach to. The reply may still have completed in your \
+                     browser; rerun the command."
+                );
+            }
+            if unpinned_dips > 0 {
+                continue;
             }
 
             let st = match read {
@@ -2584,7 +2830,11 @@ impl Channel {
 
         let st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
         if !st.get("open").and_then(|v| v.as_bool()).unwrap_or(false) {
-            bail!("clicked the model picker but its menu did not open");
+            let via = pick.get("via").and_then(|v| v.as_str()).unwrap_or("?");
+            bail!(
+                "clicked the model picker (found by {via}) but its menu did not open; pass \
+                 --model current to use the account's current model"
+            );
         }
 
         let outcome = match want_level {
@@ -3471,6 +3721,10 @@ mod tests {
         // The whole point: never key off the button label, which drifts.
         assert!(JS_FIND_PICKER.contains("composer-plus-btn"));
         assert!(JS_FIND_PICKER.contains(r#"button[aria-haspopup="menu"]"#));
+        assert!(JS_FIND_PICKER.contains("model-switcher-dropdown-button"));
+        assert!(JS_PICKER_MENU.contains("composer-intelligence-picker-content"));
+        assert!(keeps_current_model("current") && keeps_current_model(" Default "));
+        assert!(!keeps_current_model("instant") && !keeps_current_model("pro"));
         assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
         assert!(JS_PICKER_MENU.contains(r#"[role="slider"]"#));
         assert!(JS_PICKER_MENU.contains("aria-valuenow"));
@@ -3535,6 +3789,10 @@ mod tests {
             ("clear_composer", JS_CLEAR_COMPOSER),
             ("composer_fingerprint", JS_COMPOSER_FINGERPRINT),
             ("insert_hello", &js_insert_text("hello")),
+            ("find_picker", JS_FIND_PICKER),
+            ("mention_menu", &js_mention_menu("chatgpt-use")),
+            ("connector_pill", &js_connector_pill("chatgpt-use")),
+            ("picker_menu", JS_PICKER_MENU),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }
@@ -3549,6 +3807,44 @@ mod tests {
         }
         // A bare unanchored "ok" would click any button whose label contains it.
         assert!(JS_DISMISS_DIALOG.contains("/^(got it|ok|"));
+    }
+
+    #[test]
+    fn a_lost_tab_is_recognised_by_chrome_uses_wording() {
+        assert!(tab_gone("chrome-use [\"open\"] failed (exit 1): ✗ the tab this command was driving is gone — it navigated"));
+        assert!(!tab_gone("chrome-use failed: Too many requests"));
+    }
+
+    #[test]
+    fn one_low_read_during_turn_one_is_not_a_lost_page() {
+        let mut dips = 0;
+        // The re-render blip: one low read, then the turn is back.
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(!unpinned_page_lost(false, Some(1), 0, &mut dips));
+        assert_eq!(dips, 0);
+        // A page that stays blank is lost on the third poll.
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(!unpinned_page_lost(false, Some(0), 0, &mut dips));
+        assert!(unpinned_page_lost(false, Some(0), 0, &mut dips));
+        // Once pinned, or with an unreadable count, the count never decides.
+        let mut d = 2;
+        assert!(!unpinned_page_lost(true, Some(0), 0, &mut d));
+        assert_eq!(d, 0);
+        assert!(!unpinned_page_lost(false, None, 0, &mut d));
+    }
+
+    #[test]
+    fn the_fingerprint_check_fails_closed() {
+        let ok = serde_json::json!({"n": 3, "h": 7});
+        assert!(check_fingerprint(Some(&ok), 3, 7).is_ok());
+        assert!(check_fingerprint(Some(&ok), 4, 7).unwrap_err().to_string().contains("truncated"));
+        assert!(check_fingerprint(Some(&ok), 3, 8).unwrap_err().to_string().contains("scrambled"));
+        // A probe that failed or answered in another shape is not a pass.
+        for bad in [None, Some(serde_json::json!({})), Some(serde_json::json!({"n": 3})),
+                    Some(serde_json::json!("error"))] {
+            let e = check_fingerprint(bad.as_ref(), 3, 7).unwrap_err().to_string();
+            assert!(e.contains("not verified"), "{e}");
+        }
     }
 
     #[test]

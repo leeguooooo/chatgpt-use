@@ -20,6 +20,10 @@ pub enum Command {
     Ask(AskArgs),
     /// Mode 2 · brain — ChatGPT drives local tools in an agent loop until done.
     Run(RunArgs),
+    /// Code review by ChatGPT that explores the repository itself: starting
+    /// from the change against --base, it reads whatever code it needs
+    /// (read-only tools, in a throwaway worktree) and reports verified bugs.
+    Review(ReviewArgs),
     /// Mode 3 · drop-in — Anthropic-compatible /v1/messages shim for Claude Code.
     Serve(ServeArgs),
     /// MCP channel — local MCP server exposing project tools to a regular GPT-5.5
@@ -129,6 +133,10 @@ pub struct WorkArgs {
     /// Hard cap on turns when --loop is set (each turn is one model reply).
     #[arg(long, default_value_t = 8)]
     pub max_turns: u32,
+    /// The ChatGPT app (MCP connector) to @-mention into each message so the
+    /// turn can call its tools. Empty: mention none.
+    #[arg(long, default_value = "chatgpt-use")]
+    pub connector: String,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
@@ -177,7 +185,9 @@ pub struct ChannelArgs {
     pub timeout: u64,
     /// Select the composer "Intelligence" level: instant | medium | high |
     /// "extra high" | pro (or a raw menu label). GPT-5.5 Pro can only be reached
-    /// here (it has no Apps/MCP). Default: the account's current level.
+    /// here (it has no Apps/MCP). `current` leaves the picker alone and uses
+    /// the account's current model. Default: the account's current level
+    /// (`work` defaults to instant).
     #[arg(long)]
     pub model: Option<String>,
     /// When another run is using the ChatGPT window: wait for it, or fail at
@@ -222,6 +232,25 @@ pub struct AskArgs {
     /// An id whose request may have reached ChatGPT is never sent again.
     #[arg(long = "request-id", value_name = "ID")]
     pub request_id: Option<String>,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewArgs {
+    /// Review the change since this ref's merge-base with HEAD. Uncommitted
+    /// and untracked work is included.
+    #[arg(long, default_value = "main")]
+    pub base: String,
+    /// Extra direction for the reviewer (what to focus on).
+    #[arg(long)]
+    pub focus: Option<String>,
+    /// Hard cap on tool rounds (each is one ChatGPT message).
+    #[arg(long, default_value_t = 20)]
+    pub max_steps: u32,
+    /// Leave the review worktree in place afterwards (its path is printed).
+    #[arg(long)]
+    pub keep: bool,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
