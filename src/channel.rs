@@ -493,9 +493,13 @@ fn js_mention_menu(name: &str) -> String {
         r#"(() => {{
   const name = {n};
   const shown = (r) => !r.closest('[hidden], [aria-hidden="true"]') && getComputedStyle(r).display !== 'none';
+  // `.__menu-item` is also the sidebar's class ("New chat", "Search", the
+  // chat history — seen live), so a row only counts inside an open popup,
+  // never inside navigation.
+  const POPUP = '[data-mention-list-scroll-area], [role="listbox"], [role="menu"], [data-radix-popper-content-wrapper]';
   const rows = [...document.querySelectorAll(
     '.__menu-item[tabindex="0"], [data-mention-list-scroll-area] button[data-list-navigation-item="true"]')]
-    .filter(shown);
+    .filter(r => shown(r) && r.closest(POPUP) && !r.closest('nav, aside, [data-testid*="sidebar"], #stage-slideover-sidebar'));
   const titles = rows.map(r => ((r.innerText || r.textContent || '').split('\n')[0] || '')
     .replace(/\s+/g, ' ').trim());
   const isName = (t) => t === name || (t.startsWith(name) && /^\s*DEV$/.test(t.slice(name.length)));

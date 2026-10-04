@@ -366,16 +366,27 @@ test("mention menu: exactly one row titled as the app, badge allowed, highlight 
 });
 
 test("mention menu: the other row markup, and no match / two matches", () => {
-  const one = page(`<div class="__menu-item" tabindex="0">chatgpt-use</div>`);
+  const one = page(`<div role="listbox"><div class="__menu-item" tabindex="0">chatgpt-use</div></div>`);
   assert.equal(one("mention_menu").count, 1);
-  const none = page(`<div class="__menu-item" tabindex="0">chatgpt-user</div><div class="__menu-item" tabindex="0">Drive</div>`);
+  const none = page(`<div role="listbox"><div class="__menu-item" tabindex="0">chatgpt-user</div><div class="__menu-item" tabindex="0">Drive</div></div>`);
   const m = none("mention_menu");
   assert.equal(m.count, 0);
   assert.deepEqual(JSON.parse(JSON.stringify(m.titles)), ["chatgpt-user", "Drive"]);
-  const two = page(`<div class="__menu-item" tabindex="0">chatgpt-use</div><div class="__menu-item" tabindex="0">chatgpt-use DEV</div>`);
+  const two = page(`<div role="menu"><div class="__menu-item" tabindex="0">chatgpt-use</div><div class="__menu-item" tabindex="0">chatgpt-use DEV</div></div>`);
   assert.equal(two("mention_menu").count, 2, "ambiguous: not chosen");
-  const hidden = page(`<div hidden><div class="__menu-item" tabindex="0">chatgpt-use</div></div>`);
+  const hidden = page(`<div hidden role="listbox"><div class="__menu-item" tabindex="0">chatgpt-use</div></div>`);
   assert.equal(hidden("mention_menu").count, 0);
+});
+
+test("mention menu: the sidebar's __menu-item rows are never read as the menu", () => {
+  // As seen live: no popup open, sidebar entries share the class.
+  const run = page(`<nav aria-label="Chat history">
+    <a class="__menu-item" tabindex="0">New chat</a><a class="__menu-item" tabindex="0">Search</a>
+    <div class="group __menu-item" tabindex="0">chatgpt-use</div></nav>
+    <div class="__menu-item" tabindex="0">chatgpt-use</div>`);
+  const m = run("mention_menu");
+  assert.equal(m.count, 0, JSON.stringify(m));
+  assert.deepEqual(JSON.parse(JSON.stringify(m.titles)), [], "outside a popup nothing counts");
 });
 
 test("connector pill: found in the composer by either markup", () => {
