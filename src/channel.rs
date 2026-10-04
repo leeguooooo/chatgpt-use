@@ -1909,8 +1909,16 @@ impl Channel {
         }
 
         let url = format!("{WEB_CONVO_URL_TPL}{id}");
-        ab_open(&self.ab, &self.session, &url, None, deadline)
-            .context("reopening the pinned conversation")?;
+        if let Err(first) = ab_open(&self.ab, &self.session, &url, None, deadline) {
+            // Seen live: chrome-use refuses to drive a tab it has lost ("the
+            // tab this command was driving is gone") rather than retarget.
+            // Closing the session drops that dead binding; the next open gets
+            // a fresh tab on the same conversation, as `connect` does.
+            eprintln!("reopening conversation {id} failed ({first:#}); retrying in a fresh tab");
+            ab_close(&self.ab, &self.session);
+            ab_open(&self.ab, &self.session, &url, None, deadline)
+                .context("reopening the pinned conversation in a fresh tab")?;
+        }
         if !wait_composer(&self.ab, &self.session, deadline, 30)? {
             bail!("reopened conversation {id} but the composer never appeared");
         }
