@@ -15,6 +15,9 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 pub fn run(args: &ResumeArgs) -> Result<()> {
+    // SIGTERM (a harness timeout, say) ends the wait through the normal path,
+    // so the receipt is settled or restored instead of left mid-update.
+    crate::channel::install_cancel_handler();
     let mut envelope = resume(args, None, None);
     // Older callers read the reply text at the top level; keep it there too.
     if let Some(text) = envelope["result"]["text"].as_str().map(str::to_string) {

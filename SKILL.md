@@ -23,11 +23,11 @@ and a Chrome profile logged in to chatgpt.com.
 
 ```sh
 # Sidekick — one round trip, caller stays the brain
-chatgpt-use ask "<question>" [--file <path> ...]
+chatgpt-use ask "<question>" [--file <path> ...] --no-stdin
 git diff | chatgpt-use ask "Explain what changed and what might break"
 
 # Structured delegation — plan/review/debug/research verdict packet, optionally --model pro
-chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]
+chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro] --no-stdin
 chatgpt-use handoff plan.json --to codex|claude-code [--execute]   # dry-run without --execute
 
 # Closed loop — ChatGPT DOES the task on the project via its MCP connector and reports back
@@ -38,7 +38,9 @@ chatgpt-use mcp --port 8788 --cwd <project>            # read-only by default, s
 #   --profile full --permission-mode trusted|dangerous  # write/bash — trusted/local only
 
 # Machine use — one JSON envelope + exit code; stdin is context when piped
-chatgpt-use ask --json [--request-id <id>] "<question>"   # then status|resume|cancel <id>
+chatgpt-use ask --json --no-stdin [--request-id <id>] "<question>"   # then status|resume|cancel <id>
+# Piped stdin is context. Not piping anything? Pass --no-stdin: an open but silent stdin
+# (some harnesses, or a `while read` loop that ask would drain) fails after 5 s otherwise.
 
 # Any MCP client — ask / status / resume / cancel as tools, same envelope
 chatgpt-use agent-mcp      # e.g. claude mcp add chatgpt-use -- chatgpt-use agent-mcp

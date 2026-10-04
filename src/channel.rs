@@ -1714,7 +1714,16 @@ impl Channel {
                 .with_submitted(Submitted::Yes)
                 .into());
             }
-            std::thread::sleep(Duration::from_secs(5));
+            nap(Duration::from_secs(5));
+            if cancel_requested() {
+                // Stop WAITING; the generation itself is not ours to stop here.
+                return Err(ChannelError::new(
+                    ErrorKind::Incomplete,
+                    format!("stopped waiting for conversation {id}; the reply may still be generating"),
+                )
+                .with_submitted(Submitted::Yes)
+                .into());
+            }
         }
     }
 

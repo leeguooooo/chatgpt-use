@@ -173,10 +173,19 @@ pub fn may_send(existing: Option<&Receipt>) -> bool {
 pub fn live_state(r: &Receipt, alive: impl Fn(u32) -> bool) -> String {
     match r.state.as_str() {
         "accepted" | "submitted" if alive(r.pid) => "running".into(),
+        // A reply was recorded before an owner (a `resume` re-reading it) died
+        // mid-update: the request did complete.
+        "accepted" | "submitted" if has_reply(r) => "completed".into(),
         "accepted" => "submission_unknown".into(),
         "submitted" => "detached".into(),
         other => other.into(),
     }
+}
+
+/// Whether the receipt records a reply: the request completed at some point,
+/// whatever its state field says now.
+pub fn has_reply(r: &Receipt) -> bool {
+    matches!(r.outcome.as_deref(), Some("completed" | "schema_violation" | "unparseable"))
 }
 
 /// Whether `pid` is still a chatgpt-use process. Pids are reused, and `cancel`

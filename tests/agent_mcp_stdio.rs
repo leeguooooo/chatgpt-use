@@ -94,3 +94,28 @@ fn agent_mcp_speaks_jsonrpc_on_stdout_and_shares_the_ask_envelope() {
     assert!(status.success(), "the server exits cleanly when its client hangs up");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn unreadable_input_ends_the_session_through_shutdown() {
+    let home = std::env::temp_dir().join(format!("chatgpt-use-agent-mcp-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chatgpt-use"))
+        .arg("agent-mcp")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("CHATGPT_USE_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"\xff\xfe not utf-8\n").unwrap();
+    // Exits with an error even though the client has not hung up yet.
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    drop(stdin);
+    let _ = std::fs::remove_dir_all(&home);
+}

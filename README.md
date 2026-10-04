@@ -58,6 +58,9 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
   leaves a pipe open cannot hang the run; past either deadline the ask fails as `not_submitted`
   instead of being sent without its context. `--stdin` waits for stdin however long it takes,
   `--no-stdin` never reads it. Over 512 KiB also fails before anything is sent.
+  **Changed in 0.0.8:** `ask` used to ignore stdin. A caller that leaves an unused pipe open, or
+  runs `ask` inside a `while read` loop (where it would now drain the loop's input), should pass
+  `--no-stdin`.
 - `--json` prints one envelope instead of text — `{"status":"completed","result":{"text":…},
   "conversation_id":…,"request_id":…}` or a failure with `error` — using the statuses and exit
   codes below. Without `--json` the reply is plain text and any failure exits 1.

@@ -95,16 +95,28 @@ impl Backend for Live {
 pub fn run(args: &AgentMcpArgs) -> Result<()> {
     let server = Server::new(Live, Box::new(std::io::stdout()), args.channel.clone());
     eprintln!("chatgpt-use agent-mcp: serving on stdio");
+    let mut read_error = None;
     for line in std::io::stdin().lock().lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            server.handle(&line);
+        match line {
+            Ok(line) if !line.trim().is_empty() => {
+                server.handle(&line);
+            }
+            Ok(_) => {}
+            // Unreadable input (an I/O error, a non-UTF-8 byte) ends the
+            // session like a hang-up does: through shutdown, never around it.
+            Err(e) => {
+                read_error = Some(e);
+                break;
+            }
         }
     }
-    // The client hung up. Stop what is still running so its receipt records
+    // The client is gone. Stop what is still running so its receipt records
     // how it ended, rather than leaving a generation nobody will read.
     server.shutdown(Duration::from_secs(30));
-    Ok(())
+    match read_error {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
 
 struct Task {

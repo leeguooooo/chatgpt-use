@@ -162,9 +162,10 @@ enum Route {
 }
 
 fn route(r: &receipt::Receipt, alive: impl Fn(u32) -> bool) -> Route {
-    if matches!(r.state.as_str(), "completed" | "failed") {
+    let live = alive(r.pid);
+    if matches!(r.state.as_str(), "completed" | "failed") || (!live && receipt::has_reply(r)) {
         Route::Settled
-    } else if !alive(r.pid) {
+    } else if !live {
         Route::Attach
     } else if r.owner.as_deref() == Some(receipt::OWNER_MCP) {
         Route::Marker
@@ -236,6 +237,14 @@ mod tests {
         assert_eq!(route(&r, |_| false), Route::Attach);
         r.state = "completed".into();
         assert_eq!(route(&r, |_| true), Route::Settled);
+        // A resume killed mid-reread leaves state "submitted" over a recorded
+        // reply: with its owner dead, that is a finished request, not one to
+        // open the browser for.
+        r.state = "submitted".into();
+        r.outcome = Some("completed".into());
+        assert_eq!(route(&r, |_| false), Route::Settled);
+        assert_eq!(receipt::live_state(&r, |_| false), "completed");
+        assert_eq!(receipt::live_state(&r, |_| true), "running");
     }
 
     #[test]
