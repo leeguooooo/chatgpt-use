@@ -1207,9 +1207,11 @@ impl Channel {
                         saw_login = true;
                     } else {
                         last_failure = Some(format!(
-                            "{label}: the ChatGPT page loaded ({what}) but showed no composer we \
-                             recognise — ChatGPT may have changed its editor; chatgpt-use needs \
-                             an update for it"
+                            "{label}: the ChatGPT page loaded ({what}) but showed no composer. \
+                             Most often this Chrome profile is signed out of ChatGPT (the signed-out \
+                             page has no composer): open chatgpt.com in it and sign in. If it is \
+                             signed in, ChatGPT may have changed its editor and chatgpt-use needs \
+                             an update"
                         ));
                     }
                     ab_close(&ab, &session);
@@ -1256,9 +1258,8 @@ impl Channel {
             return Err(ChannelError::new(
                 ErrorKind::SessionUnavailable,
                 format!(
-                    "could not open ChatGPT through chrome-use (tried {} candidate(s)). This is \
-                     the browser connection, not your login. Last failure — {last}\n\n  \
-                     Check:  chrome-use status",
+                    "could not open ChatGPT through chrome-use (tried {} candidate(s)). Last \
+                     failure — {last}\n\n  Check:  chrome-use status",
                     candidates.len()
                 ),
             )
