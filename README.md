@@ -182,7 +182,8 @@ chatgpt-use review --base origin/main --focus "the cancel path" --max-steps 30
 ```
 
 It runs in a throwaway `git worktree` of HEAD with your uncommitted and untracked files copied in,
-with read-only tools plus `bash` in `safe` mode, so it cannot change your checkout. The report lists
+with read-only tools only (`git_diff`, `grep`, windowed `read_file`, …; no shell), so it cannot
+change your checkout. The report lists
 verified issues with file:line, a failure scenario and a fix. Each tool round is one ChatGPT
 message; `--max-steps` (default 20) caps the cost. `--keep` leaves the worktree for a look.
 

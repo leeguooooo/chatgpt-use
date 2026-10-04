@@ -201,10 +201,17 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "git_diff".to_string(),
-            description: "Show the unstaged `git diff`, optionally limited to one path.".to_string(),
+            description: "Show `git diff`: the unstaged changes, or with `rev` everything from \
+                that commit to the working tree; `stat` for the per-file summary; `path` to limit \
+                it to one file."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "Optional path to diff (workspace-relative)." } },
+                "properties": {
+                    "path": { "type": "string", "description": "Optional path to diff (workspace-relative)." },
+                    "rev": { "type": "string", "description": "Optional commit to diff the working tree against." },
+                    "stat": { "type": "boolean", "description": "Only the per-file summary (--stat)." }
+                },
                 "required": []
             }),
         },
@@ -987,12 +994,24 @@ fn tool_git(args: &[&str], cwd: &Path) -> Result<String, String> {
 }
 
 fn tool_git_diff(input: &Value, cwd: &Path) -> Result<String, String> {
+    let mut args = vec!["diff"];
+    if input.get("stat").and_then(Value::as_bool).unwrap_or(false) {
+        args.push("--stat");
+    }
+    let rev = input.get("rev").and_then(|v| v.as_str()).unwrap_or("");
+    if !rev.is_empty() {
+        if rev.starts_with('-') || !rev.chars().all(|c| c.is_ascii_alphanumeric() || "._-/~^".contains(c)) {
+            return Err("git_diff: invalid rev (allowed: alphanumerics and . _ - / ~ ^)".to_string());
+        }
+        args.push(rev);
+    }
     match input.get("path").and_then(|v| v.as_str()) {
         Some(p) => {
             resolve_path(cwd, p)?; // confine to workspace
-            run_git(&["diff", "--", p], cwd)
+            args.extend(["--", p]);
+            run_git(&args, cwd)
         }
-        None => run_git(&["diff"], cwd),
+        None => run_git(&args, cwd),
     }
 }
 
@@ -1166,6 +1185,30 @@ mod tests {
         assert!(default.content.contains("[read_file: lines 1-600 of 1000; read on with offset=601]"), "{}", &default.content[default.content.len() - 80..]);
         let more = execute(&make_call("c2", "read_file", json!({"path": "big.txt", "offset": 601, "limit": 5})), &dir, true, PermissionMode::Safe);
         assert!(more.content.starts_with("601\n602\n603\n604\n605\n"), "{}", more.content);
+    }
+
+    #[test]
+    fn git_diff_takes_a_rev_and_stat_and_refuses_option_injection() {
+        let dir = tmpdir();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").arg("-C").arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args).output().unwrap().status.success());
+        };
+        git(&["init", "-q"]);
+        fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "a"]);
+        fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-am", "b"]);
+        let diff = execute(&make_call("d", "git_diff", json!({"rev": "HEAD~1"})), &dir, true, PermissionMode::Safe);
+        assert!(diff.ok && diff.content.contains("+two"), "{}", diff.content);
+        let stat = execute(&make_call("s", "git_diff", json!({"rev": "HEAD~1", "stat": true})), &dir, true, PermissionMode::Safe);
+        assert!(stat.content.contains("f.txt") && !stat.content.contains("+two"), "{}", stat.content);
+        for bad in ["--output=/tmp/x", "HEAD;rm", "a b"] {
+            let r = execute(&make_call("b", "git_diff", json!({"rev": bad})), &dir, true, PermissionMode::Safe);
+            assert!(!r.ok, "{bad}: {}", r.content);
+        }
     }
 
     #[test]

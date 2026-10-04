@@ -30,7 +30,7 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
 chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro] --no-stdin
 chatgpt-use handoff plan.json --to codex|claude-code [--execute]   # dry-run without --execute
 
-# Code review — ChatGPT explores the repo itself from the change vs --base (read-only, throwaway worktree)
+# Code review — ChatGPT explores the repo itself from the change vs --base (read-only tools, throwaway worktree)
 chatgpt-use review [--base main] [--focus "<area>"] [--max-steps 20]
 
 # Local tool loop — ChatGPT reads files / runs commands here; works on a Free plan
