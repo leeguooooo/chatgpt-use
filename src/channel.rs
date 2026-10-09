@@ -1746,17 +1746,37 @@ impl Channel {
             // button and this selector matches nothing.
             let _ = ab_cmd(
                 &self.ab,
-                &["click", r#"button[data-testid="send-button"], form[data-chatgpt-composer] button[type="submit"]"#],
+                &[
+                    "click",
+                    r#"button[data-testid="send-button"], button[data-testid="fruitjuice-send-button"], button[data-testid*="send"], button[aria-label*="Send" i], button[aria-label*="发送"], form[data-chatgpt-composer] button[type="submit"]"#,
+                ],
                 &self.session,
                 budget,
             );
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
-                return Err(SubmitFailure::Ambiguous(anyhow!(
-                    "the message was never submitted — no new user turn appeared \
-                     after pressing Enter and clicking the send button. The \
-                     composer may be disabled (rate limit, expired session) or \
-                     the page layout changed."
-                )));
+                // If clicking the button did not trigger submission, dispatch Enter directly to the focused composer
+                let _ = ab_eval(
+                    &self.ab,
+                    r#"(() => {
+                        const el = document.querySelector('[data-cgu-composer]') || document.querySelector('#prompt-textarea') || document.querySelector('div[contenteditable="true"]');
+                        if (el) {
+                            el.focus();
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+                            el.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+                            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+                        }
+                    })()"#,
+                    &self.session,
+                    budget,
+                );
+                if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
+                    return Err(SubmitFailure::Ambiguous(anyhow!(
+                        "the message was never submitted: no new user turn appeared \
+                         after pressing Enter, clicking the send button, and dispatching \
+                         fallback Enter. The composer may be disabled (rate limit, expired \
+                         session) or the page layout changed."
+                    )));
+                }
             }
         }
 

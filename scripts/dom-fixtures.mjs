@@ -188,10 +188,17 @@ test("streaming vs done: each stop-button form is seen and clickable", () => {
     assert.equal(run("state").stop, true, button);
     assert.equal(run("click_stop").clicked, true, button);
   }
-  const done = page(`<div data-turn-key="k"><div data-user-message-bubble>q</div>
-    <div data-conversation-role="assistant">done</div></div><form><button data-testid="send-button">s</button></form>`);
-  assert.equal(done("state").stop, false);
-  assert.equal(done("click_stop").clicked, false);
+  for (const sendBtn of [
+    '<button data-testid="send-button">s</button>',
+    '<button data-testid="fruitjuice-send-button">s</button>',
+    '<button aria-label="Send prompt">s</button>',
+    '<button aria-label="发送">s</button>',
+  ]) {
+    const done = page(`<div data-turn-key="k"><div data-user-message-bubble>q</div>
+      <div data-conversation-role="assistant">done</div></div><form>${sendBtn}</form>`);
+    assert.equal(done("state").stop, false, sendBtn);
+    assert.equal(done("click_stop").clicked, false, sendBtn);
+  }
 });
 
 test("a running tool chip is active; the reply's own prose is not", () => {
