@@ -558,6 +558,32 @@ fn js_connector_pill(name: &str) -> String {
 }
 
 // JS: press the stop button, if the page is generating.
+/// The send-button fallback in `submit`. A selector list matches in DOM order,
+/// not list order, so the exact testids/ids stay page-wide while the loose
+/// `*=send` / aria-label alternatives are scoped to the form holding the
+/// composer we stamped (`data-cgu-composer`); otherwise any other button on the
+/// page whose label contains "Send" could be clicked instead.
+const SEND_BUTTON_SELECTOR: &str = concat!(
+    r#"button[data-testid="send-button"], "#,
+    r#"button[data-testid="fruitjuice-send-button"], "#,
+    r#"button#composer-submit-button, "#,
+    r#"form:has([data-cgu-composer]) button[data-testid*="send"], "#,
+    r#"form:has([data-cgu-composer]) button[aria-label*="Send" i], "#,
+    r#"form:has([data-cgu-composer]) button[aria-label*="发送"], "#,
+    r#"form[data-chatgpt-composer] button[type="submit"]"#,
+);
+
+/// Dispatch a synthetic Enter on the stamped composer (see `submit`).
+const JS_DISPATCH_ENTER: &str = r#"(() => {
+  const el = document.querySelector('[data-cgu-composer]') || document.querySelector('#prompt-textarea');
+  if (!el) return { ok: false };
+  el.focus();
+  for (const type of ['keydown', 'keypress', 'keyup']) {
+    el.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+  }
+  return { ok: true };
+})()"#;
+
 const JS_CLICK_STOP: &str = r#"(() => {
   const b = document.querySelector('button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'form button[type="button"][aria-label="Stop"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"]');
@@ -1743,29 +1769,22 @@ impl Channel {
             // Enter didn't take. Click the send button and demand evidence again.
             // Note this fallback is naturally inert if the submit did land after
             // all: once generation starts, the send button becomes the stop
-            // button and this selector matches nothing.
+            // button (`stop-button` / `composer-stop-button`, "Stop streaming")
+            // and none of SEND_BUTTON_SELECTOR's alternatives match it.
             let _ = ab_cmd(
                 &self.ab,
-                &[
-                    "click",
-                    r#"button[data-testid="send-button"], button[data-testid="fruitjuice-send-button"], button[data-testid*="send"], button[aria-label*="Send" i], button[aria-label*="发送"], form[data-chatgpt-composer] button[type="submit"]"#,
-                ],
+                &["click", SEND_BUTTON_SELECTOR],
                 &self.session,
                 budget,
             );
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
-                // If clicking the button did not trigger submission, dispatch Enter directly to the focused composer
+                // Last resort: a synthetic Enter on the composer itself. Untrusted
+                // events are weaker than the CDP `press Enter` above, but the
+                // editor's own keydown handler may still act on one. Harmless if
+                // the submit did land late: the composer is empty by then.
                 let _ = ab_eval(
                     &self.ab,
-                    r#"(() => {
-                        const el = document.querySelector('[data-cgu-composer]') || document.querySelector('#prompt-textarea') || document.querySelector('div[contenteditable="true"]');
-                        if (el) {
-                            el.focus();
-                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-                            el.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-                            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-                        }
-                    })()"#,
+                    JS_DISPATCH_ENTER,
                     &self.session,
                     budget,
                 );
@@ -3767,6 +3786,21 @@ mod tests {
     fn convo_drift_rejects_a_blank_new_chat() {
         let msg = convo_drift("abc", None).expect("must fail closed");
         assert!(msg.contains("abc"), "{msg}");
+    }
+
+    #[test]
+    fn send_fallback_scopes_loose_selectors_to_the_composer_form() {
+        for part in SEND_BUTTON_SELECTOR.split(", ") {
+            let loose = part.contains("*=");
+            assert!(
+                !loose || part.starts_with("form:has([data-cgu-composer]) "),
+                "loose selector not scoped to the composer form: {part}"
+            );
+        }
+        assert!(SEND_BUTTON_SELECTOR.contains(r#"button[data-testid="send-button"]"#));
+        assert!(SEND_BUTTON_SELECTOR.contains("composer-submit-button"));
+        assert!(!SEND_BUTTON_SELECTOR.contains("stop"));
+        assert!(JS_DISPATCH_ENTER.contains("[data-cgu-composer]"));
     }
 
     #[test]
