@@ -201,14 +201,14 @@ pub fn parse_packet(reply: &str) -> Result<DelegationPacket> {
         anyhow::anyhow!(
             "delegation packet: no JSON object / json block found in reply \
              (ChatGPT did not return a structured packet; raw reply: {:?})",
-            &reply[..reply.len().min(300)]
+            head(reply, 300)
         )
     })?;
 
     let packet: DelegationPacket = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
             "delegation packet: failed to parse json: {e}\nraw was: {:?}",
-            &raw[..raw.len().min(500)]
+            head(&raw, 500)
         )
     })?;
 
@@ -235,10 +235,41 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
             }
         }
     }
-    // 2. First balanced {...}, tracking string literals so braces inside strings
-    //    don't throw off the depth count. ASCII braces/quotes only; UTF-8
-    //    continuation bytes (>=0x80) never collide with these markers.
-    let start = reply.find('{')?;
+    // 2. First top-level balanced {...} that parses as a JSON object. Not simply
+    //    the first: the conversation record wraps code as
+    //    `<CodeBlock … editable={false}>`, and that attribute is a balanced pair
+    //    ahead of the real object. Only sibling spans are candidates, never one
+    //    nested inside a malformed span, so a broken reply can't yield a partial
+    //    value. With no valid object anywhere, keep the first balanced span so
+    //    the caller's parse error still shows what was found.
+    let mut first = None;
+    let mut from = 0;
+    while let Some(offset) = reply[from..].find('{') {
+        let start = from + offset;
+        let Some(span) = balanced_object_at(reply, start) else { break };
+        if matches!(serde_json::from_str::<serde_json::Value>(span), Ok(serde_json::Value::Object(_))) {
+            return Some(span.to_string());
+        }
+        first.get_or_insert(span);
+        from = start + span.len();
+    }
+    first.map(str::to_string)
+}
+
+/// At most `max` bytes of `s`, cut back to a char boundary so slicing a reply
+/// for an error message can't panic on multibyte text.
+fn head(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The balanced `{...}` starting at byte `start`, tracking string literals so
+/// braces inside strings don't throw off the depth count. ASCII braces/quotes
+/// only; UTF-8 continuation bytes (>=0x80) never collide with these markers.
+fn balanced_object_at(reply: &str, start: usize) -> Option<&str> {
     let bytes = reply.as_bytes();
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);
     for (i, &b) in bytes[start..].iter().enumerate() {
@@ -257,7 +288,7 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(reply[start..start + i + 1].to_string());
+                        return Some(&reply[start..start + i + 1]);
                     }
                 }
                 _ => {}
@@ -272,6 +303,33 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_does_not_pick_object_nested_in_malformed_outer() {
+        // The outer object is invalid (trailing comma); its valid inner object
+        // must not be returned as if it were the whole reply.
+        let reply = r#"{"profile":{"name":"Ada"},}"#;
+        assert_eq!(extract_json_object(reply).as_deref(), Some(reply));
+    }
+
+    #[test]
+    fn parse_packet_error_truncates_at_char_boundary() {
+        // A wrong-shape object with a multibyte char straddling byte 500 must
+        // produce an error, not a slicing panic.
+        let reply = format!("{{\"x\": \"{}é{}\"}}", "a".repeat(492), "b".repeat(20));
+        assert!(!reply.is_char_boundary(500));
+        assert!(parse_packet(&reply).is_err());
+    }
+
+    #[test]
+    fn extract_skips_codeblock_wrapper_braces() {
+        // ChatGPT's conversation record now wraps code in a JSX-like tag whose
+        // attribute `editable={false}` is the first balanced `{...}` in the reply.
+        let reply = "<CodeBlock language=\"json\" editable={false}>\n{\"goal\": \"g\", \"verdict\": \"proceed\"}\n</CodeBlock>";
+        let raw = extract_json_object(reply).expect("object found");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["goal"], "g");
+    }
 
     fn make_packet_json(verdict: &str) -> String {
         format!(
