@@ -3347,68 +3347,53 @@ fn convo_drift(pinned: &str, current: Option<&str>) -> Option<String> {
     }
 }
 
+/// What can actually be spawned, best first. Windows' CreateProcess cannot run
+/// an extensionless file, so the `chrome-use` sh shim a layout puts on PATH must
+/// never be chosen; a `.cmd` shim runs, but only through cmd.exe and its quoting,
+/// so any real `.exe` beats it even when the shim comes earlier on PATH (#17).
+#[cfg(windows)]
+const BIN_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat"];
+#[cfg(not(windows))]
+const BIN_SUFFIXES: &[&str] = &[""];
+
 fn find_chrome_use() -> Option<PathBuf> {
     // Prefer a companion binary next to chatgpt-use. This makes portable
     // Windows installs work even when the user's PATH is full or stale.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in AB_BIN_CANDIDATES {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                #[cfg(windows)]
-                {
-                    let candidate = dir.join(format!("{name}.exe"));
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
+    let beside: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
+        .into_iter()
+        .collect();
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let on_path: Vec<PathBuf> = path_var
+        .split(crate::platform::path_separator())
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    // Common install spots that may not be on PATH.
+    let mut usual: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        usual.push(PathBuf::from(local).join("Programs").join("chrome-use"));
     }
-    for name in AB_BIN_CANDIDATES {
-        if let Some(p) = which_bin(name) {
-            return Some(p);
-        }
-    }
-    // Also check ~/.local/bin — common for manual installs on macOS/Linux.
     if let Some(home) = crate::platform::home_dir() {
-        for local_bin in [home.join("chrome-tools"), home.join(".local").join("bin")] {
-            for name in AB_BIN_CANDIDATES {
-                let candidate = local_bin.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                #[cfg(windows)]
-                {
-                    let candidate = local_bin.join(format!("{name}.exe"));
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
+        usual.push(home.join("chrome-tools"));
+        usual.push(home.join(".local").join("bin"));
     }
-    None
+    pick_binary(AB_BIN_CANDIDATES, &[beside, on_path, usual], BIN_SUFFIXES)
 }
 
-/// Minimal `which`-equivalent: search PATH for a binary name.
-fn which_bin(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(crate::platform::path_separator()) {
-        if dir.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(dir).join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-        #[cfg(windows)]
-        {
-            let p = PathBuf::from(dir).join(format!("{name}.exe"));
-            if p.is_file() {
-                return Some(p);
+/// First existing `<dir>/<name><suffix>`. Suffix order outranks directory order,
+/// so a better kind of binary anywhere wins over a worse one earlier in the search.
+fn pick_binary(names: &[&str], tiers: &[Vec<PathBuf>], suffixes: &[&str]) -> Option<PathBuf> {
+    for suffix in suffixes {
+        for dirs in tiers {
+            for name in names {
+                for dir in dirs {
+                    let candidate = dir.join(format!("{name}{suffix}"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
             }
         }
     }
@@ -3434,7 +3419,7 @@ fn ab_cmd_with_profile(
 
     let output = cmd
         .output()
-        .with_context(|| format!("failed to run chrome-use {args:?}"))?;
+        .map_err(|e| anyhow!("failed to run {} {args:?}: {e}", ab.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3457,7 +3442,7 @@ fn ab_cmd_with_profile(
             "chrome-use {:?} failed (exit {}): {}",
             args,
             output.status.code().unwrap_or(-1),
-            &detail[..detail.len().min(300)]
+            crate::delegation::head(&detail, 300)
         );
     }
 
@@ -3998,9 +3983,29 @@ mod tests {
     }
 
     #[test]
-    fn which_bin_finds_platform_shell() {
-        let shell = if cfg!(windows) { "powershell.exe" } else { "sh" };
-        assert!(which_bin(shell).is_some(), "{shell} should be findable on PATH");
+    fn a_windows_lookup_skips_the_extensionless_shim_for_a_real_exe() {
+        // #17: chrome-tools/bin comes first on PATH and holds a sh shim, a .cmd
+        // shim and no .exe; the real binary sits in a later PATH directory.
+        let root = std::env::temp_dir().join(format!("cgu-pick-{}", std::process::id()));
+        let (shims, real) = (root.join("bin"), root.join("Programs"));
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(shims.join("chrome-use"), "#!/bin/sh").unwrap();
+        let tiers = [vec![shims.clone(), real.clone()]];
+        let windows = [".exe", ".cmd", ".bat"];
+
+        // The sh shim alone is not runnable: nothing to pick.
+        assert_eq!(pick_binary(&["chrome-use"], &tiers, &windows), None);
+
+        std::fs::write(shims.join("chrome-use.cmd"), "@echo off").unwrap();
+        assert_eq!(pick_binary(&["chrome-use"], &tiers, &windows), Some(shims.join("chrome-use.cmd")));
+
+        std::fs::write(real.join("chrome-use.exe"), "MZ").unwrap();
+        assert_eq!(pick_binary(&["chrome-use"], &tiers, &windows), Some(real.join("chrome-use.exe")));
+
+        // Elsewhere the plain name is the binary, and earlier tiers still win.
+        assert_eq!(pick_binary(&["chrome-use"], &tiers, &[""]), Some(shims.join("chrome-use")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn typed(kind: ErrorKind) -> anyhow::Error {

@@ -258,7 +258,7 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
 
 /// At most `max` bytes of `s`, cut back to a char boundary so slicing a reply
 /// for an error message can't panic on multibyte text.
-fn head(s: &str, max: usize) -> &str {
+pub(crate) fn head(s: &str, max: usize) -> &str {
     let mut end = s.len().min(max);
     while !s.is_char_boundary(end) {
         end -= 1;
