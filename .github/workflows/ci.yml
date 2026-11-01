@@ -42,3 +42,52 @@ jobs:
         run: |
           docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --version
           docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" centos:7 /b/chatgpt-use --help
+
+  prepare-release:
+    needs: [test, linux-glibc-floor]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: prepare-release
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: bump version and tag releasable commits
+        id: prepare
+        env:
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          if [ "$(git rev-parse origin/main)" != "$TESTED_SHA" ]; then
+            echo "Newer main commit exists; its CI will prepare the release"
+            exit 0
+          fi
+          tag="$(python3 scripts/prepare-release.py)"
+          if [ -z "$tag" ]; then
+            echo "No releasable commits since the last tag"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -u
+          git commit -m "chore(release): $tag"
+          git tag "$tag"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: ${{ needs.prepare-release.outputs.tag }}
