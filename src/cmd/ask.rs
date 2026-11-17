@@ -47,6 +47,8 @@ pub struct AskInput {
     pub prompt: String,
     /// Context file paths, read by [`execute`].
     pub files: Vec<String>,
+    /// Image paths uploaded as attachments (see `Channel::attach_images`).
+    pub images: Vec<String>,
     /// Context text already in hand (the CLI's stdin, an MCP argument).
     pub context: Option<String>,
     /// Ask for JSON matching this schema and validate it.
@@ -72,6 +74,9 @@ pub fn run(args: &AskArgs) -> Result<()> {
     }
     if args.output_schema.is_some() && args.mode != Mode::Ask {
         anyhow::bail!("--output-schema works with plain ask only, not --mode {:?}", args.mode);
+    }
+    if !args.images.is_empty() && args.mode != Mode::Ask {
+        anyhow::bail!("--image works with plain ask only, not --mode {:?}", args.mode);
     }
 
     let mode = if args.no_stdin {
@@ -106,6 +111,7 @@ pub fn run(args: &AskArgs) -> Result<()> {
             let input = AskInput {
                 prompt: args.prompt.clone(),
                 files: args.files.clone(),
+                images: args.images.clone(),
                 context: match read {
                     StdinRead::Text(t) => Some(t),
                     _ => None,
@@ -159,6 +165,11 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         Ok(m) => m,
         Err(e) => return tag(structured::failure(&e), input),
     };
+    // Checked before the receipt is claimed: a bad path must not cost a turn.
+    let images = match check_images(&input.images) {
+        Ok(i) => i,
+        Err(e) => return tag(structured::failure(&e), input),
+    };
     match claim_receipt(input.request_id.as_deref(), input.owner, input.owner_token.as_deref()) {
         Ok(path) => opts.receipt = path,
         Err(e) => return tag(structured::failure(&e), input),
@@ -170,6 +181,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
 
     let mut convo = None;
     let reply = Channel::connect(&opts).and_then(|mut channel| {
+        channel.attach_images(images);
         let reply = channel.send(&message);
         convo = channel.conversation_id().map(str::to_string);
         channel.close();
@@ -190,6 +202,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         serde_json::json!({
             "prompt_chars": input.prompt.len(),
             "files": input.files.len(),
+            "images": input.images.len(),
             "context_chars": input.context.as_ref().map(|s| s.len()),
             "model": opts.model,
             "status": envelope["status"],
@@ -214,6 +227,37 @@ fn load_schema(source: &SchemaSource) -> Result<structured::Schema, String> {
 }
 
 // ---- context ----------------------------------------------------------------
+
+/// Image attachments as absolute paths, each an existing file of a type the
+/// ChatGPT composer accepts as an image.
+pub fn check_images(paths: &[String]) -> Result<Vec<String>> {
+    const KINDS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+    const MAX_IMAGES: usize = 10;
+    if paths.len() > MAX_IMAGES {
+        anyhow::bail!("at most {MAX_IMAGES} images per message, got {}", paths.len());
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let kind = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if !KINDS.contains(&kind.as_str()) {
+                anyhow::bail!("not a supported image ({}): {p}", KINDS.join(", "));
+            }
+            let full = fs::canonicalize(path).with_context(|| format!("image not found: {p}"))?;
+            if !full.is_file() {
+                anyhow::bail!("image is not a file: {p}");
+            }
+            // canonicalize yields a `\\?\` path on Windows; chrome-use wants a plain one.
+            let shown = full.to_string_lossy();
+            Ok(shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string())
+        })
+        .collect()
+}
 
 /// The ask message: each context file, then stdin, as fenced blocks, then the
 /// prompt.
@@ -565,6 +609,7 @@ mod tests {
         AskInput {
             prompt: prompt.into(),
             files: vec![],
+            images: vec![],
             context: None,
             schema: None,
             request_id: None,
@@ -584,6 +629,20 @@ mod tests {
             receipt: None,
             ignore_cooldown: false,
         }
+    }
+
+    #[test]
+    fn images_are_checked_before_anything_is_sent() {
+        let dir = std::env::temp_dir().join(format!("cgu-img-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.PNG");
+        fs::write(&png, b"\x89PNG").unwrap();
+        let ok = check_images(&[png.to_string_lossy().into()]).unwrap();
+        assert!(!ok[0].starts_with(r"\\?\"));
+        assert!(check_images(&[dir.join("notes.txt").to_string_lossy().into()]).is_err());
+        assert!(check_images(&[dir.join("missing.png").to_string_lossy().into()]).is_err());
+        assert!(check_images(&vec![png.to_string_lossy().into(); 11]).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -407,6 +407,11 @@ impl<B: Backend> Server<B> {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default(),
+            images: args
+                .get("images")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
             context: args.get("context").and_then(Value::as_str).map(str::to_string),
             schema: args.get("output_schema").cloned().map(SchemaSource::Inline),
             request_id: Some(request_id.clone()),
@@ -637,6 +642,7 @@ fn tool_list() -> Vec<Value> {
                     "prompt": {"type": "string", "minLength": 1},
                     "context": {"type": "string", "description": "Context text sent before the prompt."},
                     "files": {"type": "array", "items": {"type": "string"}, "description": "Paths whose contents are sent as context."},
+                    "images": {"type": "array", "items": {"type": "string"}, "maxItems": 10, "description": "Image paths (png, jpg, gif, webp) uploaded as attachments ChatGPT can see."},
                     "output_schema": schema,
                     "request_id": request_id,
                     "model": {"type": "string", "description": "instant | medium | high | extra high | pro, or a model name."},

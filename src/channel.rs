@@ -1150,6 +1150,39 @@ const JS_FIND_PICKER: &str = concat!(
 })()"#
 );
 
+// JS: prepare the visible composer for an image upload. Clears attachments a
+// failed earlier attempt left behind, then stamps the composer form's own
+// multi-file input as `[data-cgu-upload]` for chrome-use's `upload`. Relies on
+// `[data-cgu-composer]`, stamped by JS_COMPOSER in `fill_composer`.
+const JS_TAG_UPLOAD: &str = r#"(() => {
+  const composer = document.querySelector('[data-cgu-composer]');
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({ok: false, error: 'composer form not found'});
+  const visible = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  form.querySelectorAll('button[aria-label^="Remove"]').forEach(b => { if (visible(b)) b.click(); });
+  document.querySelectorAll('[data-cgu-upload]').forEach(e => e.removeAttribute('data-cgu-upload'));
+  const inputs = [...form.querySelectorAll('input[type="file"]')];
+  const input = inputs.find(i => i.multiple && i.accept === '')
+    || inputs.find(i => i.multiple && /image/.test(i.accept) && !/video/.test(i.accept));
+  if (!input) return JSON.stringify({ok: false, error: 'no file input on the composer (' + inputs.length + ' inputs)'});
+  input.setAttribute('data-cgu-upload', '1');
+  return JSON.stringify({ok: true});
+})()"#;
+
+// JS: attachment tiles on the visible composer. While a file uploads its tile
+// holds a progressbar labelled "Uploading <name>"; Send stays enabled
+// meanwhile, so it is no signal.
+const JS_UPLOAD_STATE: &str = r#"(() => {
+  const composer = document.querySelector('[data-cgu-composer]');
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({tiles: 0, uploading: 0, failed: 0});
+  const tiles = [...form.querySelectorAll('[role="button"].composer-attachment-surface')];
+  const uploading = form.querySelectorAll('[role="progressbar"][aria-label^="Uploading"]').length;
+  // The tile's label is the file name, so only its visible text can say it failed.
+  const failed = tiles.filter(t => /failed|error|couldn.t|unable/i.test(t.innerText)).length;
+  return JSON.stringify({tiles: tiles.length, uploading, failed});
+})()"#;
+
 // JS: read the opened picker — the effort slider (index + where to focus it)
 // and the model-family radios. `level` is the name the page currently shows for
 // the slider position; it is for logging only, never for matching. The picker's
@@ -1347,6 +1380,9 @@ pub struct Channel {
     /// A ChatGPT app (connector) to @-mention into every message, so its tools
     /// are available in that turn (see `attach_connector`).
     connector: Option<String>,
+    /// Image files uploaded into the composer with the next message (see
+    /// `upload_images`).
+    images: Vec<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1548,6 +1584,7 @@ impl Channel {
             submitted: false,
             receipt: opts.receipt.clone(),
             connector: None,
+            images: Vec::new(),
             _surface: surface,
         };
 
@@ -1632,6 +1669,51 @@ impl Channel {
     /// by default; mentioning it is how a message opts in.
     pub fn use_connector(&mut self, name: &str) {
         self.connector = Some(name.to_string()).filter(|n| !n.trim().is_empty());
+    }
+
+    /// Upload these image files (absolute paths) as attachments of the next
+    /// message, so ChatGPT can see them.
+    pub fn attach_images(&mut self, paths: Vec<String>) {
+        self.images = paths;
+    }
+
+    /// Put `self.images` into the (empty, focused) composer and wait until
+    /// ChatGPT has finished uploading every one. Runs before any text is typed
+    /// and before submit, so a failure here never sends anything.
+    ///
+    /// The file input must be the visible composer's own: the page keeps
+    /// hidden composers from earlier chats, each with inputs that take the
+    /// files silently and attach them nowhere.
+    fn upload_images(&self, budget: f64) -> Result<()> {
+        if self.images.is_empty() {
+            return Ok(());
+        }
+        let tagged = ab_eval(&self.ab, JS_TAG_UPLOAD, &self.session, budget)
+            .context("finding the composer's file input")?;
+        if !tagged.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let why = tagged.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            bail!("cannot attach images: {why}");
+        }
+        let mut args = vec!["upload", "[data-cgu-upload]"];
+        args.extend(self.images.iter().map(String::as_str));
+        ab_cmd(&self.ab, &args, &self.session, budget).context("uploading images to ChatGPT")?;
+
+        let want = self.images.len() as u64;
+        let until = Instant::now() + Duration::from_secs_f64(budget.min(120.0));
+        let mut last = serde_json::Value::Null;
+        while Instant::now() < until {
+            last = ab_eval(&self.ab, JS_UPLOAD_STATE, &self.session, budget).unwrap_or_default();
+            let n = |k: &str| last.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            if n("failed") > 0 {
+                bail!("ChatGPT rejected an image upload ({last})");
+            }
+            if n("tiles") >= want && n("uploading") == 0 {
+                eprintln!("attached {want} image(s)");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        bail!("images did not finish uploading in time ({last})")
     }
 
     /// Put the app `name` into the (empty, focused) composer as a mention
@@ -1787,6 +1869,7 @@ impl Channel {
         if let Some(name) = self.connector.clone() {
             self.attach_connector(&name, budget)?;
         }
+        self.upload_images(budget)?;
 
         // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
         // fails with EAGAIN ("Resource temporarily unavailable"). Each chunk
