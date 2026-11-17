@@ -50,6 +50,9 @@ chatgpt-use ask "Review this diff for race conditions" --file src/server.rs
 
 # or feed it whatever you already gathered
 git diff | chatgpt-use ask "Explain what changed and what might break"
+
+# attach screenshots or diagrams ChatGPT should look at
+chatgpt-use ask "Why is this layout overflowing?" --image shot.png --no-stdin
 ```
 
 - The **caller** decides what context to send — `chatgpt-use` just relays it and returns ChatGPT's text.
@@ -61,6 +64,11 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
   **Changed in 0.0.8:** `ask` used to ignore stdin. A caller that leaves an unused pipe open, or
   runs `ask` inside a `while read` loop (where it would now drain the loop's input), should pass
   `--no-stdin`.
+- `--image <path>` (repeatable, up to 10; png, jpg, jpeg, gif, webp) uploads the file into the
+  composer as an attachment, so ChatGPT sees the image itself rather than its bytes. Paths are
+  checked before anything is claimed or sent, and the turn waits until every upload has finished;
+  an upload that fails or stalls fails the ask as not sent. Plain ask mode only. `agent-mcp`'s
+  `ask` tool takes the same as `images`.
 - `--json` prints one envelope instead of text — `{"status":"completed","result":{"text":…},
   "conversation_id":…,"request_id":…}` or a failure with `error` — using the statuses and exit
   codes below. Without `--json` the reply is plain text and any failure exits 1.
@@ -571,7 +579,7 @@ chatgpt-use work "<task>"
 chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
 
 # Sidekick — plain question (harness is the brain)
-chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
+chatgpt-use ask "<question>" [--file <path> ...] [--image <path> ...] [--profile auto|relay|"Profile N"]
 
 # Structured delegation — ChatGPT plans/reviews, returns a verdict packet
 chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]

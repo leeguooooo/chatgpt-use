@@ -23,7 +23,7 @@ and a Chrome profile logged in to chatgpt.com.
 
 ```sh
 # Sidekick — one round trip, caller stays the brain
-chatgpt-use ask "<question>" [--file <path> ...] --no-stdin
+chatgpt-use ask "<question>" [--file <path> ...] [--image <png|jpg|gif|webp> ...] --no-stdin
 git diff | chatgpt-use ask "Explain what changed and what might break"
 
 # Structured delegation — plan/review/debug/research verdict packet, optionally --model pro
