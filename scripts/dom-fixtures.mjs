@@ -333,6 +333,111 @@ test("picker: two visible candidates of a kind are not guessed between", () => {
   assert.equal(run("find_picker").ok, false);
 });
 
+// The Nov 2026 composer as captured in issue #18 (English Plus account,
+// generated classes and ids removed): no composer-plus-btn, no picker test id.
+const PICKER_2026_11 = `<button type="button" aria-label="Select ChatGPT model" aria-haspopup="menu"
+  aria-expanded="false" data-composer-navigation-target="reasoning"
+  data-selected-reasoning-effort="none">Instant</button>`;
+
+test("picker: the Nov 2026 composer, found by its reasoning attributes with no plus button", () => {
+  const run = withLayout(page(`<form data-chatgpt-composer>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+    <button type="button" aria-label="Add files and more" aria-haspopup="menu">+</button>
+    ${PICKER_2026_11}</form>`));
+  const p = run("find_picker");
+  assert.equal(p.ok, true, JSON.stringify(p));
+  assert.equal(p.via, "reasoning");
+  assert.equal(p.label, "Instant");
+});
+
+test("picker: the Nov 2026 button is not matched on its translated label", () => {
+  const run = withLayout(page(`<form data-chatgpt-composer>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+    ${PICKER_2026_11.replace("Select ChatGPT model", "选择 ChatGPT 模型").replace(">Instant<", ">即时<")}</form>`));
+  const p = run("find_picker");
+  assert.equal(p.via, "reasoning", JSON.stringify(p));
+  assert.equal(p.label, "即时");
+});
+
+test("picker: a hidden earlier composer's picker is not chosen, nor counted as a second", () => {
+  const run = withLayout(page(`
+    <div hidden><form data-chatgpt-composer>
+      <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+      ${PICKER_2026_11.replace(">Instant<", ">stale<")}</form></div>
+    <div inert><form>${PICKER_2026_11.replace(">Instant<", ">inert<")}</form></div>
+    <form data-chatgpt-composer>
+      <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+      ${PICKER_2026_11}</form>`));
+  const p = run("find_picker");
+  assert.equal(p.via, "reasoning", JSON.stringify(p));
+  assert.equal(p.label, "Instant");
+});
+
+test("picker: the composer's own picker wins over the same markup elsewhere on the page", () => {
+  const run = withLayout(page(`
+    <div>${PICKER_2026_11.replace(">Instant<", ">elsewhere<")}</div>
+    <form data-chatgpt-composer>
+      <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+      ${PICKER_2026_11}</form>`));
+  assert.equal(run("find_picker").label, "Instant");
+});
+
+test("picker: unknown markup with no plus button says what the composer form held", () => {
+  const run = withLayout(page(`<form data-chatgpt-composer>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+    <button aria-haspopup="menu">Add files and more</button><button aria-haspopup="menu">?</button></form>`));
+  const p = run("find_picker");
+  assert.equal(p.ok, false);
+  assert.match(p.error, /^composer toolbar not found \(.*2 menu button\(s\) in the composer form\)$/);
+});
+
+// The open menu from the same capture: the arrow keys belong to the menu row,
+// the slider span is aria-hidden and only carries the value, and an inert
+// subtree holds model radios that are not on screen.
+const MENU_2026_11 = `<div role="menu">
+  <div role="menuitem" aria-label="Power" data-reasoning-slider="true" aria-keyshortcuts="ArrowLeft ArrowRight" id="power">Power</div>
+  <span role="status">Instant, 1 of 3.</span>
+  <span role="slider" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0" aria-hidden="true" id="value"></span>
+  <div aria-hidden="true" data-active="false" inert>
+    <div role="menuitemradio" aria-checked="true">Latest</div>
+    <div role="menuitemradio" aria-checked="false">GPT-5.5</div></div></div>`;
+
+test("picker menu: the Nov 2026 menu reads its 3-step slider and focuses the menu row", () => {
+  const run = page(MENU_2026_11);
+  // Only the row has a box: the value span is visually hidden.
+  run.window.eval(`HTMLElement.prototype.getBoundingClientRect = function () {
+    return this.id === 'power' ? {top: 100, left: 40, width: 200, height: 30}
+                               : {top: 0, left: 0, width: 0, height: 0};
+  };`);
+  const m = run("picker_menu");
+  assert.equal(m.open, true);
+  assert.equal(m.slider.now, 0);
+  assert.equal(m.slider.min, 0);
+  assert.equal(m.slider.max, 2);
+  assert.equal(m.slider.focus, "row");
+  assert.deepEqual([m.slider.thumbX, m.slider.thumbY], [140, 115]);
+  assert.equal(m.level, "Instant, 1 of 3.");
+  assert.deepEqual(JSON.parse(JSON.stringify(m.radios)), [], "the inert radios are not offered");
+});
+
+test("picker menu: an inert subtree's radios cannot be clicked", () => {
+  const run = page(MENU_2026_11 + `<div role="menu"><div role="menuitemradio" id="live">Latest</div></div>`);
+  let clicked = [];
+  for (const el of run.doc.querySelectorAll('[role="menuitemradio"]')) {
+    el.addEventListener("click", () => clicked.push(el.id || "inert"));
+  }
+  assert.equal(run("click_radio_latest").ok, true);
+  assert.deepEqual(clicked, ["live"]);
+  const none = page(MENU_2026_11);
+  assert.equal(none("click_radio_latest").ok, false);
+});
+
+test("picker menu: the older slider is still focused on its thumb", () => {
+  const run = withLayout(page(`<div data-testid="composer-intelligence-picker-content">
+    <div data-model-reasoning-effort-slider><div role="slider" aria-valuenow="2" aria-valuemin="0" aria-valuemax="4"></div></div></div>`));
+  assert.equal(run("picker_menu").slider.focus, "thumb");
+});
+
 test("picker menu: open when the content is a plain test-id container, not role=menu", () => {
   const run = withLayout(page(`<div data-testid="composer-intelligence-picker-content">
     <div data-model-reasoning-effort-slider><div role="slider" aria-valuenow="2" aria-valuemin="0" aria-valuemax="4"></div></div>

@@ -1086,35 +1086,56 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
     )
 }
 
-// JS: locate the composer's model picker WITHOUT relying on its text.
-//
-// Its label tracks the current model and has read "Instant", "5.6 SolLight" and
-// "6Pro" on one account inside three weeks, so any word list goes stale. What is
-// stable is where it sits: the composer toolbar row, identified by the plus
-// button's testid, holding exactly one other `aria-haspopup="menu"` button.
 // JS: find the composer's model / effort picker button. ChatGPT names it in
 // several ways across rollouts (selectors as recorded by
-// miuuyy/codex-chatgpt-web `chatgpt-session.ts`, Oct 2026); the first group
-// with exactly ONE visible match wins. The old structural rule — the one menu
-// button on the composer row beside `composer-plus-btn` — is the fallback.
-// Never matched on its label, which changes with the model line-up.
-const JS_FIND_PICKER: &str = r#"(() => {
+// miuuyy/codex-chatgpt-web `chatgpt-session.ts`, Oct 2026, and the composer
+// captured in issue #18, Nov 2026); the first group with exactly ONE visible
+// match wins. The old structural rule — the one menu button on the composer
+// row beside `composer-plus-btn` — is the fallback.
+//
+// Never matched on its text or aria-label: the text tracks the model line-up
+// ("Instant", "5.6 SolLight", "6Pro" on one account inside three weeks) and
+// the label ("Select ChatGPT model") is translated.
+//
+// The Nov 2026 composer has no `composer-plus-btn` and no test id on the
+// picker; it carries `data-composer-navigation-target="reasoning"` and
+// `data-selected-reasoning-effort`. The page keeps hidden composers from
+// earlier navigation, so that group is looked up in the visible composer's
+// form first, and anything hidden or inert is skipped.
+const JS_FIND_PICKER: &str = concat!(
+    "(() => {",
+    js_composer_helper!(),
+    r#"
   const visible = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const live = (b) => visible(b) && !b.closest('[inert], [hidden], [aria-hidden="true"], [data-active="false"]');
   const at = (b, via) => {
     const r = b.getBoundingClientRect();
     return JSON.stringify({ok: true, via, label: (b.textContent || '').trim(),
                            x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)});
   };
-  for (const [via, sel] of [
-    ['testid', 'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]'],
-    ['trigger', 'button[data-codex-intelligence-trigger="true"][aria-haspopup="menu"]'],
-    ['tone', 'button[aria-haspopup="menu"][data-tone="neutral"]'],
+  const composer = __cguComposer();
+  const form = composer && composer.closest('form');
+  const REASONING = 'button[aria-haspopup="menu"][data-composer-navigation-target="reasoning"], ' +
+    'button[aria-haspopup="menu"][data-selected-reasoning-effort]';
+  for (const [via, sel, scoped] of [
+    ['testid', 'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]', false],
+    ['trigger', 'button[data-codex-intelligence-trigger="true"][aria-haspopup="menu"]', false],
+    ['reasoning', REASONING, true],
+    ['tone', 'button[aria-haspopup="menu"][data-tone="neutral"]', false],
   ]) {
-    const hits = [...document.querySelectorAll(sel)].filter(visible);
+    if (scoped && form) {
+      const inForm = [...form.querySelectorAll(sel)].filter(live);
+      if (inForm.length === 1) return at(inForm[0], via);
+    }
+    const hits = [...document.querySelectorAll(sel)].filter(scoped ? live : visible);
     if (hits.length === 1) return at(hits[0], via);
   }
   const plus = document.querySelector('[data-testid="composer-plus-btn"]');
-  if (!plus) return JSON.stringify({ok: false, error: 'composer toolbar not found'});
+  if (!plus) {
+    const menus = form ? [...form.querySelectorAll('button[aria-haspopup="menu"]')].filter(live).length : 0;
+    return JSON.stringify({ok: false, error: 'composer toolbar not found (no known picker markup; ' +
+      (form ? menus + ' menu button(s) in the composer form' : 'no composer form') + ')'});
+  }
   const rowTop = plus.getBoundingClientRect().top;
   const hits = [...document.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
     if (b.getAttribute('data-testid') === 'composer-plus-btn') return false;
@@ -1126,39 +1147,54 @@ const JS_FIND_PICKER: &str = r#"(() => {
       error: 'expected one model picker on the composer row, found ' + hits.length});
   }
   return at(hits[0], 'row');
-})()"#;
+})()"#
+);
 
-// JS: read the opened picker — the effort slider (index + thumb position) and
-// the model-family radios. `level` is the name the page currently shows for the
-// slider position; it is for logging only, never for matching. The picker's
+// JS: read the opened picker — the effort slider (index + where to focus it)
+// and the model-family radios. `level` is the name the page currently shows for
+// the slider position; it is for logging only, never for matching. The picker's
 // content need not be a [role="menu"] any more: it can be a plain container
 // with data-testid="composer-intelligence-picker-content", or a [role="group"].
+//
+// In the Nov 2026 menu (issue #18) the `[role="slider"]` is an
+// `aria-hidden="true"` span that only carries the value; the control that
+// takes the arrow keys is a `[role="menuitem"][data-reasoning-slider]` row.
+// When that row is there, `thumbX/thumbY` are its centre and `focus` is "row".
+// That menu also keeps an `inert`, `data-active="false"` subtree of model
+// radios, so inactive content is skipped — judged on `inert` /
+// `data-active`, not `aria-hidden`, which the live slider itself carries.
 const JS_PICKER_MENU: &str = r#"(() => {
-  const SLIDER = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
+  const EFFORT = '[data-model-reasoning-effort-slider], [data-model-picker-power-slider], [data-reasoning-slider]';
+  const SLIDER = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"], [data-reasoning-slider] [role="slider"]';
+  const active = (e) => !e.closest('[inert], [hidden], [data-active="false"]');
+  const first = (root, sel) => [...root.querySelectorAll(sel)].find(active) || null;
   let menu = null;
   for (const sel of [
     '[data-testid="composer-intelligence-picker-content"]',
-    '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
-    '[role="group"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider], [data-model-picker-power-slider])',
+    '[role="menu"]:has([role="menuitemradio"], ' + EFFORT + ')',
+    '[role="group"]:has([role="menuitemradio"], ' + EFFORT + ')',
     '[role="menu"]',
   ]) {
-    menu = document.querySelector(sel);
+    menu = first(document, sel);
     if (menu) break;
   }
-  const sl = (menu && (menu.querySelector(SLIDER) || menu.querySelector('[role="slider"]')))
-    || document.querySelector(SLIDER) || document.querySelector('[role="slider"]');
+  const sl = (menu && (first(menu, SLIDER) || first(menu, '[role="slider"]')))
+    || first(document, SLIDER) || first(document, '[role="slider"]');
   let slider = null;
   if (sl) {
-    const r = sl.getBoundingClientRect();
+    const row = first(menu || document, '[data-reasoning-slider]');
+    const r = (row || sl).getBoundingClientRect();
     slider = {now: Number(sl.getAttribute('aria-valuenow')),
               min: Number(sl.getAttribute('aria-valuemin')),
               max: Number(sl.getAttribute('aria-valuemax')),
+              focus: row ? 'row' : 'thumb',
               thumbX: Math.round(r.left + r.width / 2),
               thumbY: Math.round(r.top + r.height / 2)};
   }
   const shown = [...document.querySelectorAll('[role="menuitem"]')]
-    .find(e => e.getAttribute('aria-label') === 'Select model');
-  const radios = [...document.querySelectorAll('[role="menuitemradio"]')].map(e => ({
+    .find(e => active(e) && e.getAttribute('aria-label') === 'Select model')
+    || (menu && first(menu, '[role="status"]'));
+  const radios = [...document.querySelectorAll('[role="menuitemradio"]')].filter(active).map(e => ({
     text: (e.textContent || '').trim(),
     checked: e.getAttribute('aria-checked') === 'true'
   }));
@@ -1174,6 +1210,7 @@ fn js_click_radio(text: &str) -> String {
         r#"(() => {{
   const target = {t};
   for (const el of document.querySelectorAll('[role="menuitemradio"]')) {{
+    if (el.closest('[inert], [hidden], [data-active="false"]')) continue;
     if ((el.textContent || '').trim() === target) {{
       el.click();
       return JSON.stringify({{ok: true}});
@@ -2858,6 +2895,12 @@ impl Channel {
     ///     ("Latest", "GPT-5.6 Sol", "GPT-5.5"). A `--model` that isn't a level
     ///     name is matched against those.
     ///
+    /// The composer changed again in Nov 2026 (DOM captured in issue #18, not
+    /// checked live here): no `composer-plus-btn`, the picker button marked
+    /// `data-composer-navigation-target="reasoning"`, and the slider's arrow
+    /// keys on a `[data-reasoning-slider]` menu row. `JS_FIND_PICKER`,
+    /// `JS_PICKER_MENU` and `set_level` handle both forms.
+    ///
     /// Two clicks must be REAL input events, not `element.click()`: opening the
     /// picker, and focusing the slider thumb. JS clicks are ignored by both.
     fn select_model(&self, model: &str, deadline: Instant) -> Result<()> {
@@ -2873,15 +2916,18 @@ impl Channel {
         let want_level = level_index(&want);
 
         // 1. Locate the picker structurally and open it with a real click.
-        let mut pick = serde_json::Value::Null;
-        for attempt in 0..6 {
+        //    The composer toolbar can render well after the editor (seen on a
+        //    project landing page, issue #18), so keep looking for ~12s.
+        let give_up = deadline.min(Instant::now() + Duration::from_secs(12));
+        let mut pick;
+        loop {
             pick = ab_eval(&self.ab, JS_FIND_PICKER, &self.session, remaining())?;
-            if pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+                || Instant::now() + Duration::from_millis(600) >= give_up
+            {
                 break;
             }
-            if attempt < 5 {
-                std::thread::sleep(Duration::from_millis(600));
-            }
+            std::thread::sleep(Duration::from_millis(600));
         }
         if !pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -2945,24 +2991,43 @@ impl Channel {
         // A real click on the thumb; this focuses the slider WITHOUT closing the
         // menu, which `press --selector` does not manage (focusing through a
         // selector dismisses the popover and the arrow keys go nowhere).
-        ab_cmd(&self.ab, &["click", &tx.to_string(), &ty.to_string()], &self.session, remaining())
-            .context("focusing the thinking-effort slider")?;
-        std::thread::sleep(Duration::from_millis(300));
+        //
+        // In the Nov 2026 menu the arrow keys belong to a menu row instead
+        // (`focus: "row"`, see JS_PICKER_MENU). How that row takes focus has
+        // not been checked on a live page: hover it first, which cannot
+        // activate anything, and click it only if the arrows then did nothing.
+        // Either may move the value by itself, so the arrow presses are
+        // counted from a fresh read, and success is judged on the final index.
+        let on_row = slider.get("focus").and_then(|v| v.as_str()) == Some("row");
+        let ways: &[&str] = if on_row { &["hover", "click"] } else { &["click"] };
+        let read_now = |v: &serde_json::Value| {
+            v.get("slider").and_then(|s| s.get("now")).and_then(|n| n.as_i64())
+        };
+        let mut after = st.clone();
+        let mut got = now;
+        for way in ways {
+            ab_cmd(&self.ab, &[way, &tx.to_string(), &ty.to_string()], &self.session, remaining())
+                .context("focusing the thinking-effort slider")?;
+            std::thread::sleep(Duration::from_millis(300));
+            after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+            let Some(cur) = read_now(&after) else {
+                bail!("the thinking-effort slider went away while focusing it ({way})");
+            };
 
-        let key = if target >= now { "ArrowRight" } else { "ArrowLeft" };
-        for _ in 0..(target - now).abs() {
-            ab_cmd(&self.ab, &["press", key], &self.session, remaining())
-                .context("moving the thinking-effort slider")?;
-            std::thread::sleep(Duration::from_millis(250));
+            let key = if target >= cur { "ArrowRight" } else { "ArrowLeft" };
+            for _ in 0..(target - cur).abs() {
+                ab_cmd(&self.ab, &["press", key], &self.session, remaining())
+                    .context("moving the thinking-effort slider")?;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+
+            after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+            got = read_now(&after).unwrap_or(-1);
+            if got == target {
+                break;
+            }
         }
-        std::thread::sleep(Duration::from_millis(300));
-
-        let after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
-        let got = after
-            .get("slider")
-            .and_then(|v| v.get("now"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
         if got != target {
             bail!(
                 "could not move the thinking-effort slider to {} ({}): it sits at {}",
@@ -3871,6 +3936,7 @@ mod tests {
             ("mention_menu", &js_mention_menu("chatgpt-use")),
             ("connector_pill", &js_connector_pill("chatgpt-use")),
             ("picker_menu", JS_PICKER_MENU),
+            ("click_radio_latest", &js_click_radio("Latest")),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }
