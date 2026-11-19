@@ -464,6 +464,141 @@ test("picker menu: closed when nothing is open", () => {
   assert.equal(run("picker_menu").open, false);
 });
 
+// Image attachments (`ask --image`). No DOM capture of these exists in the
+// repo: the markup below is built from the selectors the feature's author
+// recorded on a live English page (tile class, progressbar, file inputs), with
+// the labels translated to check that none of them is read.
+const composerWith = (inner) => `<form data-chatgpt-composer>
+  <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>${inner}
+  <input type="file" multiple accept="" id="any">
+  <input type="file" accept="image/*" id="single">
+  <button aria-label="发送">s</button></form>`;
+const tile = (name, extra = "") => `<div class="wrap"><div role="button" class="composer-attachment-surface"
+  aria-label="${name}">${name}${extra}</div><button aria-label="移除 ${name}" class="rm">x</button></div>`;
+
+test("upload: the visible composer's multi-file input is stamped, never a hidden composer's", () => {
+  const run = page(`
+    <div hidden><form><div id="prompt-textarea" contenteditable="true"></div>
+      <input type="file" multiple accept="" id="stale" data-cgu-upload="1"></form></div>
+    ${composerWith("")}`);
+  assert.equal(run("composer").composer, true);
+  const t = run("tag_upload");
+  assert.deepEqual(t, { ok: true, leftover: 0, removed: 0 });
+  assert.deepEqual([...run.doc.querySelectorAll("[data-cgu-upload]")].map(n => n.id), ["any"]);
+});
+
+test("upload: no composer stamp, or no usable input, is an error", () => {
+  const none = page(composerWith(""));
+  assert.equal(none("tag_upload").ok, false, "composer probe has not run");
+  const bare = page(`<form data-chatgpt-composer>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+    <input type="file" accept="image/*"></form>`);
+  bare("composer");
+  const t = bare("tag_upload");
+  assert.equal(t.ok, false);
+  assert.match(t.error, /no file input on the composer \(1 inputs\)/);
+});
+
+test("upload: leftover tiles are removed by position, with a non-English label", () => {
+  const run = page(composerWith(tile("old-a.png") + tile("old-b.png")));
+  run("composer");
+  const clicked = [];
+  for (const b of run.doc.querySelectorAll("button")) {
+    b.addEventListener("click", () => { clicked.push(b.className || b.getAttribute("aria-label")); b.closest(".wrap")?.remove(); });
+  }
+  const t = run("tag_upload");
+  assert.equal(t.leftover, 2);
+  assert.equal(t.removed, 2);
+  assert.deepEqual(clicked, ["rm", "rm"], "only the tiles' own buttons, never Send");
+  assert.equal(run("upload_state").tiles, 0);
+});
+
+test("upload: a tile with no button of its own is left alone and still counted", () => {
+  const run = page(composerWith(`<div><div role="button" class="composer-attachment-surface">old.png</div></div>`));
+  run("composer");
+  let sent = 0;
+  run.doc.querySelector('button[aria-label="发送"]').addEventListener("click", () => sent++);
+  const t = run("tag_upload");
+  assert.equal(t.leftover, 1);
+  assert.equal(t.removed, 0);
+  assert.equal(sent, 0);
+  assert.equal(run("upload_state").tiles, 1, "the caller sees it and refuses to upload");
+});
+
+test("upload state: a progressbar counts whatever its label's language", () => {
+  for (const label of ["Uploading login-failed.PNG", "正在上传 login-failed.PNG", ""]) {
+    const run = page(composerWith(tile("login-failed.PNG", `<div role="progressbar" aria-label="${label}"></div>`)));
+    run("composer");
+    assert.deepEqual(run("upload_state"), { form: true, tiles: 1, uploading: 1, failed: 0 }, label);
+  }
+});
+
+test("upload state: done, and a file name that says 'failed' or 'error' is not a failure", () => {
+  const run = page(composerWith(tile("login-failed.PNG")));
+  run("composer");
+  assert.deepEqual(run("upload_state"), { form: true, tiles: 1, uploading: 0, failed: 0 });
+  const stem = page(composerWith(tile("Login-Failed")));
+  stem("composer");
+  assert.equal(stem("upload_state").failed, 0, "name shown without its extension");
+});
+
+test("upload state: a failed tile is seen by its text or its markup", () => {
+  for (const extra of ["<span>Upload failed</span>", `<span role="alert">上传失败</span>`, `<span aria-invalid="true"></span>`]) {
+    const run = page(composerWith(tile("login-failed.PNG", extra)));
+    run("composer");
+    assert.equal(run("upload_state").failed, 1, extra);
+  }
+});
+
+test("upload state: a short or failure-like file name does not hide a real failure", () => {
+  for (const name of ["a.png", "error.png"]) {
+    const ok = page(composerWith(tile(name)));
+    ok("composer");
+    assert.equal(ok("upload_state_short").failed, 0, name);
+    const cut = page(composerWith(tile("err…")));
+    cut("composer");
+    assert.equal(cut("upload_state_short").failed, 0, "an ellipsised name");
+    for (const extra of ["<span>Upload failed</span>", `<span>Unable to upload ${name}</span>`, "<span>Error</span><i>!</i>"]) {
+      const bad = page(composerWith(tile(name, extra)));
+      bad("composer");
+      assert.equal(bad("upload_state_short").failed, 1, name + " " + extra);
+    }
+  }
+});
+
+test("upload: a lone Send or menu button near a tile is never taken for its remove control", () => {
+  for (const near of [
+    `<button type="submit">x</button>`, `<button data-testid="send-button">x</button>`,
+    `<button aria-haspopup="menu">x</button>`, `<button id="composer-submit-button">x</button>`,
+  ]) {
+    const run = page(composerWith(`<div><div role="button" class="composer-attachment-surface">old.png</div>${near}</div>`));
+    run("composer");
+    let clicks = 0;
+    for (const b of run.doc.querySelectorAll("button")) b.addEventListener("click", () => clicks++);
+    assert.equal(run("tag_upload").removed, 0, near);
+    assert.equal(clicks, 0, near);
+  }
+  // A box that reaches the editor is the composer itself, not the tile's own.
+  const wide = page(`<form data-chatgpt-composer><div>
+    <div contenteditable="true" data-lexical-editor="true" role="textbox"></div>
+    <div role="button" class="composer-attachment-surface">old.png</div><button id="go">go</button></div>
+    <input type="file" multiple accept=""></form>`);
+  wide("composer");
+  let went = 0;
+  wide.doc.querySelector("#go").addEventListener("click", () => went++);
+  assert.equal(wide("tag_upload").removed, 0);
+  assert.equal(went, 0);
+});
+
+test("upload state: only the visible composer's tiles count, and no composer reads as unknown", () => {
+  const run = page(`<div hidden><form><div id="prompt-textarea" contenteditable="true"></div>${tile("stale.png")}</form></div>
+    ${composerWith(tile("login-failed.PNG"))}`);
+  run("composer");
+  assert.equal(run("upload_state").tiles, 1);
+  const none = page(`<main>loading</main>`);
+  assert.deepEqual(none("upload_state"), { form: false, tiles: 0, uploading: 0, failed: 0 });
+});
+
 test("mention menu: exactly one row titled as the app, badge allowed, highlight read", () => {
   const run = page(`<div data-mention-list-scroll-area>
     <button data-list-navigation-item="true">chatgpt-use-old\nlegacy</button>

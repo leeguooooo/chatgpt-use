@@ -252,11 +252,19 @@ pub fn check_images(paths: &[String]) -> Result<Vec<String>> {
             if !full.is_file() {
                 anyhow::bail!("image is not a file: {p}");
             }
-            // canonicalize yields a `\\?\` path on Windows; chrome-use wants a plain one.
-            let shown = full.to_string_lossy();
-            Ok(shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string())
+            Ok(plain_path(&full.to_string_lossy()))
         })
         .collect()
+}
+
+/// `canonicalize` yields a verbatim path on Windows (`\\?\C:\x`, or
+/// `\\?\UNC\server\share\x` for a network file); chrome-use wants the plain
+/// form (`C:\x`, `\\server\share\x`). Other paths pass through.
+fn plain_path(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
 }
 
 /// The ask message: each context file, then stdin, as fenced blocks, then the
@@ -643,6 +651,14 @@ mod tests {
         assert!(check_images(&[dir.join("missing.png").to_string_lossy().into()]).is_err());
         assert!(check_images(&vec![png.to_string_lossy().into(); 11]).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_verbatim_paths_become_plain_ones() {
+        assert_eq!(plain_path(r"\\?\C:\shots\a.png"), r"C:\shots\a.png");
+        assert_eq!(plain_path(r"\\?\UNC\nas\share\a.png"), r"\\nas\share\a.png");
+        assert_eq!(plain_path(r"\\nas\share\a.png"), r"\\nas\share\a.png");
+        assert_eq!(plain_path("/tmp/a.png"), "/tmp/a.png");
     }
 
     #[test]
