@@ -1150,6 +1150,142 @@ const JS_FIND_PICKER: &str = concat!(
 })()"#
 );
 
+/// JS string literal: an attachment tile on the composer (as seen on the Nov
+/// 2026 composer by the author of `ask --image`).
+macro_rules! js_attachment_tile {
+    () => {
+        r#"'[role="button"].composer-attachment-surface'"#
+    };
+}
+
+// JS: prepare the visible composer for an image upload. Removes attachments
+// an earlier attempt left behind, then stamps the composer form's own
+// multi-file input as `[data-cgu-upload]` for chrome-use's `upload`. Relies on
+// `[data-cgu-composer]`, stamped by JS_COMPOSER in `fill_composer`.
+//
+// A tile's remove control is found by where it sits, not by its translated
+// label: the one other button in the smallest box (at most three levels up)
+// around that tile alone — a box that does not reach the editor, and never a
+// submit or menu button. Only when that box holds several buttons is the
+// English "Remove …" label used to choose. `leftover` is how many tiles were
+// there; the caller confirms with `js_upload_state` that none remain, so a
+// wrong guess here stops the upload instead of mixing attachments.
+const JS_TAG_UPLOAD: &str = concat!(
+    r#"(() => {
+  const composer = document.querySelector('[data-cgu-composer]');
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({ok: false, error: 'composer form not found'});
+  const TILE = "#,
+    js_attachment_tile!(),
+    r#";
+  const tiles = [...form.querySelectorAll(TILE)];
+  let removed = 0;
+  for (const tile of tiles) {
+    let box = tile, buttons = [];
+    for (let up = 0; up < 4 && box && box !== form; up++, box = box.parentElement) {
+      if (box.contains(composer) || box.querySelectorAll(TILE).length > (box === tile ? 0 : 1)) break;
+      buttons = [...box.querySelectorAll('button')].filter(b => b !== tile &&
+        !b.matches('[type="submit"], [aria-haspopup], [data-testid*="send"], #composer-submit-button'));
+      if (buttons.length) break;
+    }
+    const remove = buttons.length === 1 ? buttons[0]
+      : buttons.find(b => /^remove/i.test(b.getAttribute('aria-label') || ''));
+    if (remove) { remove.click(); removed++; }
+  }
+  document.querySelectorAll('[data-cgu-upload]').forEach(e => e.removeAttribute('data-cgu-upload'));
+  const inputs = [...form.querySelectorAll('input[type="file"]')];
+  const input = inputs.find(i => i.multiple && i.accept === '')
+    || inputs.find(i => i.multiple && /image/.test(i.accept) && !/video/.test(i.accept));
+  if (!input) return JSON.stringify({ok: false, leftover: tiles.length, removed,
+    error: 'no file input on the composer (' + inputs.length + ' inputs)'});
+  input.setAttribute('data-cgu-upload', '1');
+  return JSON.stringify({ok: true, leftover: tiles.length, removed});
+})()"#
+);
+
+/// JS: the attachment tiles on the visible composer, for files named `names`.
+/// Returns {form, tiles, uploading, failed}; judged by `upload_step`.
+///
+/// Send stays enabled while a file uploads, so it is no signal. What is: the
+/// tile holds a `[role="progressbar"]` until its upload ends. Any progressbar
+/// or `aria-busy` node in the composer form counts — its label ("Uploading
+/// <name>" in English) is translated and is not read.
+///
+/// A failed tile is one marked `aria-invalid` / holding a `[role="alert"]`,
+/// or one with a piece of text that says so. The file's own name is not such
+/// text (`login-failed.png` is not a failure): a text node that is the name,
+/// its stem or an ellipsised start of it is skipped, and the full name is
+/// taken out of any other. A bare "error" stays a failure even for
+/// `error.png`. That wording is English: how a failed upload looks in other
+/// languages is not known.
+fn js_upload_state(names: &[String]) -> String {
+    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).filter(|n| !n.is_empty()).collect();
+    let names = serde_json::to_string(&lower).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(() => {{
+  const names = {names};
+  const composer = document.querySelector('[data-cgu-composer]');
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({{form: false, tiles: 0, uploading: 0, failed: 0}});
+  const tiles = [...form.querySelectorAll({tile})];
+  const uploading = form.querySelectorAll('[role="progressbar"], [aria-busy="true"]').length;
+  const isName = (t) => names.some(n => {{
+    const stem = n.replace(/\.[^.]+$/, '');
+    if (t === n || (t === stem && !/^(failed|error|unable)$/.test(stem))) return true;
+    const cut = t.split(/…|\.\.\./)[0];
+    return cut !== t && cut.length > 0 && n.startsWith(cut);
+  }});
+  const saysFailed = (t) => {{
+    for (const n of names) t = t.split(n).join(' ');
+    return /failed|error|couldn.t|unable/.test(t);
+  }};
+  const failed = tiles.filter(t => {{
+    if (t.matches('[aria-invalid="true"]') || t.querySelector('[role="alert"], [aria-invalid="true"]')) return true;
+    const walk = document.createTreeWalker(t, 4);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {{
+      const text = (n.nodeValue || '').trim().toLowerCase();
+      if (text && !isName(text) && saysFailed(text)) return true;
+    }}
+    return false;
+  }}).length;
+  return JSON.stringify({{form: true, tiles: tiles.length, uploading, failed}});
+}})()"#,
+        tile = js_attachment_tile!(),
+    )
+}
+
+/// What one `js_upload_state` read means for an upload of `want` files into a
+/// composer that held none.
+#[derive(Debug, PartialEq)]
+enum UploadStep {
+    /// Every file has its tile and nothing is uploading.
+    Settled,
+    /// Still uploading, or the state could not be read. Never grounds to send.
+    Wait,
+    Failed(&'static str),
+}
+
+fn upload_step(state: &serde_json::Value, want: u64) -> UploadStep {
+    let n = |k: &str| state.get(k).and_then(|v| v.as_u64());
+    if state.get("form").and_then(|v| v.as_bool()) != Some(true) {
+        return UploadStep::Wait;
+    }
+    let (Some(tiles), Some(uploading), Some(failed)) = (n("tiles"), n("uploading"), n("failed")) else {
+        return UploadStep::Wait;
+    };
+    if failed > 0 {
+        return UploadStep::Failed("ChatGPT rejected an image upload");
+    }
+    if tiles > want {
+        return UploadStep::Failed("the composer holds more attachments than were uploaded");
+    }
+    if tiles == want && uploading == 0 {
+        UploadStep::Settled
+    } else {
+        UploadStep::Wait
+    }
+}
+
 // JS: read the opened picker — the effort slider (index + where to focus it)
 // and the model-family radios. `level` is the name the page currently shows for
 // the slider position; it is for logging only, never for matching. The picker's
@@ -1347,6 +1483,9 @@ pub struct Channel {
     /// A ChatGPT app (connector) to @-mention into every message, so its tools
     /// are available in that turn (see `attach_connector`).
     connector: Option<String>,
+    /// Image files uploaded into the composer with the next message (see
+    /// `upload_images`).
+    images: Vec<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1548,6 +1687,7 @@ impl Channel {
             submitted: false,
             receipt: opts.receipt.clone(),
             connector: None,
+            images: Vec::new(),
             _surface: surface,
         };
 
@@ -1634,6 +1774,100 @@ impl Channel {
         self.connector = Some(name.to_string()).filter(|n| !n.trim().is_empty());
     }
 
+    /// Upload these image files (absolute paths) as attachments of every
+    /// message this channel sends, so ChatGPT can see them.
+    pub fn attach_images(&mut self, paths: Vec<String>) {
+        self.images = paths;
+    }
+
+    /// Put `self.images` into the (empty, focused) composer and wait until
+    /// ChatGPT has finished uploading every one. Runs before any text is typed
+    /// and before submit, so a failure here never sends anything. `budget` is
+    /// what is left of the turn.
+    ///
+    /// The file input must be the visible composer's own: the page keeps
+    /// hidden composers from earlier chats, each with inputs that take the
+    /// files silently and attach them nowhere.
+    ///
+    /// Fails closed. The composer must hold no attachment before the upload
+    /// and exactly ours after it, with nothing uploading on two reads in a
+    /// row; anything else, including a state that cannot be read, is not sent.
+    /// A cancel during the wait ends it as cancelled.
+    fn upload_images(&self, budget: f64) -> Result<()> {
+        if self.images.is_empty() {
+            return Ok(());
+        }
+        let until = Instant::now() + Duration::from_secs_f64(budget.min(120.0));
+        let names: Vec<String> = self
+            .images
+            .iter()
+            .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string())
+            .collect();
+        let state_js = js_upload_state(&names);
+        let state = || ab_eval(&self.ab, &state_js, &self.session, budget).unwrap_or_default();
+        let tiles = |v: &serde_json::Value| v.get("tiles").and_then(|t| t.as_u64());
+
+        let tagged = ab_eval(&self.ab, JS_TAG_UPLOAD, &self.session, budget)
+            .context("finding the composer's file input")?;
+        if !tagged.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let why = tagged.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            bail!("cannot attach images: {why}");
+        }
+        // Start from an empty composer, confirmed, so every tile counted
+        // below is one of ours.
+        let empty_by = until.min(Instant::now() + Duration::from_secs(3));
+        let mut before = state();
+        while tiles(&before) != Some(0) && Instant::now() < empty_by {
+            std::thread::sleep(Duration::from_millis(300));
+            before = state();
+        }
+        if tiles(&before) != Some(0) {
+            bail!(
+                "cannot attach images: the composer already holds attachments that could not \
+                 be removed ({before})"
+            );
+        }
+
+        let mut args = vec!["upload", "[data-cgu-upload]"];
+        args.extend(self.images.iter().map(String::as_str));
+        ab_cmd(&self.ab, &args, &self.session, budget).context("uploading images to ChatGPT")?;
+
+        // Best effort: do not leave our files in the composer for a later message.
+        let discard = || {
+            let _ = ab_eval(&self.ab, JS_TAG_UPLOAD, &self.session, budget);
+        };
+        let want = self.images.len() as u64;
+        let mut last = serde_json::Value::Null;
+        let mut settled = 0;
+        while Instant::now() < until {
+            if cancel_requested() {
+                discard();
+                return Err(ChannelError::new(
+                    ErrorKind::Cancelled,
+                    "cancelled while the images were uploading; the prompt was not sent",
+                )
+                .into());
+            }
+            last = state();
+            match upload_step(&last, want) {
+                UploadStep::Failed(why) => {
+                    discard();
+                    bail!("{why} ({last})");
+                }
+                // A tile can show up a moment before its progressbar does.
+                UploadStep::Settled if settled >= 1 => {
+                    eprintln!("attached {want} image(s)");
+                    return Ok(());
+                }
+                UploadStep::Settled => settled += 1,
+                UploadStep::Wait => settled = 0,
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        discard();
+        bail!("images did not finish uploading in time ({last})")
+    }
+
     /// Put the app `name` into the (empty, focused) composer as a mention
     /// pill: type `@name` with real keystrokes, require exactly one matching
     /// row in the mention menu, highlight it with the arrow keys, press Enter,
@@ -1702,6 +1936,7 @@ impl Channel {
     }
 
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
+        let entered = Instant::now();
         // Never type while the PAGE still believes it is generating. ChatGPT
         // disables submission then, so Enter is silently swallowed and the turn
         // reports "never submitted".
@@ -1787,6 +2022,7 @@ impl Channel {
         if let Some(name) = self.connector.clone() {
             self.attach_connector(&name, budget)?;
         }
+        self.upload_images((budget - entered.elapsed().as_secs_f64()).max(2.0))?;
 
         // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
         // fails with EAGAIN ("Resource temporarily unavailable"). Each chunk
@@ -2315,6 +2551,15 @@ impl Channel {
             let SubmitFailure::BeforeSubmit(why) = first else {
                 return Err(first.into_error());
             };
+            // A cancel that arrived while the composer was being filled (an
+            // image upload can take minutes) must not be retried into a send.
+            if cancel_requested() {
+                return Err(ChannelError::new(
+                    ErrorKind::Cancelled,
+                    "cancelled before the prompt was sent",
+                )
+                .into());
+            }
             eprintln!("submit failed: {why:#}");
 
             // Reconnect: back to our conversation if we have one, otherwise to a
@@ -3914,6 +4159,28 @@ mod tests {
         assert!(JS_STATE.contains("composer-stop-button"));
     }
 
+    #[test]
+    fn an_upload_is_settled_only_on_a_complete_known_state() {
+        let st = |v: serde_json::Value| upload_step(&v, 2);
+        use serde_json::json;
+        assert_eq!(st(json!({"form": true, "tiles": 2, "uploading": 0, "failed": 0})), UploadStep::Settled);
+        assert_eq!(st(json!({"form": true, "tiles": 2, "uploading": 1, "failed": 0})), UploadStep::Wait);
+        assert_eq!(st(json!({"form": true, "tiles": 1, "uploading": 0, "failed": 0})), UploadStep::Wait);
+        // Unreadable or partial state is never grounds to send.
+        assert_eq!(st(serde_json::Value::Null), UploadStep::Wait);
+        assert_eq!(st(json!({"form": false, "tiles": 2, "uploading": 0, "failed": 0})), UploadStep::Wait);
+        assert_eq!(st(json!({"form": true, "tiles": 2})), UploadStep::Wait);
+        assert!(matches!(st(json!({"form": true, "tiles": 2, "uploading": 0, "failed": 1})), UploadStep::Failed(_)));
+        assert!(matches!(st(json!({"form": true, "tiles": 3, "uploading": 0, "failed": 0})), UploadStep::Failed(_)));
+    }
+
+    #[test]
+    fn upload_probes_do_not_read_translated_labels() {
+        let state = js_upload_state(&["Shot.PNG".to_string()]);
+        assert!(!state.contains("Uploading"), "{state}");
+        assert!(state.contains(r#"["shot.png"]"#), "{state}");
+    }
+
     /// Writes the page probes for scripts/check-dom.sh. Ignored: it is a
     /// build step for that script, not a test.
     #[test]
@@ -3937,6 +4204,9 @@ mod tests {
             ("connector_pill", &js_connector_pill("chatgpt-use")),
             ("picker_menu", JS_PICKER_MENU),
             ("click_radio_latest", &js_click_radio("Latest")),
+            ("tag_upload", JS_TAG_UPLOAD),
+            ("upload_state", &js_upload_state(&["login-failed.PNG".to_string()])),
+            ("upload_state_short", &js_upload_state(&["a.png".to_string(), "error.png".to_string()])),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }

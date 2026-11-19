@@ -203,6 +203,10 @@ pub struct AskArgs {
     /// Files whose contents are prepended as context (repeatable).
     #[arg(long = "file")]
     pub files: Vec<String>,
+    /// Images uploaded to the message as attachments, so ChatGPT can see them
+    /// (repeatable; png, jpg, jpeg, gif or webp). Plain ask mode only.
+    #[arg(long = "image")]
+    pub images: Vec<String>,
     /// Delegation mode: ask (plain text) | plan | review | debug | research.
     /// Non-ask modes send a typed delegation packet and parse a structured reply.
     #[arg(long, value_enum, default_value_t = crate::delegation::Mode::Ask)]
