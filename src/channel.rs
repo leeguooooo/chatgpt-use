@@ -981,6 +981,37 @@ fn level_index(want: &str) -> Option<usize> {
     LEVEL_ORDER.iter().position(|l| *l == norm)
 }
 
+/// Map a level index onto the slider the page actually shows.
+///
+/// Pro/Business accounts get all five positions (`aria-valuemax` 4). Plus
+/// accounts get three, labelled Instant / Medium / High (#18) — the same
+/// names as the first three of `LEVEL_ORDER`, so the index carries over
+/// unchanged; "extra high" and "pro" are simply not offered there. Any other
+/// shape is refused rather than guessed.
+fn slider_target(idx: usize, max: i64) -> Result<i64> {
+    let positions = match max {
+        4 => LEVEL_ORDER.len(),
+        2 => 3,
+        _ => bail!(
+            "the thinking-effort slider now has {} positions but this build \
+             knows 5 (Pro: {}) or 3 (Plus: instant, medium, high) — refusing to \
+             guess which is which",
+            max + 1,
+            LEVEL_ORDER.join(", ")
+        ),
+    };
+    if idx >= positions {
+        bail!(
+            "{:?} is not offered on this account: its thinking-effort slider has \
+             only {} ({}); pick one of those or pass --model current",
+            LEVEL_ORDER[idx],
+            positions,
+            LEVEL_ORDER[..positions].join(", ")
+        );
+    }
+    Ok(idx as i64)
+}
+
 // JS: start a fresh chat WITHOUT reloading the page.
 //
 // A full navigation to https://chatgpt.com/ costs 45 backend-api requests on
@@ -2902,16 +2933,7 @@ impl Channel {
         })?;
         let now = slider.get("now").and_then(|v| v.as_i64()).unwrap_or(-1);
         let max = slider.get("max").and_then(|v| v.as_i64()).unwrap_or(-1);
-        let last = (LEVEL_ORDER.len() - 1) as i64;
-        if max != last {
-            bail!(
-                "the thinking-effort slider now has {} positions but this build \\
-                 knows {} levels ({}) — refusing to guess which is which",
-                max + 1,
-                LEVEL_ORDER.len(),
-                LEVEL_ORDER.join(", ")
-            );
-        }
+        let target = slider_target(idx, max)?;
         let (tx, ty) = match (
             slider.get("thumbX").and_then(|v| v.as_i64()),
             slider.get("thumbY").and_then(|v| v.as_i64()),
@@ -2927,7 +2949,6 @@ impl Channel {
             .context("focusing the thinking-effort slider")?;
         std::thread::sleep(Duration::from_millis(300));
 
-        let target = idx as i64;
         let key = if target >= now { "ArrowRight" } else { "ArrowLeft" };
         for _ in 0..(target - now).abs() {
             ab_cmd(&self.ab, &["press", key], &self.session, remaining())
@@ -3733,6 +3754,24 @@ mod tests {
 
     /// A model family name must fall through to the radio path, not be
     /// mistaken for an effort level.
+    #[test]
+    fn slider_target_handles_five_and_three_step_sliders() {
+        // Pro/Business: five positions, identity mapping.
+        for i in 0..5 {
+            assert_eq!(slider_target(i, 4).unwrap(), i as i64);
+        }
+        // Plus (#18): instant / medium / high only.
+        assert_eq!(slider_target(0, 2).unwrap(), 0);
+        assert_eq!(slider_target(1, 2).unwrap(), 1);
+        assert_eq!(slider_target(2, 2).unwrap(), 2);
+        let e = slider_target(3, 2).unwrap_err().to_string();
+        assert!(e.contains("extra high") && e.contains("not offered"), "{e}");
+        assert!(slider_target(4, 2).is_err());
+        // Unknown shapes are refused, never guessed.
+        assert!(slider_target(0, 3).is_err());
+        assert!(slider_target(0, -1).is_err());
+    }
+
     #[test]
     fn level_index_rejects_model_family_names() {
         assert_eq!(level_index("GPT-5.5"), None);
